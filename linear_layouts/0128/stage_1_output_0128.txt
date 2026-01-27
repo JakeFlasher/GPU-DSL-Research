@@ -1,0 +1,248 @@
+## 1) Implementation Landscape (Real‑Metal, Triton‑centric)
+
+### 1.1 Core software artifact (what “exists in code”)
+
+**Artifact:** a **Triton GPU backend** integration (“Triton‑Linear”) that replaces/augments Triton’s legacy “layout” machinery with a **linear-algebraic layout representation** and a **layout engine** that:
+
+- Represents *both* **Distributed layouts** (register/thread/warp mapping) and **Memory layouts** (shared/tensor memory offset mapping) uniformly as **linear maps over 𝔽₂** (bit‑level linear transforms). ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+- Runs a **layout propagation engine** with:
+  - **Anchor layouts** at key ops (global memory ops + `tt.dot` lowering points like `mma/wgmma`)
+  - A forward pass (propagate along use‑chains, merge candidates, insert conversions)
+  - A backward pass (rematerialize/eliminate conversions when cheap). ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+- Enables generic lowering/codegen decisions:
+  - Contiguity/vectorization analysis via inverse layouts. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+  - Broadcast/duplication detection via **zero columns** in the layout matrix. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+  - Layout conversion synthesis via **right inverses** + heuristics to minimize cross‑thread/warp movement. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+  - Shared memory **swizzle** derivation to reduce bank conflicts while maintaining vectorization. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+  - Warp‑shuffle based codegen for some layout conversions and for `tl.gather` when the axis is warp‑contained. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+### 1.2 Where it sits in the compiler stack (ASCII pipeline)
+
+```
+PyTorch / User code
+   |
+   v
+Triton Python DSL (tile-level SPMD)
+   |
+   v
+tt IR (Triton dialect: ops + shape ops)
+   |
+   |  [Linear Layouts "layout engine"]
+   |   - anchors (blocked for mem, mma/wgmma for dot)
+   |   - forward/backward propagation
+   |   - insert convert_layout / rematerialize
+   v
+ttg IR (TritonGPU dialect: explicit distributed+memory layouts)
+   |
+   |  [Layout-aware codegen]
+   |   - vectorize ld/st via contiguity (inverse layout)
+   |   - Shared Memory Swizzle selection
+   |   - emit SHFL/LDMatrix/STMatrix when compatible
+   v
+LLVM / NVVM -> PTX -> SASS
+   |
+   v
+Real GPU (H100/GH200, MI300, ...)
+```
+
+### 1.3 Hardware abstraction it relies on (explicit assumptions)
+
+**Primary abstraction:** a layout is a **linear map on index bits**.
+
+- They build the coordinate of an element by treating register/thread/warp indices as concatenated **bit-vectors**, and applying a binary matrix (over 𝔽₂), i.e., essentially XOR/AND compositions on bits. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+- Triton’s layout parameters are heavily **power-of-two** constrained (warp size, tile sizes, etc.), which makes the 𝔽₂ / bit-matrix formulation fit naturally. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+- **Distributed layout** is restricted to “permutation + optional zero columns”: each column has ≤1 non-zero bit and no duplicates, i.e., a permutation matrix with interleaved zeros. That’s a big “shape” constraint on what can be represented as a *distributed* mapping. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+- **Memory layout** is an *invertible* linear layout mapping **memory offsets → logical tensor coordinates** (covers unswizzled + swizzled like mma swizzling). ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+### 1.4 What it optimizes on real hardware (visible in PTX/SASS behavior)
+
+The paper is very explicit that (baseline) Triton’s conversions “always go through shared memory”, and Triton‑Linear’s gains come from enabling:
+- vectorized global loads/stores,
+- fewer/more optimal `convert_layout` and `local_load/store`,
+- more use of warp shuffles and SIMD-ish primitives. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+They also profile/evaluate on:
+- NVIDIA RTX4090
+- NVIDIA GH200 (Hopper-class, with TMA present)
+- AMD MI250 ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+---
+
+## 2) Modern hardware stress test (“Hopper / Blackwell / MI300” check)
+
+This is specifically about *software-visible underutilization* of existing features: **TMA**, **warp specialization**, **Thread Block Clusters**, and low-precision types.
+
+### Hopper (H100 / GH200): what changes materially vs “classical CUDA+SMEM+warp” thinking
+
+Hopper introduces a much richer “data movement ISA surface” and cooperation granularity:
+
+- **TMA (Tensor Memory Accelerator)**: can transfer **1D–5D tensors** between global and shared, including **shared memory across SMs within a cluster**, and is designed to:
+  - avoid using registers for moves,
+  - avoid using SM instructions for moves (a single thread issues large data moves),
+  - enable **warp-specialized code** where some warps do data movement and others compute. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html))
+- **Thread Block Clusters / Distributed Shared Memory (DSMEM)**: a block can read/write/atomic into other blocks’ shared memory within a cluster. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html))
+- At PTX level, bulk tensor copies are explicit (`cp.async.bulk.tensor`) and include:
+  - `.dim` up to **.5d**
+  - `.shared::cluster` destination
+  - optional `.multicast::cluster` to copy into multiple CTAs’ shared memory at once (via `ctaMask`). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html))
+
+### Where Linear Layouts *as implemented* is likely misaligned
+
+Even though the seed is excellent at *mapping* tensors onto reg/thread/warp/shared, it does **not** (from what is described) elevate **“transport engines”** (TMA bulk copy, cluster-scope movement, async groups) to first-class objects in the layout engine. The layout engine is described in terms of:
+- anchor layouts,
+- propagation via use/def chains,
+- inserting layout conversions,
+- and then using shuffles/ldmatrix/stmatrix/vector ld/st when “tile divisibility” matches. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+That creates a **Hopper-era mismatch**:
+
+- **TMA wants:**
+  - explicit async copy groups (`cp.async.bulk.*`, barriers),
+  - warp specialization (copy warps vs compute warps),
+  - sometimes cluster-level staging/multicast.
+- **Linear Layouts engine currently reasons about:**
+  - static layout conversions and local (CTA-level) memory operations.
+
+So the failure mode on Hopper is not “incorrectness,” but **leaving latency-hiding and transport bandwidth on the table** when kernels *don’t already* use tensor descriptors/TMA.
+
+### Blackwell check (FP4 + Tensor Memory)
+
+The seed text explicitly acknowledges **Tensor Memory on Blackwell** as another special memory unit requiring special layouts. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+From an abstraction perspective:
+- Linear Layouts can likely *represent* many of these layouts (still bit-level swizzles/permutations),
+- but the *compiler plumbing* must expand:
+  - new memory spaces (tensor memory),
+  - new intrinsics / lowering targets,
+  - new “anchor layouts” and cost models.
+
+So “Blackwell conflict” is largely **coverage / lowering maturity**, not the math.
+
+### AMD MI300 check (vs MI250 baseline in the paper)
+
+Two concrete points:
+
+1) The paper itself reports that Triton‑Linear’s speedups are **lower on AMD** than NVIDIA, attributing it to lacking efficient primitives like `ldmatrix`. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+2) MI‑series GPUs have **different shared memory (LDS) bank behavior** because:
+- **64 lanes per wavefront**
+- **32 physical banks (4B per bank)**
+- bank conflict rules depend on the specific LDS instruction width (`ds_read_b128`, `ds_write_b128`, etc.). ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html))
+
+So even though Linear Layouts derives “optimal swizzles,” the **bank conflict model must be target-specific**. A swizzle that is “optimal” under a 32‑lane NVIDIA bank model can be *non-optimal* under AMD’s phased 64‑lane LDS model.
+
+---
+
+## 3) Workload stress test (LLM decoding + MoE)
+
+### Why LLM inference is adversarial to the seed’s assumptions
+
+LLM decoding and MoE introduce patterns that are “layout-hostile” in a very specific sense:
+
+- **Ragged / dynamic shapes**: effective tensor extents vary per request/token, so static tiling/layout decisions can mispredict contiguity and reuse.
+- **KV-cache paging**: memory access is often **indirect** (page tables / block maps). You can have a beautiful logical layout, but the physical memory is *not contiguous*, so vectorization/transactions degrade.
+- **Scatter/Gather dominance**: MoE routing, embedding, KV reads are gather/scatter heavy; much of the cost is address generation + memory divergence, not just bank conflicts.
+
+Linear Layouts excels when the problem is “my logical tensor is regular, and I need to map it onto regs/threads/warps/shared efficiently.” It is weaker when the problem is “my logical tensor indices are produced by **indirection** and are not regular.”
+
+---
+
+## Table 1 — Implementation Map
+
+| Abstraction_Layer | Seed_Approach | Modern_HW_Conflict (H100/MI300) | Potential_Fix (software-only) |
+|---|---|---|---|
+| **Triton frontend (Python)** | Expresses certain layout tricks purely via shape ops (e.g., pre-shuffle / scale broadcast for MXFP4) “in just five lines of Python”. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | **Runtime dynamism** (LLM decode, MoE) makes “compile once for a static tile” brittle; pre-shuffle may not amortize when batch is tiny. | Add **runtime/JIT shape specialization** + caching; integrate “layout plans” with autotuning keyed on (B, H, head_dim, page_size). |
+| **tt/ttg layout attachment** | Layouts are first-class attributes; layout engine uses **anchor layouts** (blocked for loads/stores, mma/wgmma for `tt.dot`) and propagates (forward/backward) inserting `convert_layout`. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | On Hopper, optimal kernels often require **warp specialization + async transport** (TMA) and sometimes **cluster-scope** reasoning; the described engine is largely **layout-conversion-centric**, not transport/pipeline-centric. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html)) | Extend the engine’s cost model to include **TMA pipelines** (latency hiding) and **cluster occupancy**; treat “transport operators” as schedulable ops (like `cp.async.bulk.tensor`). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html)) |
+| **Layout representation (𝔽₂ matrices)** | Represents layouts as linear maps on **bit-vectors** of reg/thread/warp indices; composition/product/inversion in 𝔽₂. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Doesn’t naturally model **pointer-chasing indirection** (KV-cache paging, MoE routing) where address = base + f(index_table[index]). | Hybridize: keep linear layouts for regular subspaces; attach an “**indirect axis**” annotation and generate specialized gather/scatter lowering (vectorized gather4/scatter4, or block-compacted prefetch). |
+| **Distributed layout definition** | Distributed layouts are surjective maps with columns being distinct powers of two or zeros (“permutation + zeros”). ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Hard to encode **cross-CTA / cluster** distribution (Thread Block Cluster introduces a new locality tier beyond a CTA). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html)) | Add a “**cluster dimension label**” so layouts can map across {CTA, warp, thread, reg}; enable DSMEM-aware conversions. |
+| **Memory layout definition (shared/tensor memory)** | Memory layouts are invertible linear maps Off→logical coords; includes mma swizzled layouts and claims all memory layouts are linear layouts. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Hopper’s TMA uses **tensor maps** and supports **1D–5D** tensor bulk copies; also supports **cluster multicast** copies. If memory layouts aren’t tied to tensorMap/TMA constraints, you can block TMA lowering. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html)) | Teach memory layouts to emit/consume **tensorMap descriptors** and constrain swizzles to those encodings; auto-lower eligible global↔shared to `cp.async.bulk.tensor` (instead of SM LD/ST). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html)) |
+| **Layout conversion codegen** | Computes conversion via right-inverse selection; tries to minimize inter-thread/warp movement and promote broadcasting. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | On Hopper, excessive conversion through registers/shuffles can create **Register Pressure → occupancy cliffs**, especially when coupled with wgmma fragment regs + epilogue fusion. | Add register-pressure-aware cost model; prefer **TMA-assisted staging** or shared-memory conversions when shuffles explode; schedule conversions around wgmma commit/wait. |
+| **Shared Memory Swizzle** | Computes “optimal swizzled layout” maximizing vectorization and minimizing bank conflicts; explicitly models bank conflicts in linear algebra. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | **AMD LDS** conflicts are wavefront‑64 with phased bank rules; the bank conflict objective must change per ISA (`ds_read_b128` etc). ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html)) | Make swizzle synthesis **target-parametric**: bank phases, bank mapping, preferred LDS widths; generate XOR swizzles consistent with AMD rules. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html)) |
+| **Gather operator lowering** | `tl.gather` can be optimized using warp shuffles **only if the gather axis is warp-contained**; otherwise it degenerates. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | MoE / KV-cache paging uses gather patterns that often cross warps/CTAs and are irregular; shuffle rounds can become instruction-bound. | Add hierarchical gather (warp→CTA→cluster), possibly using TMA scatter/gather-like modes where possible; block-sorted gather to improve coalescing. |
+| **Backend primitive availability** | Leverages SIMD-ish primitives (`ldmatrix/stmatrix`, vectorized `ld.shared/st.shared`) when tile divisibility matches. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Paper notes AMD gains are smaller due to lack of `ldmatrix`-like primitives in their stack. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Implement AMD analogues (LDS vector ops + MFMA-friendly packing) in Triton/MLIR lowering; add per-target “primitive catalog.” |
+
+---
+
+## 4) Performance Cliffs (3 concrete “Nsight Compute SOL% drops here” scenarios)
+
+Each cliff is phrased as: **trigger → why the seed degrades → what Nsight shows**.
+
+### Cliff #1 — H100 / GH200: `wgmma` inner-loop with RHS updated every iteration (attention-like)
+
+**Trigger scenario**
+- Kernel uses `tt.dot` lowered to **wgmma**.
+- In the K-loop, **the right operand is updated each iteration** (typical in attention blocks / streamed GEMM variants).
+
+**Why Linear Layouts can underdeliver**
+- The paper explicitly observes that when the RHS is updated per-iteration, **wgmma accesses it directly in shared memory**, and “only on RTX4090 it will be lowered into `ldmatrix` after our optimizations,” leading to **lower speedup on GH200**. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- Translation: a major part of the seed’s “win” (more `ldmatrix/stmatrix` and efficient layout conversions) is structurally less applicable when the compute primitive itself insists on shared-memory sourcing and update patterns disrupt reuse.
+
+**Nsight Compute symptoms (what “low SOL%” looks like)**
+- **Tensor Core utilization below expectation** (compute pipe underfed):
+  - Low tensor/SM utilization while memory or barrier stalls rise.
+- **Barrier / dependency stalls** increase:
+  - Lots of time waiting on shared-memory readiness / synchronization.
+- Often: memory throughput isn’t saturated either, because the pipeline is “bubbly” (not enough eligible warps), i.e., classic **occupancy/latency-hiding** breakdown.
+
+**Interpretation**
+- This is the “wgmma + staging” cliff: your layout conversions might be optimal in a static sense, but without **transport scheduling** (TMA + warp specialization) you can’t keep wgmma fed.
+
+---
+
+### Cliff #2 — `tl.gather` / layout conversions: gather axis grows (shuffle rounds explode)
+
+**Trigger scenario**
+- Either:
+  - you’re doing `tl.gather` on a dimension that grows beyond a “small warp-contained” regime, **or**
+  - your layout conversion strategy chooses warp-shuffle-based exchange on a growing axis.
+
+**Why Linear Layouts degrades**
+- The seed’s gather optimization is **conditional**: it only applies when “all elements along the axis dimension … reside within the same warp,” detected by a layout test; otherwise it can’t use warp shuffles. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- Even when the condition holds, they explicitly report that as gathered dimension increases, **speedup drops** because “the overhead of emitting multiple rounds of warp shuffles outweighs the benefits of eliminating shared memory.” ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+
+**Nsight Compute symptoms**
+- **Instruction-bound** behavior:
+  - High executed instruction count dominated by shuffle/permutation ops.
+- **Low SOL% despite low memory traffic**:
+  - You’re not DRAM-bound; you’re chewing cycles on data movement inside the SM.
+- Potential secondary effect: **Register Pressure rises** (more live values while shuffling), which can cut occupancy and worsen everything.
+
+**LLM/MoE tie-in**
+- MoE token routing + reordering commonly creates exactly this: lots of “index-driven” movement where warp-contained assumptions break, and shuffle-based data movement scales poorly.
+
+---
+
+### Cliff #3 — LLM decoding with KV-cache paging: indirection kills contiguity (vectorization collapses)
+
+**Trigger scenario**
+- **Decoding** (sequence length increments by 1 each step), often with:
+  - small batch (e.g., batch < 8),
+  - KV-cache stored in **paged / block tables**,
+  - access pattern = gather from scattered pages.
+
+**Why Linear Layouts can’t save it (and can even worsen it)**
+- Linear Layouts’ strongest wins come from:
+  - identifying contiguity for vectorization by reasoning about the inverse layout, ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+  - and converting layouts efficiently (sometimes via shuffles) instead of always staging through shared memory. ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+- KV paging breaks the premise: even if the *logical* axis is contiguous, **physical addresses are not**. That defeats vector loads/coalescing; you fall back to scalar/partial memory ops and pay address-gen overhead.
+- With small batch, your **Kernel Grid** is tiny; any extra register pressure from conversions/shuffles pushes you over an **occupancy cliff** (fewer active warps → worse latency hiding).
+
+**Nsight Compute symptoms**
+- **Memory-latency bound** despite low bandwidth:
+  - high long-scoreboard / memory dependency stalls (waiting on scattered loads),
+  - low DRAM throughput (not streaming),
+  - low SM occupancy / low eligible warps.
+- If your kernel still stages through shared for conversions: shared load/store overhead adds bubbles without improving coalescing.
+
+**Hopper-specific note**
+- This is exactly where Hopper’s **TMA** + warp specialization could help: TMA avoids using registers/SM instructions for movement and is designed for warp-specialized pipelines. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html))  
+- If the seed’s compilation path doesn’t automatically turn your staged loads into TMA bulk ops (tensorMap-based), you’ll see low SOL% even though the GPU *has* machinery to hide the latency.
+
+---
+
+Learn more:
+1. [Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using ₂](https://arxiv.org/html/2505.23819v3)
+2. [Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using $\\mathbb{F}\_2$](https://arxiv.org/pdf/2505.23819v3)
+3. [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html)
+4. [1. Introduction — parallel-thread-execution 8.1 documentation](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html)
+5. [Avoiding LDS Bank Conflicts on AMD GPUs Using CK-Tile Framework — ROCm Blogs](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html)

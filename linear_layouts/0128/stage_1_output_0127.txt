@@ -1,0 +1,245 @@
+## 1) Implementation Landscape (Real‑Metal SOTA) — where these “layout papers” sit in today’s stack
+
+You gave two seeds that are *both* “layout systems,” but they live at different layers:
+
+- **Seed A (Linear Layouts)**: *compiler-backend* mechanism inside **Triton’s GPU backend** (tt/ttg → LLVM/PTX). It makes layouts a first-class backend IR concept represented as **binary matrices over \(\mathbb{F}_2\)** and uses that to systematically generate layout conversions, swizzles, vectorization, and some gather optimizations. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- **Seed B (LEGO)**: *frontend/codegen* mechanism: a **layout expression language** that composes layouts + computation and emits indexing expressions, integrating via **template instantiation** (Jinja2 placeholders) and **SymPy** symbolic manipulation; then it relies on downstream compilers (Triton/MLIR/CUDA) for final lowering. ([arxiv.org](https://arxiv.org/html/2505.08091))  
+
+### ASCII pipeline view (software-visible)
+
+```
+                (Seed B: LEGO)                         (Seed A: Linear Layouts)
+Layout spec  ----------------------->  index exprs      Triton IR (tt/ttg)
+  + Jinja2 templates   SymPy algebra     (apply/inv)       + anchor layouts (blocked/mma/wgmma)
+          |                |                |              + propagation + convert insertion
+          v                v                v              + swizzle + shuffle + vectorization derivations
+   emits Triton/CUDA/MLIR source/IR  --->  backend  --->  LLVM/PTX/SASS
+                                          (Triton/LLVM)
+```
+
+### Why this matters for *H100/B200 + MI300X*
+On modern accelerators, **layout** is necessary but not sufficient. Peak kernels are dominated by *software orchestration* of:
+
+- **Asynchronous data movement** (Hopper: **TMA** can move 1D–5D tensors global↔shared, and even shared↔shared across SMs within a cluster; it avoids using registers + avoids “SM instructions” for the bulk copy). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.6.0/hopper-tuning-guide/index.html?utm_source=openai))  
+- **Cluster-level execution** (thread-block clusters + **Distributed Shared Memory**; access requires cluster semantics like `cluster.sync()`). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai))  
+- **Async proxy ordering** (bulk TMA ops and some tensor core ops are in an *async proxy*; correctness/perf requires the right proxy fences, not just correct indexing). ([docs.nvidia.com](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html?utm_source=openai))  
+- **MI300X realities**: wavefront=64, LDS bank conflicts have *phase/group* rules and XOR-style transforms are a known practical fix. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai))  
+
+So: these seeds “solve layout expression + conversion,” but your target bottlenecks (TMA, warp specialization, clusters, ragged KV paging, MoE scatter/gather) are mostly **layout × scheduling × dynamism** problems.
+
+---
+
+## 2) Deconstruct the seeds’ implementations (what is the “software artifact” + what hardware abstraction is assumed?)
+
+### Seed A: Linear Layouts (Triton backend)
+**Core software artifact**
+- A **Triton GPU backend layout engine** that:
+  - represents distributed + memory layouts as **linear maps over \(\mathbb{F}_2\)** (binary matrices acting on the *bits* of indices), ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+  - seeds “anchor layouts” (blocked for global ops, mma/wgmma for dot-like ops) and does forward/backward propagation + conversion insertion/rematerialization, ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+  - computes **shared-memory swizzles** to reduce bank conflicts while keeping vectorization, ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+  - generates **warp-shuffle-based layout conversions**, and even a **gather** fast path when indices reside in-warp. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+
+**Hardware abstraction it relies on**
+- “Layout = linear bit-matrix mapping between hardware resource indices (regs/threads/warps or memory offsets) and logical tensor coordinates.” ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- Explicitly models:
+  - **distributed layouts** (regs/threads/warps → tensor) as surjective linear layouts, ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+  - **memory layouts** (offsets ↔ tensor) including **mma swizzling** (defined only for power-of-two params). ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+
+**Declared limitation (highly relevant for LLM serving)**
+- “Primary limitation is restriction to **power-of-two shapes**; mitigation via “define larger tensors + mask OOB.” Also says flipping/slicing aren’t expressible as linear layouts (but could be handled by affine layouts). ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+
+That restriction is an immediate red flag for **ragged attention + KV paging + MoE token counts**, which are rarely powers of two.
+
+---
+
+### Seed B: LEGO (layout expression language + template instantiation)
+**Core software artifact**
+- A **layout algebra** where user composes hierarchical tiles + permutations; the layout exports:
+  - `apply`: logical index → flat physical position  
+  - `inv`: reverse mapping ([arxiv.org](https://arxiv.org/html/2505.08091))  
+- Integration strategy:
+  - user writes code with placeholders (Jinja2 `{{ }}`); LEGO generates symbolic index expressions and substitutes them; uses **SymPy** for symbolic manipulation. ([arxiv.org](https://arxiv.org/html/2505.08091))  
+
+**Hardware abstraction it relies on**
+- “Layout = (mostly) **bijection/permutation** of index space (optionally irregular via user-defined functions).” ([arxiv.org](https://arxiv.org/html/2505.08091))  
+- **Correctness assumptions**:
+  - user-defined permutation + inverse must truly be a bijection; LEGO currently leaves that as user responsibility. ([arxiv.org](https://arxiv.org/html/2505.08091))  
+
+**A practical “evaluation caveat” that becomes a performance cliff in LLM**
+- In their Triton matmul eval they used **power-of-two square matrices** and explicitly avoided partial tiles/masking to keep comparisons “fair.” ([arxiv.org](https://arxiv.org/html/2505.08091))  
+
+So LEGO’s published numbers largely *sidestep* the exact regimes that dominate inference/serving (dynamic shapes, raggedness, masking overhead).
+
+---
+
+## 3) Modern Hardware Stress Test — Hopper / Blackwell / MI300X
+
+### NVIDIA H100 (Hopper): the big mismatch is **asynchrony + clusters**, not just layout
+Hopper’s **TMA** changes the software contract:
+
+- TMA is a “more sophisticated async copy engine” than Ampere cp.async; it can transfer **1D–5D tensors** global↔shared and even shared↔shared across SMs in a **thread block cluster**, and it avoids registers and avoids consuming SM instruction issue bandwidth for the bulk movement. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.6.0/hopper-tuning-guide/index.html?utm_source=openai))  
+- At the ISA level, there are PTX bulk tensor copy ops like `cp.async.bulk.tensor.*` (including shared::cluster paths), with explicit completion mechanisms. ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=st+async&utm_source=openai))  
+- Cluster semantics + Distributed Shared Memory require explicit cluster coordination (e.g., `cluster.sync()` for existence/lifetime). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai))  
+- Some ops (bulk TMA, some tensor core ops like `wgmma.mma_async`) use an **async proxy** and require proxy fences for correct ordering. ([docs.nvidia.com](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html?utm_source=openai))  
+
+**Seed conflict**: both seeds focus on *index/layout derivation*, but do not make “async proxy / TMA descriptor / cluster lifetime” first-class in the layout abstraction. That means: even if your layout is perfect, you can still be **memory-feed limited** and stall tensor cores in FA/GEMM.
+
+### NVIDIA B200 (Blackwell): layout pressure increases because *precision + throughput* jumps
+Blackwell systems advertise huge **FP4/FP8 Tensor Core** throughput, which raises the bar on “feed the beast”:
+
+- DGX B200 specs list FP4 and FP8 Tensor Core performance figures, plus massive HBM bandwidth. ([nvidia.com](https://www.nvidia.com/en-us/data-center/dgx-b200/?utm_source=openai))  
+- NVIDIA’s Tensor Core page indicates Blackwell supports reduced precisions including FP4/FP6/FP8 (vs Hopper up to FP8/INT8). ([nvidia.com](https://www.nvidia.com/en-us/data-center/tensor-cores/?utm_source=openai))  
+
+**Seed A partially anticipates this**: it explicitly discusses “new-generation GPUs like B200” and quantized formats like MXFP4, including software emulation paths and layout tricks (pre-shuffle to recover vectorization). ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+But again: *precision-format support* ≠ *TMA/cluster scheduling support*.
+
+### AMD MI300X (CDNA3): “layout” must internalize **wave64 + LDS bank rules**
+ROCm docs highlight:
+
+- LDS is organized into banks (32 or 64 depending on arch), and bank conflicts depend on address mapping. ([rocm.docs.amd.com](https://rocm.docs.amd.com/projects/composable_kernel/en/latest/conceptual/ck_tile/hardware/lds_bank_conflicts.html?utm_source=openai))  
+- For MI-class GPUs, wavefront=64 and bank-conflict checks can be instruction-dependent (e.g., ds\_write\_b128 groups lanes in 8-lane phases); XOR transforms are used to eliminate conflicts without padding. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai))  
+- MFMA is wavefront-level; operands are distributed across the 64 threads and the ISA specifies the operand layouts. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores-cdna/README.html?utm_source=openai))  
+
+**Seed conflict**: Linear Layouts *can* model MFMA-family “MMA layouts” as linear, and it has a bank-conflict minimization algorithm, ([arxiv.org](https://arxiv.org/html/2505.23819v3)) but the stress-test question is whether its bank model is sufficiently **ISA-accurate for wave64 phase rules** (reads vs writes, b128 vs other widths) or whether it needs MI300-specific constraints baked into the solver. LEGO, being mostly an indexing generator, will inherit whatever the backend does—if backend lacks wave64-aware swizzle, LEGO won’t save you.
+
+---
+
+## 4) Workload Stress Test — where this breaks in LLM inference (decoding) + MoE
+
+### Why LLM inference is adversarial to “static layout algebra”
+- **Decoding**: \(L_q = 1\) (or tiny), \(L_{kv}\) grows over time, batch is small and ragged; compute per token is small, so **index math + masking + data movement** dominate.  
+- **KV-cache paging**: address computation is **indirect** (block tables / pointer-chasing). This is not a simple bijective permutation of a dense tensor.  
+- **MoE routing**: dynamic scatter/gather + varying tokens-per-expert → underfilled tiles + irregular writes/reads.
+
+Seed A does have a gather optimization, but it only hits when gather’s axis elements reside **within a warp**, otherwise it can’t use the warp-shuffle fast path. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+Seed B can express irregular bijections, but requires user-provided inverses and may generate complex index expressions (and SymPy admits it lacks range information needed to fully optimize them). ([arxiv.org](https://arxiv.org/html/2505.08091))  
+
+---
+
+# Table 1 — Implementation Map
+
+| Abstraction_Layer | Seed_Approach | Modern_HW_Conflict (e.g., “Blocks TMA”) | Potential_Fix (Real‑metal, no new hardware) |
+|---|---|---|---|
+| **Layout representation** | **Linear Layouts:** binary matrix over \(\mathbb{F}_2\) acting on index bits; covers distributed + memory layouts (incl. mma swizzle). ([arxiv.org](https://arxiv.org/html/2505.23819v3))<br><br>**LEGO:** hierarchical reshape+permute; bijections via `apply`/`inv`, can be user-defined/irregular. ([arxiv.org](https://arxiv.org/html/2505.08091)) | **LLM shapes are not power-of-two + not bijective.** Linear Layouts explicitly restricts to power-of-two shapes (mitigation by padding+masking) and can’t express flipping/slicing without extending to affine layouts. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Extend Linear Layouts to **affine/piecewise layouts** (as the paper itself suggests) and make “masked tiles” a first-class cost in autotuning. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) |
+| **Compiler placement** (where it lives) | **Linear Layouts:** integrated in Triton GPU backend with anchor layouts + propagation, inserting/rematerializing converts. ([arxiv.org](https://arxiv.org/html/2505.23819v3))<br><br>**LEGO:** frontend tool that emits code/IR; relies on backend compiler to do real mapping. ([arxiv.org](https://arxiv.org/html/2505.08091)) | **Backend/Frontend split blocks HW‑aware scheduling.** LEGO can’t “force” TMA/cluster usage unless templates encode it; Linear Layouts can, but currently treats layout as value-property, not a schedule pipeline. | Introduce a Triton/MLIR pass that couples **layout selection + pipeline schedule selection** (TMA stage count, barrier placement, warp specialization). |
+| **Index expression cost** (register pressure) | **LEGO:** SymPy-based symbolic expressions; SymPy lacks variable range info to generate the most optimized index expressions. ([arxiv.org](https://arxiv.org/html/2505.08091))<br><br>**Linear Layouts:** derives contiguity/vectorization from matrix inverse; less ad-hoc indexing. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | **Decoding is “instruction-bound” on integer math.** Heavy index arithmetic increases register pressure → occupancy cliffs → can’t hide HBM latency. | Add **range-aware simplification + strength reduction** (e.g., replace div/mod with bit ops when legal), and do post-emit **SASS/LLVM-level peepholes** for address calc. |
+| **Vectorized global memory** | **Linear Layouts:** computes max contiguous elements per thread using layout inverse, enabling vectorization beyond legacy heuristics. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | **Bulk async ops have alignment rules.** If vectorization/alignment isn’t integrated with layout choice, you can’t legally use cp.async / bulk copies (and you fall back to scalar ld/st). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai)) | Make alignment a **hard constraint** in the layout solver/autotuner (choose tiles/swizzles that preserve 16B/128B alignment where needed). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai)) |
+| **Shared memory swizzle / bank conflicts** | **Linear Layouts:** defines mma swizzling + proposes an algorithm that maximizes vectorization while minimizing bank conflicts. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | **MI300X LDS is wave64 + phase‑based conflict rules.** AMD’s bank-conflict checks depend on instruction width and lane grouping; XOR transforms are common in practice. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai)) | Add an **AMD-specific bank model** (wave64 + ds\_read/write\_b128 phase rules) into the swizzle solver, and/or directly emit the known XOR coordinate transforms where legal. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai)) |
+| **Tensor core / matrix core operand layouts** | **Linear Layouts:** claims mma/wgmma input+output layouts are linear; discusses MXFP4/MX formats and layout tricks. ([arxiv.org](https://arxiv.org/html/2505.23819v3))<br><br>**MI300:** MFMA is wavefront-level with operand distribution across 64 lanes. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores-cdna/README.html?utm_source=openai)) | **Blackwell/Hopper throughput increases “feed pressure.”** If you don’t pipeline memory (TMA) and reduce layout-conversion overhead, tensor pipes idle. ([nvidia.com](https://www.nvidia.com/en-us/data-center/dgx-b200/?utm_source=openai)) | Fuse **epilogue + layout conversion** (avoid extra staging), and auto-generate **typed layout packs** for FP8/FP4 that minimize conversions while preserving vector loads. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) |
+| **Asynchronous data movement (H100)** | Neither seed makes TMA a first-class abstraction (LEGO is indexing; Linear Layouts is layout mapping). | **Blocks TMA / async proxy correctness model.** TMA can copy 1D–5D tensors global↔shared and shared↔shared across cluster; avoids registers/SM instructions. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.6.0/hopper-tuning-guide/index.html?utm_source=openai)) PTX exposes `cp.async.bulk.tensor` and related group/wait semantics. ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=st+async&utm_source=openai)) Async proxy ordering requires fences. ([docs.nvidia.com](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html?utm_source=openai)) | Implement a Triton lowering path that converts (layout, tile) → **tensorMap + cp.async.bulk.tensor pipeline** with correct proxy fences + mbarriers; expose a minimal “TMA-capable layout” interface. ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=st+async&utm_source=openai)) |
+| **Thread Block Clusters / DSM** | Seeds reason mostly within a CTA/warp abstraction. | **Misses cluster-level sharing.** CUDA clusters enable distributed shared memory across blocks; correctness requires cluster-wide synchronization. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai)) | Extend layout engine to include a **cluster dimension** (block-rank axis) and add cluster-aware primitives (DSM addresses, TMA multicast) into codegen. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai)) |
+| **Gather/scatter & indirection** | **Linear Layouts:** gather fast path uses warp shuffles only when gathered axis resides within a warp. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) It also notes shuffle overhead grows with gathered dimension. ([arxiv.org](https://arxiv.org/html/2505.23819v3))<br><br>**LEGO:** can express irregular permutations, but bijection+inverse are user responsibility. ([arxiv.org](https://arxiv.org/html/2505.08091)) | **KV cache paging + MoE routing are not simple permutations.** Indirect addressing ruins coalescing and forces divergence; warp-shuffle gather may not apply, and “shuffle rounds” can become instruction-bound. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | Add a runtime **inspector–executor**: sort/pack tokens into contiguous expert/KV blocks, then run dense kernels; implement in PyTorch runtime + Triton kernels (real-metal evaluable via tritonbench MoE/FA). |
+| **Benchmark realism** | **LEGO** eval uses power-of-two matmuls and avoids masking/partial tiling. ([arxiv.org](https://arxiv.org/html/2505.08091))<br>**Linear Layouts** explicitly calls out that some kernels rely on **TMA tensor descriptors** and are absent on GPUs without TMA. ([arxiv.org](https://arxiv.org/html/2505.23819v3)) | The seeds’ “clean” regimes exclude the exact LLM-serving corner cases (ragged, small batch, indirect). | Use tritonbench with **ragged + paging + MoE** and report Nsight Compute SOL metrics + instruction mix + occupancy; include shape buckets that reflect serving. |
+
+---
+
+# Section 2 — Performance Cliffs (3 concrete “Nsight Compute low-SOL%” scenarios)
+
+Below are three failure modes that will show up *immediately* on real H100/B200/MI300X when applying the seeds’ layout-centric methods to tritonbench-style LLM kernels.
+
+---
+
+## Cliff 1 — **Power-of-two restriction → padding/masking explosion** (decoding + ragged attention)
+
+**Trigger scenario (typical serving)**
+- FlashAttention v2/v3 **decoding** regime:
+  - \(B \le 8\)
+  - \(L_q = 1\)
+  - \(L_{kv}\) ragged across batch (e.g., 193, 257, 511, 1003…)
+  - head_dim = 128
+- MoE routing where **tokens-per-expert** is highly nonuniform (many experts get <64 tokens).
+
+**Why the seed degrades**
+- **Linear Layouts explicitly restricts layouts to power-of-two shapes** and proposes “pad bigger + mask OOB” as mitigation. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+  In inference, padding to the next power-of-two is not a minor overhead—on ragged \(L_{kv}\) it’s a *dominant* waste of bandwidth and execution slots.  
+- **LEGO’s eval explicitly avoids partial tiling/masking** by choosing power-of-two matmuls. In real kernels you can’t avoid masking. ([arxiv.org](https://arxiv.org/html/2505.08091))  
+
+**What Nsight Compute will show (symptoms)**
+- **Low SOL SM%**: lots of predication + masked lanes ⇒ low achieved occupancy/issue.
+- **Low SOL DRAM% but still slow**: bandwidth isn’t saturated because many transactions are partially useful / poorly coalesced due to ragged edges.
+- Elevated:
+  - branch / predication inefficiency,
+  - “eligible warps per cycle” depressed due to register pressure + control flow,
+  - instruction mix skewed toward address calc + predicate ops vs tensor pipes.
+
+**Software-visible fix direction**
+- Make layout representation **affine/piecewise + masked-tile-cost-aware**, not “pad to power-of-two and hope.” Linear Layouts already points to affine layouts as the natural extension. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+
+---
+
+## Cliff 2 — **No TMA/cluster‑aware schedule → tensor pipes starve** (H100/B200 GEMM/FA)
+
+**Trigger scenario**
+- Any kernel with a “tight” compute core (wgmma/mma/mfma) where performance depends on *overlapping* global→shared transfers:
+  - FlashAttention forward/backward at moderate-to-large \(L_{kv}\),
+  - Quantized GEMM FP8/INT4 (or FP4 on Blackwell) with K/V tiles coming from HBM,
+  - Fused ops that stage through shared for reuse.
+
+**Why the seed degrades**
+- Hopper’s TMA can move **1D–5D tensors** global↔shared and even shared↔shared across SMs in a cluster, and *avoids* register usage + *avoids* SM instruction issue for the bulk copy. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.6.0/hopper-tuning-guide/index.html?utm_source=openai))  
+- PTX exposes `cp.async.bulk.tensor.*` ops (including cluster paths) and explicit group/wait semantics. ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=st+async&utm_source=openai))  
+- CUDA clusters/DSM require cluster-level existence/sync semantics. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai))  
+- The seeds’ abstractions optimize *layout mapping* but do not make the **TMA descriptor + async proxy ordering model** a first-class compilation decision; CUDA notes bulk TMA ops and some tensor core ops are in an **async proxy** requiring fences. ([docs.nvidia.com](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html?utm_source=openai))  
+
+So you can end up with:
+- “perfect swizzle,” but still synchronous ld/st-driven staging,
+- overuse of registers for copy → higher register pressure → occupancy cliffs,
+- insufficient overlap → tensor core utilization collapses.
+
+**What Nsight Compute will show**
+- **Low SOL Tensor / tensor pipe active%** (e.g., `smsp__pipe_tensor_*` style utilization depressed) while:
+  - memory dependency stalls increase,
+  - scoreboard stalls on loads dominate,
+  - warp issue stalls correlate with shared/global memory ops.
+- “Compute peak” unused despite having wgmma/mma in the SASS.
+
+**Software-visible fix direction**
+- Add a **TMA-aware lowering** to Triton/MLIR:
+  - infer tensorMap from layout,
+  - emit `cp.async.bulk.tensor` + barriers + correct proxy fences,
+  - integrate with warp specialization (one warp drives TMA, others compute). ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=st+async&utm_source=openai))  
+
+---
+
+## Cliff 3 — **Gather/scatter regimes: (a) warp-shuffle gather applicability cliff, (b) shuffle-rounds instruction cliff** (KV paging + MoE)
+
+**Trigger scenario**
+- **KV-cache paging**: gather from a paged KV cache via a block table / indirection.
+- **MoE**: gather tokens for each expert + scatter outputs back, especially when:
+  - tokens-per-expert is small/variable,
+  - indices span multiple warps/CTAs.
+
+**Why the seed degrades**
+- Linear Layouts’ gather optimization only applies if the gathered axis for `src` and `index` is within the **same warp**, detected by a layout property; then it uses warp shuffles. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+  - In KV paging / MoE, indices commonly cross warp boundaries or become pointer-chasing → the fast path stops applying and you’re back to shared-memory staging or global gathers.
+- Even when the warp-shuffle gather applies, Linear Layouts reports that as the gathered dimension grows, **speedup drops after a point** because multiple rounds of shuffles outweigh shared-memory elimination. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- On MI300-class GPUs, if you stage irregular gathers/scatters through LDS, you must respect wave64 + bank conflict phase rules; XOR transforms are commonly used to make LDS accesses conflict-free. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai))  
+
+**What Nsight Compute will show**
+- For NVIDIA (warp-shuffle heavy path):
+  - **Low SOL SM%** with high integer/shuffle instruction mix,
+  - elevated “execution dependency” / pipe utilization imbalance (compute units underfed).
+- For NVIDIA/AMD (fallback/shared staging path):
+  - **Low SOL DRAM%** (random access, poor coalescing),
+  - poor L2 hit rate / cache line utilization,
+  - shared/LDS conflict stalls if staging is not swizzled correctly (particularly visible on MI300 with wave64 bank rules). ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai))  
+
+**Software-visible fix direction**
+- Treat KV paging / MoE routing as **runtime data-reordering** problems (inspector–executor):
+  - stable sort/pack tokens into contiguous expert blocks (or KV pages),
+  - then run dense kernels with predictable layouts (where Linear Layouts-style swizzles + TMA pipelines actually apply),
+  - on AMD, apply XOR LDS transforms for conflict-free staging. ([rocm.blogs.amd.com](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai))  
+
+
+Learn more:
+1. [Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using ₂](https://arxiv.org/html/2505.23819v3)
+2. [LEGO: A Layout Expression Language for Code Generation of Hierarchical Mapping](https://arxiv.org/html/2505.08091)
+3. [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/archive/12.6.0/hopper-tuning-guide/index.html?utm_source=openai)
+4. [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/?utm_source=openai)
+5. [3.2. Advanced Kernel Programming — CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-kernel-programming.html?utm_source=openai)
+6. [Avoiding LDS Bank Conflicts on AMD GPUs Using CK-Tile Framework — ROCm Blogs](https://rocm.blogs.amd.com/software-tools-optimization/lds-bank-conflict/README.html?utm_source=openai)
+7. [1. Introduction — PTX ISA 9.1 documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=st+async&utm_source=openai)
+8. [DGX B200: The Foundation for Your AI Factory | NVIDIA](https://www.nvidia.com/en-us/data-center/dgx-b200/?utm_source=openai)
+9. [Tensor Cores: Versatility for HPC & AI | NVIDIA](https://www.nvidia.com/en-us/data-center/tensor-cores/?utm_source=openai)
+10. [Understanding AMD GPU LDS and Bank Conflicts — Composable Kernel 1.1.0 Documentation](https://rocm.docs.amd.com/projects/composable_kernel/en/latest/conceptual/ck_tile/hardware/lds_bank_conflicts.html?utm_source=openai)
+11. [Matrix Core Programming on AMD CDNA™3 and CDNA™4 architecture — ROCm Blogs](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores-cdna/README.html?utm_source=openai)
