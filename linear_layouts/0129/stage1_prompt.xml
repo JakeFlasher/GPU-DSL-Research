@@ -92,8 +92,10 @@
       **Output:** A structured analysis proving where the Linear Algebra approach requires an "Affine" or "Dependent" upgrade.
     </task>
 
-    <input_seed_paper>
-      [Context Provided: Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using $\mathbb{F}_2$]
+    <input_seed_paper> You need to first log out whether the following two urls are accessible and whether the targeted seed paper files are correct retrieved or not
+    https://arxiv.org/html/2505.23819v3
+    https://arxiv.org/html/2511.10374v1
+    https://arxiv.org/pdf/2601.05972
     </input_seed_paper>
 
     <output_requirements>
