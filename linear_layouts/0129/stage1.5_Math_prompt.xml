@@ -76,55 +76,54 @@
   </deliverables>
 </developer_configuration>
 
-<user_prompt stage="1" model="gpt-5.2-pro" reasoning_effort="xhigh">
-  <context_update>
-    **Seed Papers (The Theoretical Baseline):**
-    1. **Linear Layouts ($\mathbb{F}_2$):** Uses XOR-based linear algebra to model layouts. Great for swizzling, but restricted to powers of 2.
-    2. **Integer Set Relations (ISL):** Uses Polyhedral models to unify strided and bit-manipulation layouts. Powerful but potentially expensive at compile-time.
-    3. **Categorical Foundations:** Uses Category Theory (Morphisms, Functors) to model layout composition. High abstraction, potentially disconnected from hardware quirks.
-
-    **Target Hardware Context:**
-    - **NVIDIA H100 (Hopper) & B200 (Blackwell):** Relies heavily on **TMA** (Tensor Memory Accelerator) which requires *specific* layout descriptors. If the math generates a layout TMA doesn't support, performance tanks.
-    - **AMD MI300X:** Matrix Cores require specific data interleaving to avoid LDS bank conflicts.
-
-    **Target Workloads:**
-    - **Dynamic LLM Inference:** KV-Cache paging (Block Tables), Ragged Batches (Variable SeqLen).
-    - **Quantized GEMM:** FP4/INT4 packing requires complex bit-level swizzling inside registers.
-  </context_update>
-
+<user_prompt stage="1.5" model="gpt-5.2-pro" reasoning_effort="xhigh">
   <task>
-    Perform a **"Formalism-to-Hardware Gap Analysis"** on the provided Seed Papers.
+    We have identified specific **Performance Cliffs** (from Stage 1) where the Seed Paper's $\mathbb{F}_2$ approach fails on modern hardware (e.g., Dynamic Shapes, TMA Asynchrony, Non-power-of-2 strides).
+
+    Your goal is to build a **"Theoretical Arsenal"** to solve these specific problems.
+    Perform an exhaustive, independent research sweep across **Group Theory** throughout the history of pure Maths to find the mathematical abstractions that generalize or supersede the seed paper.
+    **Research Vectors:**
+    1.  **Beyond $\mathbb{F}_2$ (Group/Lattice Theory):**
+        - The seed assumes layouts are linear maps over bits ($\mathbb{F}_2$).
+        - *Search:* What math handles **non-power-of-2** strides or **ragged tensors**? (e.g., "Integer Lattices in Polyhedral Compilation", "Modular Arithmetic for Tensor Layouts", "Affine Types for Memory Safety").
     
-    1.  **Deconstruct the Mathematical Abstraction:**
-        - What are the **axioms**? (e.g., "Layouts are linear maps over $\mathbb{F}_2$").
-        - What are the **simplifications**? (e.g., "Ignores memory hierarchy latency," "Assumes static shapes").
+    2.  **The Math of Asynchrony (TMA/Pipeline):**
+        - The seed relies on static analysis. Modern hardware (Hopper/Blackwell) is asynchronous.
+        - *Search:* How do we model **async dependencies** and **barriers** mathematically? (e.g., "Separation Logic for GPU Memory", "Pi-calculus for Tensor Cores", "Presburger Arithmetic for Async Pipelines").
 
-    2.  **The "Hardware Reality" Stress Test:**
-        - **TMA Compatibility:** Can the seed's generated layouts be directly lowered to a `CuTensorMap` descriptor on H100? Or does the math produce "valid but un-acceleratable" layouts?
-        - **Bank Conflict Modeling:** Does the formalism *provably* minimize bank conflicts, or does it just define the mapping? (e.g., Does the $\mathbb{F}_2$ solver explicitly solve for `conflict_rate = 0`?).
+    3.  **Program Synthesis & Constraint Solving:**
+        - Instead of *writing* layouts, can we *solve* for them?
+        - *Search:* "SMT-based Tensor Code Generation", "Equality Saturation (egg) for Tensor Graphs".
 
-    3.  **The "Dynamic Workload" Stress Test:**
-        - **The Ragged Tensor Problem:** How does the formalism handle a batch of sequences with lengths $[12, 1023, 7]$? 
-        - Does it force padding to $1024$ (wasteful)? Or can it handle "Affine + Masked" layouts?
-
-    **Output:** A "Theoretical Friction" report identifying 3 specific areas where the rigorous math fails to capture the messy reality of high-performance GPU execution.
   </task>
-
   <input_seed_paper>
     Please verify access and retrieve content from:
     1. https://arxiv.org/html/2505.23819v3 (Linear Layouts)
     2. https://arxiv.org/html/2511.10374v1 (ISL for Layouts)
     3. https://arxiv.org/pdf/2601.05972v1 (Categorical Foundations) and make sure you read them in entirety as many of the corner cases will be used
   </input_seed_paper>
+  <input_context>
+    <stage_1_bottlenecks>
+      uploaded to the attached files
+      (e.g., "Seed fails on dynamic batch sizes," "Seed cannot express TMA multicast patterns," "Seed fails on prime-number dimension sizes")
+    </stage_1_bottlenecks>
+  </input_context>
 
   <output_requirements>
-    <table_1>
-      **Abstraction vs. Hardware Matrix**
-      Columns: Mathematical_Concept | Hardware_Feature | Friction_Point (e.g., "$\mathbb{F}_2$ implies bitwise ops, but TMA expects stride descriptors") | Proposed_Relaxation
-    </table_1>
+    <section_1>
+      **The Theoretical Toolbox**
+      For each Stage 1 Bottleneck, propose 2 distinct theoretical frameworks that could solve it.
+      *Format:*
+      - **Bottleneck:** [e.g., Dynamic Shapes]
+      - **Theory A:** [e.g., Symbolic Polyhedra] (Explain *why* it works)
+      - **Theory B:** [e.g., JIT-Specialization via Partial Evaluation]
+    </section_1>
+    
     <section_2>
-      **The Three Performance Cliffs:**
-      Describe 3 scenarios where the *Formal* code generation would yield suboptimal *Machine* code (SASS) compared to a hand-tuned heuristic.
+      **Literature Scan**
+      List 3-5 recent breakthroughs in Pure Maths(group theory) that are relevant.
+      (e.g., "New affine scheduling algorithms," "Dependent types for array shapes").
     </section_2>
   </output_requirements>
 </user_prompt>
+ 

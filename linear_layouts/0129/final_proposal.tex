@@ -1,0 +1,448 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath, amssymb, amsfonts, amsthm}
+\usepackage{fancyvrb}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{listings}
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+
+% --- Macros (avoid $...$; use \(..\) and \[..\]) ---
+\newcommand{\Ftwo}{\mathbb{F}_2}
+\newcommand{\Nat}{\mathbb{N}}
+\newcommand{\Addr}{\mathsf{Addr}}
+\newcommand{\Layout}{\mathsf{Layout}}
+\newcommand{\Desc}{\mathsf{Desc}}
+\newcommand{\Barrier}{\mathsf{Barrier}}
+\newcommand{\Token}{\mathsf{Token}}
+\newcommand{\Visible}{\mathsf{Visible}}
+\newcommand{\Encodes}{\mathsf{encodes}}
+\newcommand{\Admissible}{\mathsf{Admissible}}
+\newcommand{\DNF}{\mathsf{DNF}}
+\newcommand{\SM}{\mathsf{SM}}
+\newcommand{\TMA}{\mathsf{TMA}}
+
+\begin{document}
+
+\title{CHRONOS: Hardware-Certified Layout Synthesis and Temporal Effect Typing for Asynchronous Tensor Compilers}
+
+\author{\IEEEauthorblockN{Principal Architect}
+\IEEEauthorblockA{Systems \& Compiler Architecture (ASPLOS/PLDI Focus)}
+}
+
+\maketitle
+
+\begin{abstract}
+Modern NVIDIA GPUs (H100/SM90+) shift the performance-critical path for tensor kernels from \emph{spatial} index bijections to \emph{temporal, descriptor-driven} protocols: bulk tensor movement via the Tensor Memory Accelerator (TMA) requires a \emph{finite, hard-constrained} tensor-map descriptor; high utilization depends on explicit asynchronous overlap and weak-ordering discipline (e.g., \texttt{cp.async.bulk(.tensor)} groups and \texttt{mbarrier} acquire/release); and tensor-core throughput hinges on warpgroup-level asynchronous MMA (\texttt{wgmma.mma\_async}) with its own fence/wait protocol. Existing layout abstractions---Linear Layouts over \(\Ftwo\) and CuTe-style layout algebras---are primarily \emph{spatial-only}: they can generate mathematically valid bijections and compose them cleanly, but they neither (i) restrict layout search to the \emph{hardware-admissible} descriptor fragment nor (ii) provide a typed semantics for \emph{when} data becomes visible under weak ordering.
+\par
+We propose \textbf{CHRONOS}, a type-driven compiler architecture that makes the fast path a \emph{type} and time a \emph{token}. CHRONOS introduces (1) \emph{descriptor-certified refinement types} that admit a layout \(\Layout_{\TMA}\) iff a witness descriptor exists satisfying the exact \(\texttt{cuTensorMapEncodeTiled}\) constraints, and (2) \emph{linear temporal effects} that enforce correct and optimizable asynchronous protocols via consumable tokens tied to \texttt{mbarrier} phases and warpgroup MMA groups. We present a concrete MLIR/Triton implementation plan: equality-saturation normalization to a descriptor-normal form, SMT-backed witness synthesis for TMA parameters, and token-respecting list scheduling that sinks waits and maximizes overlap. We evaluate on Hopper with FlashAttention-3-style warp-specialized attention, FP8 WGMMA GEMM, and ragged/MoE routing, measuring TMA utilization rate, pipeline bubbles, and compile-time budgets.
+\end{abstract}
+
+\section{Introduction \& Motivation}
+
+\subsection{The Cliff: \(\Ftwo\) layouts are valid bijections but not valid TMA descriptors}
+Linear Layouts model layout transformations as linear maps over \(\Ftwo\), enabling generic composition, inversion, and bit-level swizzles for GPU layouts \cite{zhou2026linearlayouts}. This yields a \emph{large} space of semantically correct bijections (e.g., XOR-mixing of address bits) and a clean algebra for distributed and memory layouts.
+\par
+However, Hopper's highest-leverage data-movement fast path is \emph{descriptor-driven}. TMA operations (and their PTX encodings via \texttt{cp.async.bulk.tensor.*}) consume a tensor map descriptor whose legality is \emph{not} ``any bijection''; it is a narrow fragment with hard constraints:
+\begin{itemize}
+  \item tensor rank \(\le 5\) (and additional rank constraints when interleave \(\ne\) NONE),
+  \item \(\texttt{globalAddress}\) alignment at least 16B (32B in specific modes),
+  \item \(\texttt{globalStrides}\) multiples of 16B (32B when interleave is 32B),
+  \item \(\texttt{boxDim}[i] \le 256\),
+  \item a \emph{finite enumerated} shared-memory swizzle family (NONE, 32B/64B/128B, and ATOM variants), with coupling constraints to interleave and the ``inner dimension'' in bytes \cite{cuda12_9_tma,cuda12_9_1_tma}.
+\end{itemize}
+A layout outside this fragment cannot be encoded as a tensor map; the compiler must fall back to \(\SM\)-issued address-generation loops (scalar/vector LD/ST or non-descriptor async copies), sacrificing TMA's advertised benefits.
+\par
+This is a \emph{cliff}, not a slope: the Hopper tuning guidance emphasizes that TMA avoids \(\SM\) instruction pressure because a \emph{single thread} can issue large moves while the block continues compute, enabling warp specialization \cite{hopper_tuning}. Crossing the descriptor admissibility boundary flips the kernel from warp-specialized overlap to instruction-bound data movement.
+
+\subsection{The Hazard: spatial layout algebras do not type weak ordering}
+CuTe-style layout algebras (and their categorical formalization) focus on describing and composing tensor layouts and layout operations (composition/product/division) \cite{carlisle2026cute}. This is a correctness win for the \emph{mapping}, but Hopper/SM90 introduces a second correctness dimension: \emph{when} memory becomes visible.
+\par
+PTX explicitly states that asynchronous copies are \emph{weakly ordered}: there is no ordering guarantee between operations within an async-group; correctness depends on explicit waits (\texttt{cp.async.bulk.wait\_group} or \texttt{mbarrier.test\_wait}) and on acquire/release semantics around \texttt{mbarrier} completion \cite{ptxisa87}. Similarly, \texttt{wgmma.mma\_async} is warpgroup-asynchronous; accessing accumulators without the corresponding \texttt{wgmma.wait\_group} is undefined, and \texttt{wgmma.fence} establishes required ordering with respect to warpgroup registers and (via an async proxy fence) shared memory operands \cite{ptxisa87}.
+\par
+Today, these protocols are mostly encoded by hand in high-performance kernels (e.g., FlashAttention-3 uses warp specialization and TMA/async overlap) \cite{flashattn3}. Manual protocol management is error-prone: it admits classic hazards (read-before-write, write-after-write under overlapping stages, or using WGMMA accumulators before completion) that are \emph{not expressible} in spatial-only layout IRs.
+
+\subsection{The Solution: \emph{fast path as a type; time as a token}}
+CHRONOS unifies the spatial and temporal dimensions by combining:
+\begin{enumerate}
+  \item \textbf{Refinement types} that \emph{refine} a spatial layout into a hardware-admissible descriptor-bearing subtype (\(\Layout_{\TMA}\)) iff a witness descriptor exists.
+  \item \textbf{Linear temporal effects} (typestate/token discipline) that encode asynchronous completion and visibility as consumable resources linked to \texttt{mbarrier} and warpgroup MMA group protocols.
+\end{enumerate}
+This turns two silent failure modes into typed obligations:
+\begin{quote}
+\emph{``A layout is valid''} \(\not\Rightarrow\) \emph{``a descriptor exists''}, and \emph{``mapping is correct''} \(\not\Rightarrow\) \emph{``schedule is correct under weak ordering''}.
+\end{quote}
+
+\section{Theoretical Framework (Formalism)}
+
+\subsection{Admissibility as a Refinement Type}
+
+\begin{definition}[Layout Semantics]
+A \(\Layout\) denotes a total function from a finite index domain to an address space:
+\[
+  L : D \subseteq \Nat^k \rightarrow \Addr,
+\]
+where \(D\) is the logical coordinate domain of a tensor tile (possibly parameterized by shape and tiling choices). Linear Layouts instantiate \(L\) via linear maps over \(\Ftwo\) on bit-vectors, enabling XOR-based swizzles and permutations \cite{zhou2026linearlayouts}.
+\end{definition}
+
+\begin{definition}[TMA Descriptor Fragment]
+A TMA descriptor \(d \in \Desc_{\TMA}\) is a record of fields (rank, base address, dimensions, strides, box, element traversal strides, interleave, swizzle, L2 promotion, OOB fill) constrained by the exact \texttt{cuTensorMapEncodeTiled} legality rules \cite{cuda12_9_tma,cuda12_9_1_tma}. We write \(C_{\TMA}(d)\) for this conjunction, including (representatively):
+\[
+\begin{aligned}
+& 1 \le \texttt{tensorRank}(d) \le 5 \\
+& \texttt{globalAddress}(d) \equiv 0 \pmod{16} \\
+& \forall i < \texttt{tensorRank}(d)-1:\ \texttt{globalStrides}_i(d) \equiv 0 \pmod{16} \\
+& \forall i < \texttt{tensorRank}(d):\ 1 \le \texttt{boxDim}_i(d) \le 256 \\
+& \texttt{swizzle}(d) \in \{\texttt{NONE},\texttt{32B},\texttt{64B},\texttt{128B},\texttt{ATOM variants}\} \\
+& \text{plus interleave/swizzle coupling and inner-dimension bounds.}
+\end{aligned}
+\]
+\end{definition}
+
+\begin{definition}[Descriptor Encoding Relation]
+We define \(\Encodes(d,L)\) to mean that descriptor \(d\) realizes layout \(L\) for a chosen tile domain \(D\):
+\[
+  \Encodes(d,L) \triangleq \forall \vec{i}\in D:\ L(\vec{i}) = \sem{\texttt{tensorMap}}(d,\vec{i}),
+\]
+where \(\sem{\texttt{tensorMap}}\) is the address function induced by the descriptor fields in tiled tensor-map mode (global address + stride traversal, with descriptor-defined swizzle behavior in shared memory) \cite{cuda12_9_tma,cuda12_9_1_tma,ptxisa87}.
+\end{definition}
+
+\begin{definition}[Refined Type: \(\Layout_{\TMA}\)]
+We define the admissible subtype of layouts:
+\[
+  \Layout_{\TMA} \triangleq \{\,L \mid \exists d\in \Desc_{\TMA}.\ C_{\TMA}(d) \wedge \Encodes(d,L)\,\}.
+\]
+\end{definition}
+
+\noindent\textbf{Typing judgment (admissibility).}
+We write:
+\[
+  \Gamma \vdash L : \Layout_{\TMA}
+  \quad \text{iff} \quad
+  \exists d.\ \Gamma \vdash d : \Desc_{\TMA} \wedge \Encodes(d,L).
+\]
+Operationally, CHRONOS produces \(d\) as a \emph{witness} (certificate) attached to IR, making later compiler stages checkers rather than searchers.
+
+\subsection{Temporal Effects via Linear Logic (Tokens and Barriers)}
+
+The hardware truth is that completion/visibility is not derivable from program order. PTX specifies: (i) no ordering within async-groups; (ii) explicit \texttt{wait\_group}/\texttt{mbarrier.test\_wait} governs completion; and (iii) \texttt{mbarrier.test\_wait} provides acquire semantics when it returns true, while memory accesses between arrive and wait have no ordering guarantees \cite{ptxisa87}. Therefore, we treat completion as a linear capability.
+
+\begin{definition}[Resources]
+We model three linear resources:
+\begin{itemize}
+  \item \(\Barrier(r,p)\): an \texttt{mbarrier} object protecting region \(r\) at phase \(p\).
+  \item \(\Token(r,n)\): an in-flight asynchronous transfer of \(n\) bytes into region \(r\).
+  \item \(\Visible(r)\): permission to read region \(r\) as visible under acquire.
+\end{itemize}
+Resources are linear: they must be consumed exactly once (no implicit duplication), matching the single-consumer nature of completion obligations in pipelined staging.
+\end{definition}
+
+\subsubsection{Typing rules (core)}
+The user-facing rule shape is:
+\[
+\frac{
+  \Gamma \vdash d : \Desc \quad \Gamma \vdash b : \Barrier
+}{
+  \Gamma \vdash \texttt{async\_copy}(d,b) : \Token \otimes \Barrier'
+}
+\]
+We instantiate this with region- and byte-tracking:
+\[
+\frac{
+  \Gamma \vdash d : \Desc_{\TMA}(r,n) \quad \Gamma \vdash b : \Barrier(r,p)
+}{
+  \Gamma \vdash \texttt{async\_copy}(d,b) : \Token(r,n)\ \otimes\ \Barrier(r,p{+}1)
+}
+\]
+where \(\texttt{async\_copy}\) lowers to \texttt{cp.async.bulk.tensor.*.mbarrier::complete\_tx::bytes} with the corresponding \texttt{mbarrier} operand \cite{ptxisa87}.
+
+\noindent\textbf{Wait rule (consumes token, produces visibility).}
+\[
+\frac{
+  \Gamma \vdash t : \Token(r,n) \quad \Gamma \vdash b : \Barrier(r,p)
+}{
+  \Gamma \vdash \texttt{wait}(t,b) : \Visible(r)
+}
+\]
+The implementation lowers \texttt{wait} to a loop around \texttt{mbarrier.test\_wait} (or \texttt{try\_wait}) and uses the acquire semantics as the visibility point \cite{ptxisa87}.
+
+\subsubsection{WGMMA integration}
+WGMMA introduces another asynchronous protocol: \texttt{wgmma.mma\_async} is warpgroup-aligned and produces results that are undefined to access before the corresponding \texttt{wgmma.wait\_group}; \texttt{wgmma.fence} establishes ordering w.r.t. accumulator and A-fragment registers and requires additional ordering for shared-memory operands \cite{ptxisa87}. CHRONOS treats these as a second token family:
+\[
+  \texttt{wgmma\_mma} : \texttt{WGDescA} \otimes \texttt{WGDescB} \rightarrow \Token_{\texttt{wg}}(\texttt{acc}) \,,
+\]
+and inserts/validates \texttt{wgmma.wait\_group} before accumulator use sites.
+
+\subsection{Soundness Statement (Safety under Weak Ordering)}
+
+\begin{theorem}[Temporal Safety]
+If a CHRONOS program is well-typed under the linear temporal system (no duplicated or dropped \(\Token\)/\(\Barrier\) resources), then in the lowered PTX:
+\begin{enumerate}
+  \item no shared-memory read of region \(r\) occurs before the acquire point of a corresponding \texttt{mbarrier.test\_wait} that completes all async copies producing \(r\); and
+  \item no use of WGMMA accumulator registers occurs before a \texttt{wgmma.wait\_group} that waits on the group containing the producing \texttt{wgmma.mma\_async}.
+\end{enumerate}
+\end{theorem}
+
+\noindent\textbf{Proof sketch.}
+The typing discipline enforces dominance of \(\Visible(r)\) over all reads from \(r\) and dominance of waited warpgroup tokens over accumulator uses. Lowering preserves these dominance relations as explicit PTX waits: \texttt{mbarrier.test\_wait} provides acquire when it returns true and PTX states there is no ordering/visibility guarantee between arrive and wait, matching our prohibition of reads in that interval \cite{ptxisa87}. For WGMMA, PTX states accessing accumulators without an appropriate \texttt{wgmma.wait\_group} is undefined, matching our linear obligation \cite{ptxisa87}. Translation validation checks that each token consumption corresponds to an actual wait edge.
+
+\section{Compiler Architecture (Implementation)}
+
+CHRONOS is designed to be implementable as a Triton/MLIR extension, respecting real PTX semantics and CUDA descriptor constraints. The key engineering principle is \emph{generate \(\rightarrow\) verify \(\rightarrow\) attach certificate}.
+
+\subsection{IR Overview: Spatial + Temporal}
+We introduce an MLIR dialect (\texttt{chronos}) with:
+\begin{itemize}
+  \item \texttt{chronos.layout\_spec}: general layout expressions (including \(\Ftwo\) linear layouts).
+  \item \texttt{chronos.tma.desc}: refined descriptor value (witness) with verifier for \(C_{\TMA}\).
+  \item \texttt{chronos.cp.async.bulk.tensor}: async copy op returning \texttt{!chronos.token<r,n>} and an updated \texttt{!chronos.barrier<r,p>}.
+  \item \texttt{chronos.mbarrier.wait}: consumes token and yields \texttt{!chronos.visible<r>}.
+  \item \texttt{chronos.wgmma.mma\_async} / \texttt{chronos.wgmma.wait\_group}: modeled after PTX/WGMMA constraints.
+\end{itemize}
+
+\subsection{Pass 1: EqSat Normalization to Descriptor-Normal Form}
+The goal is to rewrite a large \(\Ftwo\) layout expression space into a form where descriptor synthesis is feasible and swizzles match the finite TMA swizzle family.
+
+\paragraph{Key normalization targets.}
+\begin{enumerate}
+  \item \textbf{Factor permutations from swizzles}: separate pure dimension permutations (stride-affine) from bit-mixing.
+  \item \textbf{Push XOR mixing to low bits}: TMA swizzle options operate on fixed spans (e.g., 16B chunks within 32B/64B/128B, plus ATOM variants), so only low-order structure is potentially representable \cite{cuda12_9_1_tma}.
+  \item \textbf{Canonicalize reshape/split/join}: expose rank \(\le 5\) candidates and contiguous inner dimensions (required by descriptor constraints).
+\end{enumerate}
+
+\paragraph{Engine.}
+We use equality saturation (e-graphs) via \texttt{egg} and/or the MLIR \texttt{eqsat} dialect to explore many equivalent rewrites non-destructively and then extract a minimum-cost representative under a hardware-aware cost model \cite{egg_popl21,eqsat_arxiv25,tensat_mlsys21}.
+
+\subsection{Pass 2: SMT-backed Descriptor Witness Synthesis}
+Given a normalized layout \(L'\) in \(\DNF\), CHRONOS solves for descriptor parameters \(d\) such that:
+\[
+  C_{\TMA}(d) \wedge \Encodes(d,L') \,.
+\]
+We implement synthesis as a two-level strategy:
+\begin{enumerate}
+  \item finite enumeration over discrete choices (rank, interleave, swizzle enum, L2 promotion, OOB fill),
+  \item SMT (Z3 or cvc5) for integer constraints (alignment congruences, stride bounds, box bounds, inner-dimension vs swizzle constraints) plus lightweight equivalence checks against \(L'\) on the tile domain \cite{z3,cvc5,cuda12_9_tma,cuda12_9_1_tma}.
+\end{enumerate}
+Success produces a \texttt{chronos.tma.desc} witness attached to IR; failure produces an explicit, costed fallback plan (e.g., \texttt{cp.async} or vector LD/ST).
+
+\subsection{Pass 3: Tokenized Scheduling (Overlap by Construction)}
+CHRONOS then performs a list scheduling pass over the SSA graph with linear resources:
+\begin{itemize}
+  \item \textbf{Hoist} \texttt{async\_copy} as early as dependencies permit.
+  \item \textbf{Sink} \texttt{wait} to the last use of the corresponding region.
+  \item \textbf{Respect} group semantics: \texttt{cp.async.bulk.commit\_group} creates groups with no ordering within the group; waits must be placed based on the actual consumer requirements \cite{ptxisa87}.
+  \item \textbf{Warp specialization}: partition warps into copy-warps and compute-warps; this is explicitly aligned with Hopper’s intended use of TMA \cite{hopper_tuning}.
+\end{itemize}
+
+\begin{algorithm}[t]
+\small
+\DontPrintSemicolon
+\caption{Token-Respecting List Scheduling (simplified)}
+\KwIn{DAG of ops with deps; linear resources \(\Token,\Barrier\); cost model for stalls}
+\KwOut{Scheduled block with maximal overlap subject to correctness}
+Initialize ready-list with ops whose SSA deps are satisfied\;
+Maintain maps \(\mathsf{liveToken}[r]\), \(\mathsf{barrierState}[r]\)\;
+\While{unscheduled ops remain}{
+  Pick next op \(op\) from ready-list minimizing \(\Delta\)stall\;
+  \uIf{\(op\) is \texttt{async\_copy}(d,b)}{
+    Emit \(op\); record \(\mathsf{liveToken}[r]\gets t\); advance \(\mathsf{barrierState}[r]\)\;
+  }
+  \uElseIf{\(op\) reads region \(r\) and \(\mathsf{liveToken}[r]\) exists}{
+    Emit \texttt{wait}(\(\mathsf{liveToken}[r]\), \(\mathsf{barrierState}[r]\)) at this point\;
+    Kill \(\mathsf{liveToken}[r]\)\;
+    Emit \(op\)\;
+  }
+  \Else{
+    Emit \(op\)\;
+  }
+  Update ready-list\;
+}
+\end{algorithm}
+
+\subsection{End-to-end Flow (ASCII)}
+\begin{figure}[t]
+\begin{Verbatim}[fontsize=\scriptsize, commandchars=\\\{\}]
+Input:
+  - F2 Linear Layout (Seed A) + CuTe-style composition (Seed C)
+  - Tensor tile shapes, element types, target SM (sm_90/sm_90a)
+
+      |
+      v
+[Pass 1] EqSat Normalization (egg/eqsat)
+  Layout -> Descriptor-Normal Form (DNF)
+  - factor permutations
+  - push XOR to low bits
+  - canonicalize reshape/split/join
+      |
+      v
+[Pass 2] SMT Witness Synthesis (Z3/cvc5)
+  Solve: C_TMA(desc) /\ encodes(desc, layout_DNF)
+    - rank <= 5
+    - 16B alignment, stride congruences
+    - boxDim <= 256
+    - finite swizzle enums (32/64/128B + ATOM variants)
+  Success -> attach chronos.tma.desc
+  Fail    -> explicit fallback (cp.async / vector ld/st)
+      |
+      v
+[Pass 3] Tokenized Scheduling (Linear Types)
+  - hoist async_copy
+  - sink wait
+  - warp specialization (copy-warps vs compute-warps)
+      |
+      v
+Lowering:
+  - PTX: cp.async.bulk.tensor.* + mbarrier.test_wait
+  - PTX: wgmma.mma_async + wgmma.wait_group + wgmma.fence
+  - Validation: each token corresponds to concrete wait edges
+\end{Verbatim}
+\caption{CHRONOS compilation pipeline: certified layouts + effect-typed time.}
+\end{figure}
+
+\section{Evaluation Strategy}
+
+\subsection{Baselines}
+We compare against:
+\begin{itemize}
+  \item \textbf{FlashAttention-3} (hand-optimized warp-specialized attention using Hopper asynchrony and low precision) \cite{flashattn3}.
+  \item \textbf{Triton (standard)} (existing layout engine and lowering paths) \cite{triton}.
+  \item \textbf{cuBLAS/cuBLASLt} as vendor GEMM baseline \cite{cublas}.
+  \item \textbf{CUTLASS/CuTe} as a reference for handcrafted descriptor-aware kernels and layout engineering \cite{cutlass,carlisle2026cute}.
+\end{itemize}
+
+\subsection{Benchmarks}
+\begin{enumerate}
+  \item \textbf{Ragged Attention} (variable sequence length): stresses descriptor admissibility and temporal scheduling under dynamic bounds. We evaluate both fixed-shape and bucketed ragged regimes.
+  \item \textbf{FP8 GEMM (WGMMA)}: stresses shared-memory layout constraints, WGMMA descriptor usage, and warpgroup scheduling (\texttt{wgmma.fence}, \texttt{wgmma.wait\_group}) \cite{ptxisa87}.
+  \item \textbf{Hopper-based MoE Routing} (scatter/gather + reductions): stresses nontrivial layout conversions, asynchronous staging, and potential TMA reduction paths (when applicable).
+\end{enumerate}
+
+\subsection{Metrics}
+We report:
+\begin{enumerate}
+  \item \textbf{TMA Utilization Rate}: fraction of global\(\leftrightarrow\)shared transfers lowered to descriptor-backed \texttt{cp.async.bulk.tensor} vs fallback.
+  \item \textbf{Pipeline Bubble \%}: measured via Nsight Compute stall breakdown (e.g., barrier/scoreboard-related stalls), as a proxy for overlap quality.
+  \item \textbf{Compile Time}: total compilation time and per-pass breakdown (EqSat time, SMT time, scheduling time), compared to (i) heuristic-only (Seed A style) and (ii) relation-heavy verification workflows inspired by ISL encodings (Seed B) \cite{isl_relations,isl}.
+  \item \textbf{Correctness}: automated validation that no consumer uses shared-memory regions before \texttt{mbarrier} acquire and no WGMMA accumulator is used before \texttt{wgmma.wait\_group} (translation validation).
+\end{enumerate}
+
+\begin{table}[t]
+\caption{Primary evaluation metrics and why they matter on H100.}
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Metric & Hardware meaning \\
+\midrule
+TMA utilization rate & staying on descriptor fast path (rank/alignment/swizzle legal) \\
+Pipeline bubble \% & overlap quality under weak ordering (\texttt{mbarrier} placement) \\
+Compile time & JIT viability; solver and EqSat budgets \\
+Correctness checks & eliminates read-before-ready and WGMMA UB hazards \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Related Work}
+
+\subsection{Layout abstractions and their limits}
+Linear Layouts provide an elegant \(\Ftwo\) algebra for spatial layouts, including swizzling and bank-conflict reasoning, but do not encode TMA descriptor admissibility as a semantic subtype \cite{zhou2026linearlayouts}. The ISL-relations work shows that both CuTe and linear layouts can be represented as integer set relations for unified formal reasoning, but positions itself as foundational rather than a hardware-typed synthesizer or temporal semantics \cite{isl_relations,isl}. The categorical CuTe formalization clarifies composability and a tractable fragment aligned with CUTLASS behavior, but it is intentionally a layout algebra; it does not provide a typed account of \texttt{mbarrier}/async protocols or descriptor legality \cite{carlisle2026cute}.
+
+\subsection{Tensor compilers and scheduling systems}
+Triton is the canonical substrate for operator-level GPU kernel specialization and is a natural integration point for CHRONOS \cite{triton}. MLIR enables staged lowering and dialect-driven extensibility required to host refinement and effect typing \cite{mlir}. Halide established the ``algorithm/schedule'' separation and schedule search, but its model predates descriptor-driven GPU async protocols as first-class typed resources \cite{halide_osdi13}. Mosaic addresses interoperability and composability with external libraries for sparse tensor algebra; CHRONOS is orthogonal, focusing on \emph{descriptor certification} and \emph{temporal effect typing} for GPU async pipelines \cite{mosaic_pldi23}.
+
+\subsection{Equality saturation and synthesis}
+Equality saturation (\texttt{egg}) and tensor-graph superoptimization (Tensat) demonstrate that cost-guided extraction from large equivalence classes can outperform phase-ordered rewrite pipelines \cite{egg_popl21,tensat_mlsys21}. The MLIR \texttt{eqsat} dialect motivates embedding these capabilities directly in compiler IR \cite{eqsat_arxiv25}. Constraint-based layout synthesis frameworks (e.g., Hexcute) highlight the viability of CP/SMT-style solving in GPU layout spaces; CHRONOS differentiates by making \emph{descriptor admissibility} a refinement type and coupling it to \emph{temporal} token typing \cite{hexcute_cgo26,z3,cvc5}.
+
+\subsection{Formal methods for tensor compilation}
+A Verified Compiler for a Functional Tensor Language (ATL) demonstrates that tensor compilation can be proven correct end-to-end; CHRONOS adopts a complementary stance: \emph{translation validation} plus linear-capability typing targeted specifically at PTX weak ordering and descriptor protocols \cite{atl_pldi24,ptxisa87}. Glenside introduces a pure IR for low-level tensor rewrites via access patterns; CHRONOS shares the desire for rewrite-friendly IR but targets the GPU descriptor+async reality explicitly \cite{glenside_arxiv21}.
+
+\section{Conclusion}
+CHRONOS operationalizes a hardware-shaped thesis: on H100-class GPUs, the decisive gap is no longer ``layout expressiveness'' but \emph{hardware admissibility and temporal correctness}. By refining layouts into descriptor-certified subtypes and encoding async completion as linear resources, CHRONOS turns performance cliffs and correctness hazards into checkable, optimizable compiler obligations grounded in real PTX and CUDA descriptor rules. The resulting architecture is designed for an implementable MLIR/Triton prototype and an ASPLOS/PLDI-grade evaluation on attention, GEMM, and irregular routing workloads.
+
+\begin{thebibliography}{99}
+
+\bibitem{zhou2026linearlayouts}
+K.~Zhou \emph{et~al.}, ``Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using \(\Ftwo\),'' in \emph{ASPLOS}, 2026. DOI: \url{https://doi.org/10.1145/3760250.3762221}.
+
+\bibitem{isl_relations}
+S.~G.~Bhaskaracharya \emph{et~al.}, ``Modeling Layout Abstractions Using Integer Set Relations,'' \emph{arXiv:2511.10374}, 2025. \url{https://arxiv.org/abs/2511.10374}.
+
+\bibitem{carlisle2026cute}
+J.~Carlisle, J.~Shah, R.~Stern, and P.~VanKoughnett, ``Categorical Foundations for CuTe Layouts,'' \emph{arXiv:2601.05972}, Jan. 2026. \url{https://arxiv.org/abs/2601.05972}.
+
+\bibitem{cuda12_9_tma}
+NVIDIA, ``CUDA Driver API v12.9: Tensor Map Object Management (\texttt{cuTensorMapEncodeTiled}),'' 2025. \url{https://docs.nvidia.com/cuda/archive/12.9.0/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html}.
+
+\bibitem{cuda12_9_1_tma}
+NVIDIA, ``CUDA Driver API v12.9.1: Tensor Map Object Management (\texttt{CUtensorMapSwizzle} enums, coupling constraints),'' 2025. \url{https://docs.nvidia.com/cuda/archive/12.9.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html}.
+
+\bibitem{ptxisa87}
+NVIDIA, ``Parallel Thread Execution ISA 8.7: \texttt{cp.async.bulk(.tensor)}, \texttt{mbarrier}, \texttt{wgmma.mma\_async},'' CUDA 12.8.0, 2024. \url{https://docs.nvidia.com/cuda/archive/12.8.0/parallel-thread-execution/index.html}.
+
+\bibitem{hopper_tuning}
+NVIDIA, ``Hopper Tuning Guide (v13.1): Tensor Memory Accelerator and warp specialization,'' 2024. \url{https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html}.
+
+\bibitem{flashattn3}
+J.~Shah \emph{et~al.}, ``FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision,'' \emph{NeurIPS}, 2024. \url{https://arxiv.org/abs/2407.08608}.
+
+\bibitem{triton}
+P.~Tillet, H.~Kung, and D.~Cox, ``Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations,'' in \emph{MAPL}, 2019. \url{https://research.ibm.com/publications/triton-an-intermediate-language-and-compiler-for-tiled-neural-network-computations}.
+
+\bibitem{mlir}
+C.~Lattner \emph{et~al.}, ``MLIR: A Compiler Infrastructure for the End of Moore's Law,'' \emph{arXiv:2002.11054}, 2020. \url{https://arxiv.org/abs/2002.11054}.
+
+\bibitem{egg_popl21}
+M.~Willsey \emph{et~al.}, ``egg: Fast and Extensible Equality Saturation,'' in \emph{POPL}, 2021. \url{https://www.mwillsey.com/papers/egg}.
+
+\bibitem{tensat_mlsys21}
+M.~Willsey \emph{et~al.}, ``Tensat: Tensor Graph Superoptimization,'' in \emph{MLSys}, 2021. \url{https://www.mwillsey.com/papers/tensat}.
+
+\bibitem{eqsat_arxiv25}
+Y.~Lin \emph{et~al.}, ``eqsat: An Equality Saturation Dialect for Non-destructive Rewriting,'' \emph{arXiv:2505.09363}, 2025. \url{https://arxiv.org/abs/2505.09363}.
+
+\bibitem{z3}
+L.~de~Moura and N.~Bjørner, ``Z3: An Efficient SMT Solver,'' in \emph{TACAS}, 2008.
+
+\bibitem{cvc5}
+C.~Barrett \emph{et~al.}, ``cvc5: A Versatile and Industrial-Strength SMT Solver,'' in \emph{CAV}, 2022. \url{https://cvc5.github.io/}.
+
+\bibitem{atl_pldi24}
+A.~Liu, G.~Bernstein, A.~Chlipala, and J.~Ragan-Kelley, ``A Verified Compiler for a Functional Tensor Language,'' \emph{Proc.\ ACM Program.\ Lang. (PLDI)}, 2024. DOI: \url{https://doi.org/10.1145/3656390}.
+
+\bibitem{moaic_pldi23}
+M.~Bansal, O.~Hsu, K.~Olukotun, and F.~Kjolstad, ``Mosaic: An Interoperable Compiler for Tensor Algebra,'' \emph{Proc.\ ACM Program.\ Lang. (PLDI)}, 2023. DOI: \url{https://doi.org/10.1145/3591236}.
+
+\bibitem{glenside_arxiv21}
+G.~H.~Smith \emph{et~al.}, ``Pure Tensor Program Rewriting via Access Patterns (Representation Pearl),'' \emph{arXiv:2105.09377}, 2021. \url{https://arxiv.org/abs/2105.09377}.
+
+\bibitem{halide_osdi13}
+J.~Ragan-Kelley \emph{et~al.}, ``Halide: A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation in Image Processing Pipelines,'' in \emph{OSDI}, 2013.
+
+\bibitem{isl}
+S.~Verdoolaege, ``isl: An Integer Set Library for the Polyhedral Model,'' in \emph{ICMS}, 2010.
+
+\bibitem{pluto_pldi08}
+U.~Bondhugula \emph{et~al.}, ``Automatic Transformations for Communication-Minimized Parallelization and Locality Optimization in the Polyhedral Model,'' in \emph{PLDI}, 2008.
+
+\bibitem{tvm}
+T.~Chen \emph{et~al.}, ``TVM: An Automated End-to-End Optimizing Compiler for Deep Learning,'' in \emph{OSDI}, 2018.
+
+\bibitem{tensor_comprehensions}
+N.~Vasilache \emph{et~al.}, ``Tensor Comprehensions: Framework-Agnostic High-Performance Machine Learning Abstractions,'' \emph{arXiv:1802.04730}, 2018.
+
+\bibitem{cutlass}
+NVIDIA, ``CUTLASS: CUDA Templates for Linear Algebra Subroutines,'' GitHub repository. \url{https://github.com/NVIDIA/cutlass}.
+
+\bibitem{cublas}
+NVIDIA, ``cuBLAS/cuBLASLt Library,'' CUDA Toolkit Documentation. \url{https://docs.nvidia.com/cuda/cublas/}.
+
+\bibitem{hexcute_cgo26}
+``Hexcute: A Compiler Framework for Automating Layout Synthesis in GPU Programs,'' in \emph{CGO}, 2026. \url{https://2026.cgo.org/details/cgo-2026-papers/12/Hexcute-A-Compiler-Framework-for-Automating-Layout-Synthesis-in-GPU-Programs}.
+
+\end{thebibliography}
+
+\end{document}

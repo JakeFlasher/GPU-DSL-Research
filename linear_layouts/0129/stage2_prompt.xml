@@ -76,38 +76,29 @@
   </deliverables>
 </developer_configuration>
 
-<user_prompt stage="1" model="gpt-5.2-pro" reasoning_effort="xhigh">
-  <context_update>
-    **Seed Papers (The Theoretical Baseline):**
-    1. **Linear Layouts ($\mathbb{F}_2$):** Uses XOR-based linear algebra to model layouts. Great for swizzling, but restricted to powers of 2.
-    2. **Integer Set Relations (ISL):** Uses Polyhedral models to unify strided and bit-manipulation layouts. Powerful but potentially expensive at compile-time.
-    3. **Categorical Foundations:** Uses Category Theory (Morphisms, Functors) to model layout composition. High abstraction, potentially disconnected from hardware quirks.
-
-    **Target Hardware Context:**
-    - **NVIDIA H100 (Hopper) & B200 (Blackwell):** Relies heavily on **TMA** (Tensor Memory Accelerator) which requires *specific* layout descriptors. If the math generates a layout TMA doesn't support, performance tanks.
-    - **AMD MI300X:** Matrix Cores require specific data interleaving to avoid LDS bank conflicts.
-
-    **Target Workloads:**
-    - **Dynamic LLM Inference:** KV-Cache paging (Block Tables), Ragged Batches (Variable SeqLen).
-    - **Quantized GEMM:** FP4/INT4 packing requires complex bit-level swizzling inside registers.
-  </context_update>
-
+<user_prompt stage="2" model="gpt-5.2-pro" reasoning_effort="xhigh">
   <task>
-    Perform a **"Formalism-to-Hardware Gap Analysis"** on the provided Seed Papers.
+    You are the Principal Architect. We are synthesizing a top-tier ASPLOS/ISCA/MICRO proposal.
     
-    1.  **Deconstruct the Mathematical Abstraction:**
-        - What are the **axioms**? (e.g., "Layouts are linear maps over $\mathbb{F}_2$").
-        - What are the **simplifications**? (e.g., "Ignores memory hierarchy latency," "Assumes static shapes").
+    **Input Data:**
+    1.  **The Hardware Reality (Stage 1):** Specific bottlenecks where the seed paper fails on H100/Blackwell.
+    2.  **The Theoretical Arsenal (Stage 1.5):** Novel mathematical and Programming Language frameworks identified to solve those specific bottlenecks.
 
-    2.  **The "Hardware Reality" Stress Test:**
-        - **TMA Compatibility:** Can the seed's generated layouts be directly lowered to a `CuTensorMap` descriptor on H100? Or does the math produce "valid but un-acceleratable" layouts?
-        - **Bank Conflict Modeling:** Does the formalism *provably* minimize bank conflicts, or does it just define the mapping? (e.g., Does the $\mathbb{F}_2$ solver explicitly solve for `conflict_rate = 0`?).
+    **Execution Steps:**
+    1.  **Deep Research Phase:** Execute the `<web_search_rules>` to validate the Stage 1 bottlenecks against the latest academic literature and hardware manuals. Retrieve all related resources to ensure novelty.
+    2.  **Scaffold & Plan:** Map the Stage 1.5 theories to the validated bottlenecks.
+    3.  **Synthesize:** Generate 3 distinct, high-value **Research Directions**.
+    
+    **The Synthesis Formula:**
+    > **Proposal = (Stage 1 Hardware Gap) + (Stage 1.5 Mathematical Theory) -> (New Compiler/Runtime Artifact)**
 
-    3.  **The "Dynamic Workload" Stress Test:**
-        - **The Ragged Tensor Problem:** How does the formalism handle a batch of sequences with lengths $[12, 1023, 7]$? 
-        - Does it force padding to $1024$ (wasteful)? Or can it handle "Affine + Masked" layouts?
-
-    **Output:** A "Theoretical Friction" report identifying 3 specific areas where the rigorous math fails to capture the messy reality of high-performance GPU execution.
+    For each direction, you must:
+    1.  **Define the Gap:** Why the seed paper's approach is insufficient, citing your retrieved resources.
+    2.  **Apply the Theory:** Explicitly name the math concept from Stage 1.5 (e.g., "Replace $\mathbb{F}_2$ matrices with Integer Lattices via Smith Normal Form").
+    3.  **Define the Mechanism:** Describe the software artifact (e.g., "A Triton Pass that solves layout constraints using SMT").
+    
+    **Feasibility Filter:**
+    Ensure the proposed math is **implementable** in a ML compiler framework such as Triton (not just pure theory) and evaluable on **TritonBench**.
   </task>
 
   <input_seed_paper>
@@ -117,14 +108,20 @@
     3. https://arxiv.org/pdf/2601.05972v1 (Categorical Foundations) and make sure you read them in entirety as many of the corner cases will be used
   </input_seed_paper>
 
-  <output_requirements>
-    <table_1>
-      **Abstraction vs. Hardware Matrix**
-      Columns: Mathematical_Concept | Hardware_Feature | Friction_Point (e.g., "$\mathbb{F}_2$ implies bitwise ops, but TMA expects stride descriptors") | Proposed_Relaxation
-    </table_1>
-    <section_2>
-      **The Three Performance Cliffs:**
-      Describe 3 scenarios where the *Formal* code generation would yield suboptimal *Machine* code (SASS) compared to a hand-tuned heuristic.
-    </section_2>
-  </output_requirements>
+  <input_context>
+    <stage_1_output>
+      uploaded to attached files
+    </stage_1_output>
+    
+    <stage_1_5_output>
+      uploaded to attached files
+    </stage_1_5_output>
+  </input_context>
+
+  <decision_matrix>
+    Create a table scoring the 3 directions on:
+    - **Theoretical Novelty** (Is this a new application of the math to Systems?)
+    - **Hardware Relevance** (Does it unlock H100/Blackwell features like TMA?)
+    - **Implementation Risk** (Can we build the prototype in 3-4 months?)
+  </decision_matrix>
 </user_prompt>

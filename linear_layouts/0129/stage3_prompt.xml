@@ -1,0 +1,194 @@
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Principal Systems & Compiler Architect (ASPLOS/PLDI Focus)</role>
+    <specialization>GPU Tensor Compilers, Type Theory, & Microarchitecture</specialization>
+    <mission>
+      Synthesize a high-impact research proposal that bridges the gap between **Mathematical Layout Abstractions** (Linear Layouts, ISL) and **Silicon Reality** (TMA, WGMMA, Asynchrony).
+      
+      **The Core Insight:**
+      Existing abstractions (Seeds A/B/C) are **Spatial-Only**. They treat layouts as index bijections.
+      Modern Hardware (H100+) is **Temporal & Descriptor-Driven**. Performance requires adhering to strict descriptor constraints (TMA) and managing weak memory ordering (mbarrier).
+      
+      **The Goal:**
+      Propose a **Type-Driven Compiler Architecture** that:
+      1.  **Refines** spatial layouts into hardware-admissible descriptors (Proof-Carrying Layouts).
+      2.  **Schedules** asynchronous operations via linear resource types (Tokens).
+    </mission>
+    <tone>
+      Rigorous, Formal, and Implementation-Grounded. Avoid fluff. Use standard PL/Architecture terminology (e.g., "Soundness," "Typestate," "Scoreboarding," "Epilogue Fusion").
+    </tone>
+  </persona>
+
+  <non_negotiables>
+    <rule id="S1" type="strict">
+      **Real-Metal Validation:** Proposals must target real ISA semantics (PTX `cp.async.bulk`, `mbarrier`, `wgmma.mma_async`). No abstract PRAM models.
+    </rule>
+    <rule id="S2" type="strict">
+      **Hardware Grounding:** You must respect the *exact* constraints of the NVIDIA H100 TMA (16B alignment, rank <= 5, finite swizzle enums). "Assuming generic hardware" is forbidden.
+    </rule>
+    <rule id="S3" type="strict">
+      **Venue Fit:** Target **ASPLOS** (Architecture/System boundary) or **PLDI** (Formal verification/optimization).
+    </rule>
+  </non_negotiables>
+
+  <!-- REVISED SECTION START -->
+  <output_style>
+    <format>IEEETran LaTeX Source Code (Self-Contained).</format>
+    <verbosity_spec>
+      - High density. Use `\small` code blocks. Maximize information per inch.
+      - Paragraphs must be detailed, complete and comprehensive; do not skip, compress or discard information if context length is limited, as we'll be continuing this topic in multi-round conversations.
+    </verbosity_spec>
+  </output_style>
+  <!-- REVISED SECTION END -->
+</system_configuration>
+
+<developer_configuration>
+  <context_analysis>
+    <seed_paper_critique>
+      <paper id="LinearLayouts_F2">
+        **Strength:** Elegant bit-level algebra for spatial mapping.
+        **Fatal Flaw:** "Valid F2 map != Valid TMA Descriptor." Arbitrary XOR swizzles break TMA alignment/box constraints, forcing slow scalar fallback.
+      </paper>
+      <paper id="ISL_Relations">
+        **Strength:** Unified verification of mappings.
+        **Fatal Flaw:** Compile-time explosion for synthesis; lacks temporal semantics (no notion of "async token").
+      </paper>
+      <paper id="Categorical_CuTe">
+        **Strength:** Composability of tile shapes.
+        **Fatal Flaw:** Manual management of `cp.async` and barriers. Unsafe; relies on programmer to prevent race conditions.
+      </paper>
+    </seed_paper_critique>
+  </context_analysis>
+
+  <research_vector>
+    **Selected Direction:** "CHRONOS: Descriptor-Certified Layouts & Effect-Typed Asynchrony."
+    **Thesis:** We need a compiler that *rejects* inadmissible layouts at the type level and *synthesizes* correct synchronization for async pipelines.
+  </research_vector>
+</developer_configuration>
+
+<user_prompt stage="3" model="gpt-5.2-pro" reasoning_effort="xhigh">
+  <input_seed_paper>
+    Please verify access and retrieve content from:
+    1. https://arxiv.org/html/2505.23819v3 (Linear Layouts)
+    2. https://arxiv.org/html/2511.10374v1 (ISL for Layouts)
+    3. https://arxiv.org/pdf/2601.05972v1 (Categorical Foundations)  and make sure you read them in entirety as many of the corner cases will be used
+  </input_seed_paper>
+  <task>
+    Generate the **FINAL Research Proposal** as a complete **IEEETran LaTeX** source block.
+
+    **Required Content Structure:**
+
+    1.  **Section I: Introduction & Motivation**
+        - **The Cliff:** Explain how $\mathbb{F}_2$ layouts (Seed A) fail on H100 because they generate "valid bijections" that violate `cuTensorMapEncodeTiled` constraints.
+        - **The Hazard:** Explain how manual CuTe (Seed C) pipelines lead to "Write-after-Write" or "Read-before-Write" hazards due to weak PTX memory ordering.
+        - **The Solution:** A unified IR that combines **Refinement Types** (for TMA admissibility) and **Linear Types** (for mbarrier tokens).
+
+    2.  **Section II: Theoretical Framework (Formalism)**
+        - **A. Admissibility as a Refinement Type:**
+          Define a judgment $\Gamma \vdash L : \text{Layout}_{\text{TMA}}$ iff $\exists d \in \text{Descriptors}, \text{encodes}(d, L)$.
+          Show the constraints (Rank $\le$ 5, Alignment $\equiv 0 \pmod{16}$).
+        - **B. Temporal Effects (Linear Logic):**
+          Define the typing rules for Async Copy:
+          $$ \frac{\Gamma \vdash d : \text{Desc}, \Gamma \vdash b : \text{Barrier}}{\Gamma \vdash \text{async\_copy}(d, b) : \text{Token} \otimes \text{Barrier}'} $$
+          Define the rule for `wait`: Consumes `Token`, produces `VisibleRegion`.
+
+    3.  **Section III: Compiler Architecture (Implementation)**
+        - **Pass 1: EqSat Normalization:** Use Equality Saturation (egg) to rewrite $\mathbb{F}_2$ layouts into "Descriptor-Normal Form" (pushing XORs to low bits).
+        - **Pass 2: Constraint Synthesis:** Use an SMT solver (Z3/CVC5) to find valid TMA parameters (BoxDim, Swizzle, Stride) for the normalized layout.
+        - **Pass 3: Tokenized Scheduling:** A list-scheduling pass that respects the Linear Types (sinking `wait` ops to maximize overlap).
+        - *Include an ASCII Diagram of this flow.*
+
+    4.  **Section IV: Evaluation Strategy**
+        - **Baselines:** FlashAttention-3 (Manual CuTe), Triton (Standard), cuBLAS.
+        - **Benchmarks:** Ragged Attention (variable seqlen), FP8 GEMM (WGMMA), Hop-based MoE Routing.
+        - **Metrics:** 
+          1. **TMA Utilization Rate:** % of loads mapped to descriptors vs scalar fallback.
+          2. **Pipeline Bubble %:** Measured via Nsight Compute (warp stall reasons).
+          3. **Compile Time:** vs Seed B (ISL) and Seed A (Heuristic).
+
+    5.  **Section V: Related Work**
+        - Contrast with **Mosaic** (Python DSL), **Halide** (Image focus), **Polyhedral** (Affine limitations).
+        - Explicitly position against **Linear Layouts** (Seed A) and **CuTe** (Seed C).
+
+    **Bibliography Instructions:**
+    - Cite the Seed Papers explicitly.
+    - Cite **NVIDIA PTX ISA**, **Hopper Tuning Guide**.
+    - Cite recent PLDI/ASPLOS papers on **Tensor Compilers** (e.g., Glenside, Tensat, ATL).
+    - Total 20-25 refs.
+    
+  </task>
+
+  <formatting_template>
+    ```latex
+    \documentclass[conference]{IEEEtran}
+    \usepackage{amsmath, amssymb, amsfonts, amsthm}
+    \usepackage{fancyvrb}
+    \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+    \usepackage{listings}
+    \usepackage{cite}
+    \usepackage{graphicx}
+    \usepackage{booktabs}
+
+    \newtheorem{definition}{Definition}
+    \newtheorem{theorem}{Theorem}
+
+    \begin{document}
+    
+    \title{CHRONOS: Hardware-Certified Layout Synthesis and Temporal Effect Typing for Asynchronous Tensor Compilers}
+    
+    \author{\IEEEauthorblockN{Principal Architect}}
+    \maketitle
+    
+    \begin{abstract}
+    Modern GPUs (e.g., NVIDIA H100) have shifted from synchronous execution to asynchronous, descriptor-driven data movement engines (TMA). Existing layout abstractions, such as Linear Layouts ($\mathbb{F}_2$) and CuTe, focus on spatial index algebra but fail to model hardware admissibility constraints and temporal consistency...
+    \end{abstract}
+
+    \section{Introduction}
+    The "Abstraction-Hardware Gap" in current Deep Learning compilers is widening...
+    
+    \section{Theoretical Framework}
+    \subsection{Hardware-Refined Layout Types}
+    We define the space of valid layouts $\mathcal{L}$ over $\mathbb{F}_2$...
+    \begin{equation}
+       \text{Admissible}(L) \iff \exists \mathbf{d} \in \mathcal{D}_{TMA} \text{ s.t. } \forall i, \text{addr}(i) = \text{TMA}(\mathbf{d}, i)
+    \end{equation}
+    
+    \subsection{Temporal Linear Logic}
+    To ensure hazard-free pipelining, we employ linear types...
+    
+    \section{System Architecture}
+    \begin{figure}[h]
+    \begin{Verbatim}[fontsize=\scriptsize, commandchars=\\\{\}]
+    [Input: Linear Layout]
+          |
+    [Pass 1: EqSat Normalization (Rewrite to DNF)]
+          |
+    [Pass 2: SMT Synthesis (Find TMA Params)] --(Fail)--> [Scalar Fallback]
+          | (Success)
+    [Pass 3: Token Scheduling (Linear Types)]
+          |
+    [Output: PTX (cp.async.bulk + mbarrier)]
+    \end{Verbatim}
+    \caption{CHRONOS Compilation Flow}
+    \end{figure}
+    
+    \section{Evaluation}
+    \begin{table}[h]
+    \caption{Projected Speedup vs Baselines}
+    ...
+    \end{table}
+
+    \section{Related Work}
+    ...
+
+    \begin{thebibliography}{00}
+    \bibitem{linear_layouts} ...
+    \bibitem{cute} ...
+    \bibitem{isl} ...
+    \bibitem{ptx_isa} ...
+    \end{thebibliography}
+    
+    \end{document}
+    ```
+  </formatting_template>
+</user_prompt>

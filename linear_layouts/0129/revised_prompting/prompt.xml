@@ -1,0 +1,365 @@
+## 0) Access check: I can open all 3 seed papers (HTML/PDF)
+
+All three URLs are accessible:
+
+1. **Linear Layouts (arXiv HTML 2505.23819v3)** opened successfully. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+2. **ISL for Layouts (arXiv HTML 2511.10374v1)** opened successfully. ([arxiv.org](https://arxiv.org/html/2511.10374v1))  
+3. **Categorical Foundations (arXiv PDF 2601.05972v1)** opened successfully (174 pages). ([arxiv.org](https://arxiv.org/pdf/2601.05972v1))  
+
+---
+
+## 1) What the seed papers actually claim (vs. what your context assumes)
+
+### A. Linear Layouts ($$\mathbb{F}_2$$) — what it *really* says
+**Key commitments in the paper (not your prompt):**
+- It explicitly leans on the “**power-of-two everywhere**” reality in GPU programming and Triton’s layout engine. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- It *explicitly admits* the **primary limitation**: *“restriction to power-of-two shapes”*; mitigations include **masking out-of-bounds**; it also gestures at an “affine layouts” extension for non-linear ops. ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+- It provides formal machinery to reason about **bank conflicts** and claims a principled, layout-driven way to **maximize vectorization and minimize bank conflicts** (at least under its model). ([arxiv.org](https://arxiv.org/html/2505.23819v3))  
+
+**What it does *not* centrally do (relative to your context):**
+- It’s not a “TMA paper.” It’s about *layout abstraction + codegen*; it references modern GPU primitives (mma/wgmma etc.) but doesn’t build the abstraction around **CuTensorMap/TMA descriptor legality**.
+
+### B. ISL for Layouts — what it *really* says
+This paper’s core is: **represent CuTe layouts + Triton linear layouts as Integer Set Relations**, enabling unified formal analysis (composition, inversion, complement, etc.). ([arxiv.org](https://arxiv.org/html/2511.10374v1))  
+
+Notable points that matter to your prompting framework:
+- It explicitly notes **expressiveness beyond both** CuTe and linear layouts (e.g., non-convex sets; modulo shuffles that aren’t purely strided or binary-swizzle). ([arxiv.org](https://arxiv.org/html/2511.10374v1))  
+- It is candid about **worst-case exponential** behavior of some ISL operations, while arguing practical tractability for typical DL tensor ranks/tiling depths. ([arxiv.org](https://arxiv.org/html/2511.10374v1))  
+
+### C. Categorical Foundations for CuTe Layouts — what it *really* says
+This is a **math foundations** paper: it defines categories (Tuple, Nest) whose morphisms induce layouts, proves compatibility with layout algebra operations, and provides a Python implementation aligning with CUTLASS behavior. ([arxiv.org](https://arxiv.org/pdf/2601.05972v1))  
+
+Importantly:
+- It is **not** positioned as a hardware-tuning guide; it does not revolve around TMA/TMEM legality constraints or GPU pipeline scheduling. Its value is compositional correctness and a tractable subclass characterization.
+
+---
+
+## 2) Are your “context problems” the real problems? Mostly yes — but they’re not the *elephant*.
+
+### Claim 1: “H100 relies heavily on TMA”
+**Substantively correct.** Hopper adds **TMA** as a more sophisticated async copy engine to move multi-dimensional tensors between global↔shared (and within clusters), reducing SM instruction + register overhead and enabling overlap via async barriers. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html?utm_source=openai))  
+
+**What your prompt currently underspecifies (this matters a lot):**
+TMA is not “just faster memcpy.” It comes with **descriptor legality constraints** (alignment, swizzle/interleave modes, bounding-box constraints, type-specific restrictions). If your layout formalism can synthesize “valid math layouts” that are **illegal or degenerate** for `cuTensorMapEncodeTiled`, you fall off a performance cliff into software-emulated gathers / extra address-gen / extra barriers. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html?utm_source=openai))  
+
+### Claim 2: “B200 relies heavily on TMA”
+**Partially true, but now incomplete.** Blackwell’s story is *not only TMA anymore*.
+
+Blackwell attention kernels are explicitly framed as battling **asymmetric scaling: compute grows faster than memory bandwidth**, and they highlight using **TMEM** (tensor memory) to relieve register pressure + enable deeper pipelines + reduce SMEM traffic. ([developer.nvidia.com](https://developer.nvidia.com/blog/overcoming-compute-and-memory-bottlenecks-with-flashattention-4-on-nvidia-blackwell/?utm_source=openai))  
+
+So for Blackwell, the “layout elephant” becomes:
+- **HBM bandwidth / latency + pipeline depth**, and
+- **which on-chip storage tier you’re targeting** (registers vs SMEM vs TMEM), and
+- whether your compiler IR can *express* those choices without exploding code size or compile time.
+
+### Claim 3: “Ragged tensors remain a primary limitation”
+**Raggedness is real, but it is usually a symptom. The underlying bottleneck is memory-system efficiency under dynamism.**
+
+In production LLM serving, the most repeatedly-cited pain point is the **KV cache**: it is huge, grows dynamically per request, and naïve contiguous management causes fragmentation and limits batch size. That’s exactly why PagedAttention/vLLM exists. ([arxiv.org](https://arxiv.org/abs/2309.06180))  
+
+So: ragged sequence lengths matter mainly because they induce:
+- **fragmentation + poor batching**, and
+- **tail effects / masked tiles**, and
+- **irregular memory traffic** (worse cache/TLB locality, worse prefetch predictability),
+which ultimately surface as **memory wall / latency hiding failures**.
+
+---
+
+## 3) The real “elephant in the room” (2026 framing)
+
+If you want a single headline that survives Hopper→Blackwell:
+
+### **Elephant: memory-system limits under extreme asynchrony + strict descriptor legality**
+Concretely, the hard problems your current prompt underweights:
+
+1. **Asymmetric scaling (compute >> memory bandwidth)**  
+   Blackwell-focused attention work explicitly calls this out; kernels win by restructuring pipelines and on-chip storage usage (e.g., TMEM) rather than “just better layouts.” ([developer.nvidia.com](https://developer.nvidia.com/blog/overcoming-compute-and-memory-bottlenecks-with-flashattention-4-on-nvidia-blackwell/?utm_source=openai))  
+
+2. **Descriptor-legality cliffs (TMA / `CuTensorMap`)**  
+   Layouts are not “free-form.” Swizzle/interleave/type/alignment/bounding-box rules constrain what’s hardware-acceleratable. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html?utm_source=openai))  
+
+3. **Temporal orchestration is first-class now (async copies + barriers + clusters/warp-groups)**  
+   Hopper TMA is explicitly asynchronous and designed to overlap compute and data movement; a purely spatial layout algebra does not capture “when” unless you add a temporal layer. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html?utm_source=openai))  
+
+4. **Dynamic workload shape = scheduling + memory management problem (not only layout)**
+   PagedAttention/vLLM frames the issue as **dynamic KV cache growth/shrink + fragmentation** limiting batch size/throughput. ([arxiv.org](https://arxiv.org/pdf/2309.06180.pdf))  
+
+5. **Practical systems constraint: compilation / specialization / forward-compat**
+   Blackwell-era guidance emphasizes PTX vs cubin strategy and JIT implications; this interacts with “fancy layout synthesis” because aggressive specialization can balloon compile time and code size. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/blackwell-compatibility-guide/index.html?utm_source=openai))  
+
+---
+
+# 4) Fully revised prompting framework (Stages 1 / 1.5 / 2)
+
+Below are rewritten templates designed to:
+- separate **Seed Truth** (what the papers actually say) from **Hardware Truth** (what manuals say),
+- force an “**elephant-first**” analysis (memory wall + legality + temporal orchestration),
+- comply with the GPT‑5.2 prompting patterns (explicit output shape, scope discipline, web grounding). ([cookbook.openai.com](https://cookbook.openai.com/examples/gpt-5/gpt-5-2_prompting_guide))  
+
+You can paste these as your new `stage1_prompt.xml`, `stage1.5_prompt.xml`, `stage2_prompt.xml`.
+
+---
+
+## Stage 1 — **Context & Gap Audit** (Seed → Hardware Reality, elephant-first)
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Principal Compiler Theorist & GPU Systems Architect (ASPLOS/ISCA/MICRO)</role>
+    <mission>
+      Perform an evidence-grounded audit: what the seed formalism guarantees, what modern GPUs require,
+      and where the true bottlenecks lie (memory wall, descriptor legality, temporal orchestration).
+    </mission>
+    <tone>Rigorous, hardware-grounded (PTX/SASS + CUDA docs), falsification-first.</tone>
+  </persona>
+
+  <non_negotiables>
+    <rule id="S1" type="strict">Separate claims into: (A) Seed Paper Claim, (B) Hardware Manual Claim, (C) Our Inference. Never mix.</rule>
+    <rule id="S2" type="strict">If you mention TMA/CuTensorMap, you MUST enumerate legality constraints (alignment, swizzle/interleave/type, boxDim rules) and cite CUDA docs.</rule>
+    <rule id="S3" type="strict">If you mention Blackwell, you MUST address compute-vs-bandwidth asymmetry and on-chip tiering (SMEM vs TMEM) with citations.</rule>
+    <rule id="S4" type="strict">No abstract math without a concrete compiler artifact mapping (MLIR/Triton/CuTe) and a measurable hardware metric.</rule>
+    <rule id="S5" type="strict">Verify access to each provided arXiv URL before analysis; cite them.</rule>
+  </non_negotiables>
+
+  <tooling>
+    <web_grounding required="true">
+      <require_citations>true</require_citations>
+      <priority_sources>
+        CUDA docs, NVIDIA developer blogs, arXiv seed papers, PTX ISA docs.
+      </priority_sources>
+    </web_grounding>
+  </tooling>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - Start with a 6–10 bullet "Context Verdict" summary.
+      - Then structured tables + short, dense paragraphs.
+      - No long narrative sections > 12 lines.
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="1">
+  <task>
+    Perform a "Context & Gap Audit" for three seed papers on layout abstractions, focusing on modern GPU reality.
+
+    Step 0: Access Check
+      - Open and cite the 3 seed papers (HTML/PDF). Confirm they are readable.
+
+    Step 1: Seed Truth (per paper)
+      - Extract: axioms, closure properties, explicit limitations.
+      - REQUIRED: quote/point to the exact section(s) where limitations are stated.
+
+    Step 2: Hardware Truth (H100 + Blackwell + MI300)
+      - Identify the top 5 *hardware-enforced constraints* that dominate layout usefulness:
+        (e.g., TMA descriptor legality; async barrier scheduling; bank conflicts; register pressure; TMEM/SMEM tiering).
+      - Each constraint must include at least one citation to an official manual/blog.
+
+    Step 3: Elephant-in-the-room diagnosis (ranked)
+      - Decide whether the real bottleneck is:
+        (A) memory bandwidth wall, (B) latency hiding / asynchrony orchestration, (C) descriptor legality cliffs,
+        (D) compilation/search cost, (E) dynamic memory management (KV cache / fragmentation), or others.
+      - Provide a ranked list with justification and citations.
+
+  </task>
+
+  <input_seed_paper>
+    1) https://arxiv.org/html/2505.23819v3
+    2) https://arxiv.org/html/2511.10374v1
+    3) https://arxiv.org/pdf/2601.05972v1
+  </input_seed_paper>
+
+  <output_requirements>
+    <table name="Seed-vs-Hardware Matrix">
+      Columns:
+        Seed_Math_Concept |
+        Explicit_Seed_Limit |
+        Hardware_Feature |
+        Hardware_Legality_Constraint |
+        Performance_Cliff_Mode |
+        Minimal_Relaxation/Extension
+    </table>
+
+    <section name="3 Performance Cliffs (SASS-level intuition)">
+      For each cliff:
+        - Symptom in profiler terms (Nsight Compute metrics)
+        - The formalism’s blind spot
+        - What hand-tuned kernels do instead (e.g., cp.async.bulk.tensor pipelining, swizzle modes, TMEM usage)
+    </section>
+
+    <section name="Stage-1 Verdict">
+      - 10 bullet points: which of the user’s contexts are correct, which are incomplete, which are wrong.
+    </section>
+  </output_requirements>
+</user_prompt>
+```
+
+---
+
+## Stage 1.5 — **Theoretical Arsenal, but “implementable + measurable”**
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>PL/Compiler Research Lead (layouts + async pipelines)</role>
+    <mission>
+      Build a targeted toolbox of theories that directly address the Stage-1 ranked bottlenecks,
+      and map each theory to an implementable compiler/runtime mechanism.
+    </mission>
+  </persona>
+
+  <non_negotiables>
+    <rule id="T1">Every theory must map to: (a) an IR extension, (b) an algorithm, (c) a prototype path in MLIR/Triton/CuTe.</rule>
+    <rule id="T2">Every proposed mechanism must name at least one measurable metric beyond speedup (compile time, code size, bank-conflict rate, achieved bandwidth, barrier stalls).</rule>
+    <rule id="T3">Use web research (2019–2026) and cite primary sources for each “breakthrough.”</rule>
+  </non_negotiables>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - Use tables; each bottleneck gets exactly 2 theories + 1 hybrid option.
+      - Keep each theory entry to: 3–5 bullets: Why / Mechanism / Risk / Metric.
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="1.5">
+  <inputs>
+    <stage_1_ranked_bottlenecks>PASTE_STAGE_1_VERDICT_HERE</stage_1_ranked_bottlenecks>
+  </inputs>
+
+  <task>
+    For each top bottleneck from Stage 1, propose:
+      - Theory A (math/PL framework)
+      - Theory B (different lens)
+      - Hybrid (if A+B compose)
+
+    Examples of acceptable theories (only if mapped concretely):
+      - Mixed-radix / integer lattices / Smith Normal Form for non-power-of-2 layouts
+      - Presburger / ISL quasi-affine relations for layout legality + optimization search
+      - Effect systems / separation logic for async copy + barrier correctness
+      - Equality saturation for layout rewrites under legality constraints
+      - SMT/ILP solving for CuTensorMap-legal layout synthesis
+
+    REQUIRED: For each bottleneck, include:
+      - "Math object" (e.g., lattice, category, relation)
+      - "Compiler artifact" (e.g., MLIR dialect + canonicalization passes)
+      - "Hardware hook" (e.g., CuTensorMap swizzle modes, cp.async.bulk.tensor restrictions)
+      - "Evaluation metric plan"
+  </task>
+
+  <output_requirements>
+    <table name="Toolbox">
+      Columns:
+        Bottleneck |
+        Theory_A (why it fits) |
+        Theory_B (why it fits) |
+        Prototype_Mechanism (MLIR/Triton/CuTe) |
+        Key_Metrics |
+        Main_Risk
+    </table>
+
+    <section name="Literature Scan (2019–2026)">
+      - 5–10 items max; primary sources preferred; each with 1-line relevance.
+    </section>
+  </output_requirements>
+</user_prompt>
+```
+
+---
+
+## Stage 2 — **Synthesis: 3 research directions (gap + theory → artifact), novelty checked**
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Proposal Architect (ASPLOS primary; MICRO/ISCA-aware)</role>
+    <mission>
+      Generate 3 high-value, distinct research directions that bridge:
+        (Stage-1 validated hardware gaps) + (Stage-1.5 theories) -> (new compiler/runtime artifact),
+      with a concrete prototype + evaluation plan.
+    </mission>
+  </persona>
+
+  <non_negotiables>
+    <rule id="P1">Each direction must include a "Legality Story" (e.g., CuTensorMap legality) and a "Temporal Story" (async/barriers), not just spatial mapping.</rule>
+    <rule id="P2">Each direction must specify: IR design, algorithm, lowering strategy, and evaluation on a benchmark suite (e.g., TritonBench + at least one LLM kernel family).</rule>
+    <rule id="P3">Include a novelty check: 3 closest papers/systems and what you do differently (with citations).</rule>
+  </non_negotiables>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - Exactly 3 directions.
+      - Each direction: 6 subsections (Gap, Theory, Artifact, Lowering, Eval, Risks).
+      - End with a scoring decision matrix table.
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="2">
+  <inputs>
+    <stage_1_validated_gaps>PASTE_STAGE_1_GAPS_HERE</stage_1_validated_gaps>
+    <stage_1_5_toolbox>PASTE_STAGE_1_5_TOOLBOX_HERE</stage_1_5_toolbox>
+  </inputs>
+
+  <task>
+    Step 1 (Deep Research):
+      - Re-verify the key bottlenecks using manuals + recent literature.
+      - Confirm novelty: find adjacent work and differentiate.
+
+    Step 2 (Synthesize 3 directions):
+      For each direction:
+        1) Define the validated gap (with citations)
+        2) Apply a named theory from Stage 1.5
+        3) Define the mechanism: a new compiler/runtime artifact
+        4) Provide lowering plan down to GPU primitives (TMA/TMEM/WGMMA/etc.)
+        5) Provide evaluation plan: speed + compile time + code size + bank conflicts + achieved bandwidth + barrier stall metrics
+
+    Step 3 (Decision Matrix):
+      Score each direction (1–5):
+        - Theoretical Novelty
+        - Hardware Relevance (H100/Blackwell feature unlock)
+        - Implementation Risk (3–4 months)
+  </task>
+
+  <output_requirements>
+    <table name="Decision Matrix">
+      Columns:
+        Direction |
+        Novelty(1-5) |
+        Hardware_Relevance(1-5) |
+        Impl_Risk(1-5) |
+        Why_it_wins |
+        Key_unknowns
+    </table>
+  </output_requirements>
+</user_prompt>
+```
+
+---
+
+## 5) Summary: what to change in your current framework
+If you only change three things, make it these:
+
+1. **Make CuTensorMap legality first-class** (not a footnote). Your optimizer must target the *supported swizzle/interleave/type/box* space. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html?utm_source=openai))  
+2. **Add a temporal layer** (async copy + barrier SSA / effects), because Hopper/Blackwell performance is “layout × schedule,” not layout alone. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html?utm_source=openai))  
+3. **Reframe “ragged tensors” as memory-management + batching + tail-effect**, i.e., the real issue is KV-cache dynamism and fragmentation under memory wall constraints. ([arxiv.org](https://arxiv.org/pdf/2309.06180.pdf))  
+
+If you want, I can also produce a *fourth* template stage (“Stage 0: Seed+Hardware Fact Sheet”) that auto-builds a cited glossary of: `CuTensorMapSwizzle`, `cp.async.bulk.tensor` restrictions, SMEM bank model assumptions, and where each appears in the seed papers vs manuals—so Stage 1 starts from a verified ground truth instead of inherited lore.
+
+
+
+---
+Learn more:
+1. [Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using ₂](https://arxiv.org/html/2505.23819v3)
+2. [Modeling Layout Abstractions Using Integer Set Relations](https://arxiv.org/html/2511.10374v1)
+3. [Categorical Foundations for CuTe Layouts](https://arxiv.org/pdf/2601.05972v1)
+4. [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/archive/12.4.0/hopper-tuning-guide/index.html?utm_source=openai)
+5. [CUDA Driver API :: CUDA Toolkit Documentation](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html?utm_source=openai)
+6. [Overcoming Compute and Memory Bottlenecks with FlashAttention-4 on NVIDIA Blackwell | NVIDIA Technical Blog](https://developer.nvidia.com/blog/overcoming-compute-and-memory-bottlenecks-with-flashattention-4-on-nvidia-blackwell/?utm_source=openai)
+7. [\[2309.06180\] Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
+8. [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/pdf/2309.06180.pdf)
+9. [1. Blackwell Architecture Compatibility — Blackwell Compatibility Guide 13.1 documentation](https://docs.nvidia.com/cuda/archive/13.1.0/blackwell-compatibility-guide/index.html?utm_source=openai)
+10. [GPT-5.2 Prompting Guide](https://cookbook.openai.com/examples/gpt-5/gpt-5-2_prompting_guide)
