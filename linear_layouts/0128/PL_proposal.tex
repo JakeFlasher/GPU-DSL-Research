@@ -1,0 +1,514 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{fancyvrb}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{listings}
+
+% --------------------------
+% Listings setup (compact, IEEE-friendly)
+% --------------------------
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  xleftmargin=0.5em,
+  xrightmargin=0.5em
+}
+
+% --------------------------
+% Local macros (no $...$ math anywhere; use \( \) or \[ \])
+% --------------------------
+\newcommand{\TMA}{\textsc{TMA}}
+\newcommand{\PTX}{\textsc{PTX}}
+\newcommand{\SM}{\textsc{SM}}
+\newcommand{\IR}{\textsc{IR}}
+\newcommand{\MLIR}{\textsc{MLIR}}
+\newcommand{\TTIR}{\textsc{TTIR}}
+\newcommand{\TTGIR}{\textsc{TTGIR}}
+\newcommand{\DSMEM}{\textsc{DSMEM}}
+\newcommand{\LDS}{\textsc{LDS}}
+\newcommand{\CTA}{\textsc{CTA}}
+
+\begin{document}
+
+\title{TITAN: Typestate-Integrated Tokenized Asynchrony for TMA Pipelines in Triton}
+\author{\IEEEauthorblockN{Proposed by Principal Systems \& Compiler Architect (ASPLOS/ISCA/MICRO Focus)}}
+\maketitle
+
+\section{Problem Formulation \& Motivation}
+
+\subsection{The Hardware--Math Gap: Spatial Layout Algebra Without Temporal Transport Semantics}
+The seed system (Linear Layouts) elevates tensor layouts to first-class backend objects by representing layout conversions and swizzles as linear maps over \(\mathbb{F}_2\) (bit-matrix algebra). This is a \emph{spatial} algebra: it answers \emph{where} each logical element resides (registers, threads/warps, shared-memory offsets) and synthesizes conversions (e.g., warp-shuffle gather) accordingly.
+
+Modern Hopper/Blackwell performance, however, is increasingly dominated by a different axis: \emph{temporal} overlap and correctness of asynchronous transport:
+\begin{itemize}
+  \item \TMA{} bulk tensor transfers (global \(\leftrightarrow\) shared, and cluster shared \(\leftrightarrow\) shared via \DSMEM{}) provide high-throughput movement while avoiding register staging.
+  \item Completion is synchronized via barrier protocols (e.g., \texttt{mbarrier} arrive/wait) and requires subtle proxy-ordering fences to prevent visibility bugs or unintended serialization.
+  \item Warp specialization partitions a thread block into producer warps (copy/issue) and consumer warps (compute), increasing the importance of compiler-controlled scheduling and liveness constraints.
+\end{itemize}
+
+\textbf{Core mismatch:} a layout engine that only optimizes \emph{index maps} cannot express or optimize the partial order of \emph{events} required to exploit \TMA{} and warp specialization. In practice, this forces:
+\begin{enumerate}
+  \item \textbf{Hand-coded pipelines} (or narrow template heuristics) that are brittle across shapes and architectures.
+  \item \textbf{Over-synchronization} (extra waits/fences) to ensure correctness, which collapses overlap and turns copy engines into idle hardware.
+  \item \textbf{Uncontrolled register pressure} (over-buffering / over-unrolling) that kills occupancy and negates gains, especially when pipelines are deepened without resource awareness.
+\end{enumerate}
+
+\subsection{Target Constraints and Non-Negotiables}
+We constrain ourselves to a real-metal, software-only agenda:
+\begin{itemize}
+  \item \textbf{Evaluation on real GPUs only:} NVIDIA H100 (SM90) and AMD MI300 (CDNA3) using Triton kernels, TritonBench-like harnesses, Nsight Compute (NVIDIA) / rocprof (AMD), and end-to-end latency.
+  \item \textbf{No new hardware:} exploit existing \TMA{}, barriers, thread block clusters/\DSMEM{}, warp specialization, Tensor Cores, shared-memory swizzles, and ISA-visible synchronization.
+  \item \textbf{Compiler artifact:} implementable in Triton/\MLIR{} backend and/or PyTorch Inductor integration. No simulator-driven claims.
+\end{itemize}
+
+\subsection{Problem Statement}
+Given a kernel \(\mathcal{K}\) expressed in \TTGIR{} with:
+\begin{enumerate}
+  \item a set of \textbf{layout-annotated memory regions} (global/shared/register placement) determined by a spatial layout pass, and
+  \item a set of \textbf{compute operators} (e.g., MMA/WGMMA fragments, epilogues),
+\end{enumerate}
+we seek a compilation that:
+\begin{enumerate}
+  \item makes \textbf{asynchronous transport first-class} by representing copy/arrive/wait/fence operations as a tokenized event graph;
+  \item synthesizes a \textbf{resource-constrained schedule} (modulo pipeline with warp specialization) that maximizes steady-state overlap while respecting register and shared-memory limits; and
+  \item provides \textbf{correctness-by-construction} via a static typestate protocol that prevents (i) use-before-ready and (ii) overwrite-before-consume across pipelined shared-memory stages.
+\end{enumerate}
+
+We call this system \textbf{TITAN}: \underline{T}ypestate-\underline{I}ntegrated \underline{T}okenized \underline{A}sync on \underline{N}VIDIA (and portable lowering hooks for AMD).
+
+\section{Theoretical Framework}
+
+\subsection{Transport as a Tokenized Event Structure}
+We model a kernel as an event structure rather than an index-rewrite problem.
+
+\paragraph{Places.}
+Let \(\mathcal{P} = \{\textsf{Global}, \textsf{Shared}_{\CTA}, \textsf{Shared}_{\textsf{Cluster}}, \textsf{Reg}\}\) be memory \emph{places}.
+A tensor fragment is always associated with a place \(p \in \mathcal{P}\) and a spatial layout \(L\) (from the seed layout algebra).
+
+\paragraph{Asynchronous transport primitive.}
+An async transfer is a partial function producing a \emph{token}:
+\[
+\textsf{copy} : (p_s, p_d, L, R, \sigma) \rightarrow t
+\]
+where:
+\begin{itemize}
+  \item \(p_s, p_d \in \mathcal{P}\) are source/destination places,
+  \item \(L\) is the spatial layout defining the address mapping for region \(R\),
+  \item \(R\) is a rectangular (tiled) region of elements,
+  \item \(\sigma\) is a destination \emph{stage slot} (for pipelined buffering),
+  \item \(t\) is a linear token (a capability) representing the eventual availability of \(R\) in \(p_d\).
+\end{itemize}
+
+\paragraph{Event graph semantics.}
+Let \(E\) be a set of events and \(\prec\) a strict partial order. We generate events:
+\[
+E = E_{\textsf{copy}} \cup E_{\textsf{arrive}} \cup E_{\textsf{wait}} \cup E_{\textsf{compute}} \cup E_{\textsf{fence}}
+\]
+and construct a dependency relation \(\prec\) such that:
+\begin{itemize}
+  \item A \(\textsf{wait}(t)\) event must be ordered after the corresponding \(\textsf{copy}(\cdots)\) produces \(t\).
+  \item Any \(\textsf{compute}\) reading from stage \(\sigma\) must be ordered after \(\textsf{wait}(t_\sigma)\).
+  \item Any \(\textsf{copy}\) writing stage \(\sigma\) must be ordered after the prior stage-\(\sigma\) consumer has released the slot.
+\end{itemize}
+
+This is the core step missing from purely spatial layout algebra: we explicitly represent \emph{when/how} transport happens and expose the graph to scheduling and verification.
+
+\subsection{Typestate Protocol for Pipelined Shared-Memory Stages}
+We attach a protocol type to each stage slot \(\sigma \in \{0,\dots,D-1\}\) of a circular buffer of depth \(D\).
+
+\paragraph{Stage typestate.}
+Each stage slot \(\sigma\) has a typestate:
+\[
+S_\sigma \in \{\textsf{Empty},\ \textsf{InFlight},\ \textsf{Full},\ \textsf{Draining}\}.
+\]
+
+\paragraph{Protocol transitions (informal).}
+\begin{itemize}
+  \item Producer transition:
+  \[
+  \textsf{Empty} \xrightarrow{\textsf{copy}} \textsf{InFlight} \xrightarrow{\textsf{arrive/wait}} \textsf{Full}
+  \]
+  \item Consumer transition:
+  \[
+  \textsf{Full} \xrightarrow{\textsf{compute}} \textsf{Draining} \xrightarrow{\textsf{release}} \textsf{Empty}
+  \]
+\end{itemize}
+
+\paragraph{Linear capability discipline.}
+We treat tokens and stage ownership as linear resources:
+\begin{itemize}
+  \item Each \(\textsf{copy}\) yields a unique token \(t_\sigma\) that must be consumed exactly once by \(\textsf{wait}(t_\sigma)\).
+  \item Each stage slot \(\sigma\) has an ownership capability \(\textsf{Own}(\sigma)\) that must not be duplicated; this prevents two producers (or producer+consumer) from racing on the same slot.
+\end{itemize}
+
+\paragraph{Why typestate matters on real hardware.}
+Hopper/Blackwell asynchronous engines employ distinct memory \emph{proxies}. Proxy-ordering fences are required to avoid visibility bugs when initialization or metadata writes occur through a different proxy than the async engine. In TITAN, fences are not sprinkled heuristically; they are synthesized as obligations of the effect system:
+\begin{itemize}
+  \item If a stage’s barrier state or descriptor metadata is written by generic instructions and subsequently consumed by async proxy operations, TITAN inserts a \(\textsf{fence}\) event to satisfy a well-formedness rule \(\textsf{GenericWrites} \Rightarrow \textsf{AsyncReads}\).
+\end{itemize}
+
+\subsection{Resource-Constrained Scheduling Objective}
+We target steady-state throughput via modulo scheduling of the transport+compute event graph.
+
+\paragraph{Schedule.}
+Let \(\tau : E \rightarrow \mathbb{Z}_{\ge 0}\) map events to time slots (or abstract issue cycles). The schedule must satisfy:
+\[
+e_1 \prec e_2 \Rightarrow \tau(e_1) + \delta(e_1,e_2) \le \tau(e_2)
+\]
+where \(\delta\) models minimum separation (e.g., barrier latency, pipeline stage distance).
+
+\paragraph{Resource constraints.}
+We impose hardware resource constraints:
+\begin{itemize}
+  \item \textbf{Copy engine issue capacity} (e.g., one \TMA{} issue thread per producer warp group, bounded inflight descriptors).
+  \item \textbf{Tensor Core occupancy} (compute events consume MMA/WGMMA pipeline bandwidth).
+  \item \textbf{Register pressure} as a hard constraint: estimated peak live ranges in the pipelined loop must satisfy
+  \[
+  \textsf{RegsPerThread}(\tau) \le R_{\max}(\textsf{SM}, \textsf{CTA\_shape})
+  \]
+  to avoid occupancy collapse.
+  \item \textbf{Shared memory budget}:
+  \[
+  D \cdot \textsf{StageBytes} \le \textsf{SmemBudget}(\textsf{SM}, \textsf{ClusterSize})
+  \]
+\end{itemize}
+
+\paragraph{Optimization target.}
+We minimize initiation interval (II) or maximize overlap proxy:
+\[
+\min_{\tau, D, \textsf{warp\_roles}} \ \textsf{II}(\tau)
+\quad \text{s.t. precedence, typestate, and resource constraints.}
+\]
+In implementation, TITAN performs a small discrete search over pipeline depths and warp partitions, guided by a static cost model (register estimates, shared-memory footprint) and validated by profiling.
+
+\subsection{How TITAN Subsumes the Seed’s Layout Algebra}
+Linear Layouts answers: \emph{given an op graph, choose layouts and conversions that make memory movement cheap}.
+TITAN adds: \emph{given chosen layouts, schedule the movement to occur asynchronously and correctly}.
+
+Formally, we treat the seed layout \(L\) as a parameter to transport:
+\[
+\textsf{copy}(p_s,p_d,L,R,\sigma) \text{ is legal iff } \textsf{LegalTransport}(L,R,p_s,p_d).
+\]
+Thus, TITAN composes with the seed system:
+\begin{enumerate}
+  \item Seed selects \(L\) and inserts conversions/swizzles (spatial).
+  \item TITAN decides which movements become async transfers, where barriers go, and how to overlap them with compute (temporal).
+\end{enumerate}
+
+\section{System Architecture (The Compiler)}
+
+\subsection{Compiler Overview}
+TITAN is implemented as a backend transformation in Triton’s NVIDIA/AMD backends, positioned after layout propagation (so it sees final shared-memory shapes/swizzles) and before low-level LLVM/\PTX{} emission (so it can control barrier placement, unrolling, and warp roles).
+
+\begin{figure}[t]
+\begin{Verbatim}[fontsize=\footnotesize, commandchars=\\\{\}]
++--------------------------------------------------------------+
+|  PyTorch Inductor / Triton Frontend                           |
+|   - tiling choices, fusion, epilogue structure                |
++------------------------------+-------------------------------+
+                               |
+                               v
++--------------------------------------------------------------+
+|  TTIR  ->  TTGIR                                             |
+|   - tensor ops + memory ops                                  |
++------------------------------+-------------------------------+
+                               |
+                               v
++--------------------------------------------------------------+
+|  Seed Pass: Linear Layouts (spatial)                          |
+|   - choose per-op layout L                                    |
+|   - synthesize swizzles / convert_layout                       |
++------------------------------+-------------------------------+
+                               |
+                               v
++--------------------------------------------------------------+
+|  TITAN Pass: Tokenized Transport + Typestate Scheduling       |
+|   (1) Extract transport opportunities (global<->shared)       |
+|   (2) Lower to async ops producing !async.token               |
+|   (3) Allocate D-stage ring buffer + barriers                 |
+|   (4) Warp-specialize: producer vs consumer warps             |
+|   (5) Modulo schedule under reg/smem constraints              |
+|   (6) Typestate verify + fence synthesis                      |
++------------------------------+-------------------------------+
+                               |
+                               v
++--------------------------------------------------------------+
+|  LLVM IR / Target Lowering                                   |
+|   NVIDIA: cp.async.bulk.tensor + mbarrier + proxy fences      |
+|   AMD: pipelined global->LDS + s_waitcnt + wave64 barriers    |
++------------------------------+-------------------------------+
+                               |
+                               v
++--------------------------------------------------------------+
+|  GPU Binary (SASS / GCN)                                      |
++--------------------------------------------------------------+
+\end{Verbatim}
+\caption{TITAN compilation flow: spatial layout selection remains intact; TITAN makes transport scheduling first-class and verifiable.}
+\end{figure}
+
+\subsection{IR Extensions: \TTGIR{} Async Tokens and Barrier Ops}
+TITAN introduces (or reuses) a minimal set of \MLIR{}-like ops in the Triton GPU \IR{}:
+
+\begin{itemize}
+  \item \texttt{ttg.async.copy\_tensor} \(\rightarrow\) produces \texttt{!ttg.async.token}
+  \item \texttt{ttg.async.mbarrier\_arrive(token, bar)} \(\rightarrow\) registers completion
+  \item \texttt{ttg.async.mbarrier\_wait(bar)} \(\rightarrow\) consumes availability
+  \item \texttt{ttg.async.proxy\_fence(kind)} \(\rightarrow\) enforces proxy ordering when required
+  \item \texttt{ttg.async.stage\_acquire(k)} / \texttt{ttg.async.stage\_release(k)} \(\rightarrow\) linear ownership of ring-buffer slots
+\end{itemize}
+
+\noindent A sketch of the intended \IR{} is shown below (notation is illustrative; exact op names follow Triton backend conventions):
+
+\begin{lstlisting}[language=C,caption={Tokenized transport IR sketch (TTGIR/MLIR-like).}]
+%stage = ttg.async.stage_acquire %k : !ttg.stage
+%tok   = ttg.async.copy_tensor %desc[%coord], %smem[%stage]
+         : (!ttg.tma_desc, index, memref) -> !ttg.async.token
+ttg.async.mbarrier_arrive %bar[%stage], %tok : (!ttg.barrier, !ttg.async.token) -> ()
+ttg.async.mbarrier_wait   %bar[%stage] : (!ttg.barrier) -> ()
+
+%frag = ttg.dot.wgmma %smem[%stage], %acc : (memref, vector) -> vector
+
+ttg.async.stage_release %stage : !ttg.stage -> ()
+\end{lstlisting}
+
+\subsection{Warp Specialization and Ring-Buffer Placement}
+TITAN explicitly partitions warps in a thread block into producer and consumer roles.
+Producers issue async copies and signal barriers; consumers wait and execute tensor-core compute.
+
+\begin{figure}[t]
+\begin{Verbatim}[fontsize=\footnotesize, commandchars=\\\{\}]
++--------------------------------------------------------------+
+|  Thread Block (CTA) with Warp Specialization                  |
+|                                                              |
+|  Warps:  W0 W1 | W2 W3 W4 W5 W6 W7                            |
+|         [PROD] | [       CONSUME / WGMMA       ]              |
+|                                                              |
+|  Shared Memory Ring Buffer (depth D)                          |
+|   stage 0: [A_tile][B_tile]  barrier0                         |
+|   stage 1: [A_tile][B_tile]  barrier1                         |
+|   ...                                                        |
+|   stage D-1:             barrier(D-1)                         |
+|                                                              |
+|  Steady-state modulo schedule (per K-iteration)               |
+|   Producer:  copy -> arrive(stage (i+D-1 mod D))              |
+|   Consumer:  wait(stage i) -> compute -> release(stage i)     |
++--------------------------------------------------------------+
+\end{Verbatim}
+\caption{Warp specialization and pipelined shared-memory staging. TITAN allocates ring buffers and verifies slot ownership.}
+\end{figure}
+
+\subsection{TITAN Pass Pipeline: From Pattern Extraction to Verified Lowering}
+The pass operates as follows.
+
+\paragraph{(1) Candidate region identification.}
+We match producer-consumer motifs where shared-memory staging is beneficial:
+\begin{itemize}
+  \item Matmul-like kernels (GEMM, grouped GEMM, MoE MLPs),
+  \item Attention tiles (FlashAttention-style), and
+  \item Structured epilogues with predictable reuse.
+\end{itemize}
+We reuse the seed’s anchor ops (e.g., MMA/WGMMA) as scheduling anchors.
+
+\paragraph{(2) Transport extraction.}
+We build an explicit transport graph by rewriting memory operations into logical transfers between places:
+\[
+\textsf{Global} \rightarrow \textsf{Shared}_{\CTA} \rightarrow \textsf{Reg}
+\]
+and optionally
+\[
+\textsf{Shared}_{\textsf{Cluster}} \leftrightarrow \textsf{Shared}_{\CTA}
+\]
+when cluster/\DSMEM{} is enabled.
+
+\paragraph{(3) Tokenization.}
+Each transport becomes an async op returning a token; barriers become explicit events. All dependences are explicit edges.
+
+\paragraph{(4) Scheduler (modulo + roles).}
+We choose:
+\begin{itemize}
+  \item pipeline depth \(D \in \{2,3,4,5\}\) (small discrete search),
+  \item producer warp count \(W_P\) and consumer warp count \(W_C\),
+  \item unroll factor and stage assignment function \(\sigma(i) = i \bmod D\),
+\end{itemize}
+subject to register and shared-memory constraints. The scheduler computes a modulo schedule that overlaps copy and compute and avoids barrier-induced bubbles.
+
+\paragraph{(5) Typestate verification and fence synthesis.}
+We run a static checker that validates that for every stage:
+\begin{itemize}
+  \item \textsf{acquire} dominates all stage writes and occurs only in \textsf{Empty} state,
+  \item \textsf{wait} dominates all stage reads and occurs only after the corresponding token arrival,
+  \item \textsf{release} post-dominates stage reads and restores \textsf{Empty},
+  \item required proxy-ordering fences are present when crossing proxy domains.
+\end{itemize}
+On failure, TITAN either (i) inserts missing waits/fences (conservative fix) or (ii) falls back to synchronous lowering for that region (robustness).
+
+\subsection{Algorithms}
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+\Input{\TTGIR{} region \(R\) with spatial layouts \(L\), hardware model \(H\)}
+\Output{Region \(R'\) with tokenized async transport, schedule, and verified protocol}
+\BlankLine
+Extract candidate producer-consumer subgraph \(G \subset R\) anchored at MMA/WGMMA ops\;
+Rewrite eligible loads/stores as logical transports between places in \(\mathcal{P}\)\;
+\ForEach{pipeline configuration \((D, W_P, W_C, u)\) in small search space}{
+  Allocate ring-buffer stages \(\sigma \in \{0,\dots,D-1\}\) and per-stage barriers\;
+  Lower transports to \texttt{async.copy\_tensor} producing tokens; insert \texttt{arrive}/\texttt{wait}\;
+  Synthesize warp roles (producer vs consumer) and build modulo schedule \(\tau\)\;
+  Estimate register pressure and shared-memory use; reject if constraints violated\;
+  Run typestate verification and fence synthesis\;
+  Score configuration by predicted II + barrier wait slack + occupancy penalty\;
+}
+Select best feasible configuration; commit rewriting into \(R'\)\;
+Lower async ops to target ISA (NVIDIA: \TMA{}+\texttt{mbarrier}, AMD: pipelined global\(\rightarrow\)\LDS{}+waitcnt)\;
+\caption{TITAN scheduling: tokenized transport + resource constraints + typestate verification.}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+\Input{Tokenized event graph \((E,\prec)\) with stage ops, initial states \(S_\sigma=\textsf{Empty}\)}
+\Output{Accept (safe) or Reject (protocol violation) + diagnostic}
+\BlankLine
+Compute dominator/post-dominator relations for stage acquire/wait/release ops\;
+Perform dataflow over each stage slot \(\sigma\): propagate typestate along CFG\;
+\If{a transition violates the stage protocol}{
+  Report offending ops (use-before-ready or overwrite-before-consume)\;
+  Reject\;
+}
+Check cross-proxy visibility obligations; insert \texttt{proxy\_fence} if required and re-check\;
+Accept\;
+\caption{Typestate checker for pipelined stages (compile-time correctness).}
+\end{algorithm}
+
+\subsection{Lowering to Real Hardware}
+
+\paragraph{NVIDIA H100 (SM90) path.}
+When descriptor constraints are met, \texttt{async.copy\_tensor} lowers to \TMA{} bulk tensor operations:
+\begin{itemize}
+  \item Use a tensor-map descriptor for 2D--5D tiling.
+  \item Use barrier completion (\texttt{mbarrier.arrive}/\texttt{mbarrier.wait}) to connect tokens to consumers.
+  \item Insert proxy fences only when needed by the typestate/effect obligations to avoid correctness bugs and to prevent conservative global fences that serialize the pipeline.
+\end{itemize}
+
+\paragraph{AMD MI300 (CDNA3) path.}
+MI300 lacks a direct \TMA{} analogue; nevertheless, TITAN’s tokenized \IR{} remains useful:
+\begin{itemize}
+  \item \texttt{async.copy\_tensor} lowers to a software-pipelined global\(\rightarrow\)\LDS{} transfer, where tokens correspond to outstanding memory operations.
+  \item Token consumption is enforced via explicit wait-counter synchronization and wave64-compatible barriers; the same typestate rules apply to prevent stage hazards.
+\end{itemize}
+This provides a portability story: TITAN is a \emph{transport scheduling} abstraction, with NVIDIA benefiting from \TMA{} and AMD benefiting from disciplined pipelining and correctness enforcement.
+
+\section{Evaluation Plan}
+
+\subsection{Platforms and Tooling}
+\paragraph{Hardware.}
+\begin{itemize}
+  \item NVIDIA H100 (SM90): validate \TMA{}, \texttt{mbarrier}, warp specialization, and cluster/\DSMEM{} (where available).
+  \item AMD MI300: validate portability of tokenized scheduling and typestate safety under wave64 and \LDS{} banking constraints.
+\end{itemize}
+
+\paragraph{Profilers and measurement.}
+\begin{itemize}
+  \item NVIDIA: Nsight Compute for memory throughput, barrier stall reasons, tensor core utilization, and occupancy.
+  \item AMD: rocprof (or equivalent) for memory stalls, \LDS{} conflicts, wave occupancy.
+  \item End-to-end: wall-clock latency for representative inference operators (decode attention, MoE MLP).
+\end{itemize}
+
+\subsection{Benchmarks (Micro + Macro)}
+We evaluate three tiers to separate mechanisms.
+
+\paragraph{Tier 1: Transport microbenchmarks.}
+\begin{itemize}
+  \item Pure \TMA{} copy kernels (2D--5D tiles), varying tile sizes, alignments, and stage depth \(D\).
+  \item Barrier protocol stress tests: varying producer/consumer warp partition, measuring wait stalls and overlap.
+  \item Proxy ordering sensitivity: compare TITAN’s minimal fences vs conservative fencing baselines.
+\end{itemize}
+
+\paragraph{Tier 2: Kernel-level compute+transport.}
+TritonBench-style kernels:
+\begin{itemize}
+  \item Persistent matmul variants (baseline vs TITAN-scheduled),
+  \item Grouped GEMM (MoE-like) where transport/computation overlap is critical,
+  \item FlashAttention-style tiles emphasizing streaming and synchronization overhead.
+\end{itemize}
+
+\paragraph{Tier 3: End-to-end operator latency.}
+Integrate TITAN-generated kernels into a PyTorch Inductor pipeline for:
+\begin{itemize}
+  \item LLM decode attention (ragged-ish workloads, but here we measure \emph{asynchrony benefits} rather than shape algebra),
+  \item MoE MLP layers (transport+compute overlap under routing-induced underfill).
+\end{itemize}
+
+\subsection{Baselines}
+\begin{itemize}
+  \item \textbf{Seed baseline:} Linear Layouts-style spatial layout propagation and conversions \emph{without} tokenized transport scheduling (status quo backend).
+  \item \textbf{Triton baseline:} existing Triton implementations (including any available \TMA{} tutorials/heuristics) treated as black-box.
+  \item \textbf{Vendor baseline:} cuBLASLt / CUTLASS (NVIDIA) and rocBLAS / CK-like kernels (AMD) where applicable for GEMM-like workloads.
+  \item \textbf{Ablations:}
+    \begin{itemize}
+      \item TITAN without typestate verification (to quantify safety vs performance),
+      \item TITAN with fixed \(D=2\) vs TITAN searched \(D\),
+      \item TITAN without warp specialization (single-role warps).
+    \end{itemize}
+\end{itemize}
+
+\subsection{Metrics}
+We report:
+\begin{itemize}
+  \item \textbf{SOL\% (Speed-of-Light)} for memory and compute:
+    achieved bandwidth / peak HBM bandwidth, and achieved MMA throughput / peak.
+  \item \textbf{Overlap efficiency:} fraction of time copy engine is busy while tensor core pipe is busy.
+  \item \textbf{Barrier overhead:} stall cycles attributed to waits/barriers.
+  \item \textbf{Register pressure and occupancy:} registers per thread, achieved occupancy, and sensitivity to pipeline depth.
+  \item \textbf{Instruction mix:} changes in control/synchronization instruction count.
+\end{itemize}
+
+\section{Conclusion}
+We propose \textbf{TITAN}, a compiler backend framework that makes asynchronous transport a first-class, verifiable \IR{} concept in Triton. TITAN addresses the seed’s core limitation---optimizing \emph{where} data lives without modeling \emph{when/how} it moves---by introducing:
+\begin{enumerate}
+  \item a \textbf{tokenized transport calculus} (copy/arrive/wait/fence as explicit events),
+  \item a \textbf{typestate protocol} that enforces correct pipelined use of shared-memory stages and barrier ordering, and
+  \item a \textbf{resource-aware scheduler} that searches pipeline depth and warp specialization under register and shared-memory constraints.
+\end{enumerate}
+TITAN is designed for real-metal impact on NVIDIA H100 via \TMA{}+\texttt{mbarrier} and offers a portability path to AMD MI300 through disciplined pipelining and the same correctness framework. In doing so, TITAN turns what is currently a hand-optimized kernel trick into a systematic compiler optimization that composes with (rather than replaces) the seed’s spatial layout algebra.
+
+\begin{thebibliography}{10}
+
+\bibitem{seed_linear_layouts}
+``Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using \(\mathbb{F}_2\),'' arXiv:2505.23819 (HTML edition).
+
+\bibitem{hopper_tuning}
+NVIDIA, ``Hopper Tuning Guide,'' CUDA Toolkit Documentation.
+
+\bibitem{ptx_isa}
+NVIDIA, ``Parallel Thread Execution (\PTX{}) ISA,'' CUDA Toolkit Documentation.
+
+\bibitem{triton}
+``Triton Language and Compiler,'' Triton project documentation.
+
+\bibitem{warp_specialization}
+``Warp Specialization in PyTorch/Triton,'' PyTorch engineering blog.
+
+\bibitem{cypress}
+``Task-Based Tensor Computations on Modern GPUs,'' PLDI 2025 (NVIDIA Research).
+
+\bibitem{tawa}
+``Tawa: Automatic Warp Specialization for Modern GPUs with Asynchronous References,'' arXiv preprint (2025).
+
+\bibitem{mlir}
+LLVM Project, ``\MLIR{}: Multi-Level Intermediate Representation,'' documentation.
+
+\bibitem{dialegg}
+``DialEgg: Dialect-Agnostic \MLIR{} Optimizer using Equality Saturation with Egglog,'' CGO 2025.
+
+\bibitem{amd_mi300}
+AMD ROCm documentation and optimization notes on \LDS{} banking and wave64 execution.
+
+\end{thebibliography}
+
+\end{document}
+

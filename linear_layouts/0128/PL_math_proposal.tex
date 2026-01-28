@@ -1,0 +1,386 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{fancyvrb}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\begin{document}
+
+\title{TASIR: Transport-Aware Scheduling IR for TMA Pipelines via Petri-Net Effects}
+\author{\IEEEauthorblockN{Proposed by Principal Systems \& Compiler Architect (ASPLOS/ISCA/MICRO Focus)}}
+\maketitle
+
+\section{Problem Formulation \& Motivation}
+\textbf{Target Gap (Stage 2): Gap \#4 --- the Async Transport Cliff.}
+Modern NVIDIA Hopper/Blackwell-class GPUs expose peak performance only when kernels exploit \emph{asynchronous transport engines} (e.g., Tensor Memory Accelerator (TMA)) and their correctness rules (barrier accounting, proxy ordering). The seed abstraction family (bit-linear layout algebra over \(\mathbb{F}_2\) and frontend layout expressions) fundamentally reasons about \emph{where} data should live (index-to-address, lane-to-coordinate), but not \emph{when/how} data moves through hardware transport pipelines.
+
+\subsection{The Hardware--Math Gap}
+\textbf{Seed capability:} Spatial reasoning about layout conversions.
+A bit-linear layout is a homomorphism \(L: \{0,1\}^n \rightarrow \{0,1\}^m\), enabling algebraic inversion, composition, and synthesis of swizzles/shuffles \emph{provided} shapes are power-of-two and the mapping is total and bijective on a fixed domain.
+
+\textbf{Hardware reality:} Transport is temporal and partially ordered.
+TMA copies and some tensor-core operations execute in a distinct \emph{async proxy} and complete via barrier mechanisms. Correctness depends on ordering between:
+\begin{itemize}
+  \item \emph{Generic proxy} memory operations (normal loads/stores, shared-memory initialization, barrier init),
+  \item \emph{Async proxy} operations (TMA bulk tensor copies; possibly asynchronous tensor-core pipelines),
+  \item synchronization primitives (mbarrier init/arrive/try\_wait), plus proxy fences that establish visibility across proxies.
+\end{itemize}
+
+This creates an abstraction mismatch:
+\begin{enumerate}
+  \item \textbf{Layout is a function; transport is a partial order.}
+  A layout algebra (over \(\mathbb{F}_2\) or integer expressions) can encode address mappings, but cannot express the correctness constraint: ``operation \(a\) must be ordered before operation \(b\) \emph{across proxies}.''
+  \item \textbf{Peak performance requires schedule synthesis, not just layout selection.}
+  A kernel can have an optimal shared-memory swizzle yet still stall on barriers because the compiler issued TMA too late, used the wrong stage depth, or inserted conservative ordering.
+  \item \textbf{Correctness requires minimum necessary fences, not heuristic barriers.}
+  Over-fencing kills overlap; under-fencing is a latent race.
+\end{enumerate}
+
+\subsection{Problem Statement}
+Given a tensor program lowered to a GPU-oriented IR (e.g., TritonGPU / ttg) that already contains layout decisions (blocked tiles, swizzles, WGMMA-compatible fragments, descriptor-based loads), we want a compiler system that:
+\begin{enumerate}
+  \item \textbf{Makes transport explicit} as first-class IR operations: descriptor legality checks, TMA issue, barrier accounting, waits, proxy fences.
+  \item \textbf{Synthesizes an overlap-maximizing schedule} (stage depth, issue distance, warp specialization boundaries) while respecting resource constraints (SMEM capacity, registers, occupancy).
+  \item \textbf{Guarantees correctness} under proxy semantics via a static effect system and a Petri-net style token discipline for staged buffers.
+\end{enumerate}
+
+\subsection{Non-negotiable Constraints (Artifact Reality)}
+\begin{itemize}
+  \item \textbf{Real metal only:} evaluate on NVIDIA H100 and AMD MI300 using microbenchmarks, TritonBench, Nsight Compute / rocprof-compute, and end-to-end latency. No simulator/FPGA.
+  \item \textbf{No new hardware:} use existing ISA/arch features (TMA, mbarrier, warp specialization, cluster/DSMEM as stretch).
+  \item \textbf{Implementation feasibility:} buildable in Triton/PyTorch/CUTLASS in a 3--4 month window for an ASPLOS-style artifact.
+\end{itemize}
+
+\section{Theoretical Framework}
+TASIR (Transport-Aware Scheduling IR) is built on three mathematical pillars that directly address the transport gap.
+
+\subsection{(A) Petri Nets for Correctness of Staged Pipelines}
+We model pipelined transport/compute using a bounded Petri net \(N = (P, T, F, M_0)\):
+\begin{itemize}
+  \item Places \(P\) represent resources and stage states: \(\textsf{Empty}[s]\), \(\textsf{Full}[s]\), \(\textsf{BarrierReady}[s]\), and (optionally) \(\textsf{RegsFree}\).
+  \item Transitions \(T\) represent events: \(\textsf{IssueTMA}[s]\), \(\textsf{Arrive}[s]\), \(\textsf{Wait}[s]\), \(\textsf{Compute}[s]\).
+  \item The flow relation \(F\) encodes conservation: a stage cannot be overwritten unless a token returns to \(\textsf{Empty}[s]\).
+\end{itemize}
+
+\textbf{Safety invariant (no SMEM clobber):}
+for each stage \(s\), tokens satisfy
+\[
+\textsf{Empty}[s] + \textsf{Full}[s] = 1
+\]
+under all reachable markings. This is the canonical ``double/triple buffering is correct by construction'' property.
+
+\subsection{(B) Trace Theory for Legal Reorderings (Overlap)}
+We define a dependence relation \(D \subseteq O \times O\) over operations \(O\) and an independence relation \(I = (O \times O) \setminus D\).
+Two operations commute (can be swapped in the schedule) iff they are independent in the sense of:
+\begin{enumerate}
+  \item no data dependency (read-after-write, write-after-read, write-after-write) on the same memory region, and
+  \item no required proxy-ordering edge (defined by the effect system below).
+\end{enumerate}
+A schedule is then a \emph{linearization} of the resulting partial order. Trace equivalence classes allow aggressive hoisting of TMA issues as long as token/visibility constraints are preserved.
+
+\subsection{(C) Effect System for Proxy Ordering (Minimum Fences)}
+We assign each operation an effect:
+\[
+\epsilon = \langle \pi, \sigma, \rho, \kappa \rangle
+\]
+where:
+\begin{itemize}
+  \item \(\pi \in \{\textsf{generic}, \textsf{async}\}\) is the proxy domain,
+  \item \(\sigma \in \{\textsf{global}, \textsf{shared}, \textsf{dsmem}, \textsf{reg}\}\) is the memory space,
+  \item \(\rho \in \{\textsf{R}, \textsf{W}, \textsf{RW}\}\) is the access mode,
+  \item \(\kappa \in \{\textsf{cta}, \textsf{cluster}\}\) is the scope.
+\end{itemize}
+
+We define a \emph{required ordering} predicate \(\mathsf{Order}(\epsilon_a, \epsilon_b)\) that is true when \(a\) must happen-before \(b\) but the hardware does not provide that order implicitly due to proxy separation. TASIR introduces explicit fence operations \(\textsf{Fence}(\pi,\sigma,\kappa)\) to bridge these orders.
+
+\textbf{Key design goal:} infer and insert the \emph{minimum} set of fences needed to make the schedule legal, avoiding over-serialization.
+
+\subsection{How this Subsumes the Seed}
+The seed's \(\mathbb{F}_2\) layout algebra remains valuable as a \emph{spatial} optimizer: it selects swizzles and conversions to maximize vector width and reduce bank conflicts. TASIR composes with it by:
+\begin{enumerate}
+  \item treating the seed-selected layout as constraints on \(\textsf{TileBytes}\), access patterns, and whether descriptor-based transport is legal, and
+  \item adding a missing dimension: \emph{a typed partial order on transport and compute}.
+\end{enumerate}
+In short: \(\mathbb{F}_2\) solves \emph{where}; TASIR solves \emph{when} under proxy semantics.
+
+\section{System Architecture (Compiler \& Runtime)}
+\subsection{Overview}
+TASIR is a new internal IR layer and pass pipeline inserted after layout propagation but before LLVM/PTX emission in TritonGPU:
+\begin{itemize}
+  \item Input: ttg IR with layout decisions (blocked tiles, MMA/WGMMA fragments, descriptor loads/stores).
+  \item Output: transport-explicit schedule IR that lowers deterministically to PTX (NVIDIA) or to a semantically analogous async pipeline (AMD).
+\end{itemize}
+
+\begin{figure}[t]
+\begin{Verbatim}[fontsize=\footnotesize, commandchars=\\\{\}]
++------------------------------------------------------+
+| TTIR (high-level tensor ops)                          |
++-----------------------------+------------------------+
+                              |
+                              v
++------------------------------------------------------+
+| TTG (TritonGPU): layout propagation + conversions     |
+|  - seed layout algebra over F_2 chooses swizzles      |
+|  - produces descriptor-eligible loads when possible   |
++-----------------------------+------------------------+
+                              |
+                              v
++------------------------------------------------------+
+| TASIR (new): Transport-Aware Scheduling IR            |
+|  - explicit TMA_ISSUE / MBARRIER / PROXY_FENCE        |
+|  - Petri-net token discipline for stage buffers       |
+|  - effect inference + minimal fence insertion         |
+|  - max-plus-guided stage depth & issue distance       |
++-----------------------------+------------------------+
+                              |
+                              v
++------------------------------------------------------+
+| LLVM/PTX (NVIDIA) or LLVM/GCN (AMD)                   |
+|  - emit cp.async.bulk.tensor + mbarrier + fences       |
+|  - or software-pipelined global->LDS with waitcnt      |
++------------------------------------------------------+
+\end{Verbatim}
+\caption{Compilation flow: TASIR is inserted after layout decisions and before ISA lowering.}
+\end{figure}
+
+\subsection{TASIR Dialect: First-Class Transport Operations}
+We introduce an internal dialect (or IR extension) with the following core operations (illustrative, not syntax-final):
+\begin{itemize}
+  \item \(\textsf{MBAR\_INIT}(b, \textsf{scope})\)
+  \item \(\textsf{MBAR\_EXPECT\_TX}(b, \textsf{bytes})\)
+  \item \(\textsf{TMA\_ISSUE}(d, \textsf{gmem\_coords}, \textsf{smem\_dst}, b)\)
+  \item \(\textsf{MBAR\_TRY\_WAIT}(b)\)
+  \item \(\textsf{PROXY\_FENCE}(\textsf{async}\leftrightarrow \textsf{generic}, \textsf{space}, \textsf{scope})\)
+  \item \(\textsf{STAGE\_ALLOC}(S, \textsf{TileBytes})\) (explicit stage buffer carving to surface SMEM footprint)
+\end{itemize}
+
+\textbf{Invariant:} every \(\textsf{TMA\_ISSUE}\) is paired with \(\textsf{MBAR\_EXPECT\_TX}\) and a dominating \(\textsf{MBAR\_INIT}\); every consumer of a stage must be dominated by \(\textsf{MBAR\_TRY\_WAIT}\) on the stage barrier.
+
+\subsection{Warp Specialization as a Scheduling Primitive}
+TASIR treats warp specialization as a \emph{first-class} scheduling choice:
+\begin{itemize}
+  \item \textbf{Transport warps:} issue TMA and manage barriers.
+  \item \textbf{Compute warps:} execute WGMMA/MMA and epilogues.
+\end{itemize}
+This separation reduces instruction interference (transport overhead does not pollute compute warp I-cache and register file) and improves overlap predictability.
+
+\begin{figure}[t]
+\begin{Verbatim}[fontsize=\footnotesize, commandchars=\\\{\}]
+Kernel CTA (example: GEMM/Attention inner loop)
+-------------------------------------------------------
+SMEM:  [stage 0 tile][stage 1 tile]...[stage S-1 tile]
+      ^             ^                       ^
+      |             |                       |
+     b0            b1                    b(S-1)
+   (mbarrier)   (mbarrier)              (mbarrier)
+
+Warp groups:
+  WG0: Transport (TMA issue + barrier accounting)
+  WG1: Compute   (WGMMA/MMA on stage k mod S)
+  WG2: Epilogue  (optional: stores, reductions)
+
+Per-iteration (steady state):
+  WG0: issue tile(k+S) -> stage[(k+S) mod S]
+       expect_tx(stage_barrier)
+  WG1: try_wait(stage[k mod S]) ; compute on stage[k mod S]
+\end{Verbatim}
+\caption{Memory/thread mapping: staged SMEM buffers with per-stage barriers and warp specialization.}
+\end{figure}
+
+\subsection{Schedule Synthesis}
+\textbf{Input:} a loop nest (typically a reduction over \(K\)) with identified tiles and compute ops; resource budgets from compilation (SMEM bytes available, register pressure estimate, occupancy constraints).
+
+\textbf{Output:} a parameterized schedule: stage depth \(S\), issue distance \(\Delta\), and placement of \(\textsf{TMA\_ISSUE}\), waits, and fences.
+
+\subsubsection{Max-Plus Model (Throughput-Oriented)}
+Let \(L_m\) be the effective memory latency for one tile transfer and \(L_c\) be the compute latency per tile. A coarse steady-state initiation interval is:
+\[
+II(S) = \max\left(L_c,\; \frac{L_m}{S}\right)
+\]
+subject to:
+\[
+S \cdot \textsf{TileBytes} \le \textsf{SMEM\_Budget}, \quad
+\textsf{Regs}(S) \le \textsf{RegBudget}(\textsf{target occ})
+\]
+TASIR uses this as a guiding model; the final decision is validated by codegen-level estimates (instruction counts, known barrier overhead) and optionally a small discrete search over \(S \in \{1,2,3,4\}\) for feasibility.
+
+\subsubsection{Dependency Graph Construction}
+We build a transport-compute DAG:
+\begin{itemize}
+  \item nodes: \(\textsf{Issue}[k]\), \(\textsf{Wait}[k]\), \(\textsf{Compute}[k]\), \(\textsf{Epilogue}[k]\),
+  \item edges: \(\textsf{Issue}[k] \rightarrow \textsf{Wait}[k]\) (completion), \(\textsf{Wait}[k] \rightarrow \textsf{Compute}[k]\) (use), plus reuse edges enforcing stage token discipline.
+\end{itemize}
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetAlgoLined
+\KwIn{Loop body \(B\) with tiled ops; tile size; resource budgets}
+\KwOut{Stage depth \(S\), issue distance \(\Delta\), TASIR schedule}
+Extract per-tile transfer size \(\textsf{TileBytes}\) and compute block \(C\)\;
+Estimate \(L_m\) (transport) and \(L_c\) (compute) from static heuristics\;
+Candidate set \(\mathcal{S} \leftarrow \{1,2,3,4\}\)\;
+\ForEach{\(S \in \mathcal{S}\)}{
+  \If{\(S \cdot \textsf{TileBytes} > \textsf{SMEM\_Budget}\)}{continue\;}
+  \If{\(\textsf{Regs}(S) > \textsf{RegBudget}\)}{continue\;}
+  Predict \(II(S) \leftarrow \max(L_c, L_m/S)\)\;
+}
+Choose \(S^\star \leftarrow \arg\min_S II(S)\) among feasible candidates\;
+Set \(\Delta \leftarrow S^\star\) (prefetch \(S^\star\) tiles ahead)\;
+Construct staged Petri net for \(S^\star\) and emit TASIR:
+\begin{itemize}
+  \item prologue: init barriers + proxy fence
+  \item steady-state: issue(k+\(\Delta\)), wait(k), compute(k)
+  \item epilogue: drain remaining waits and finalize stores
+\end{itemize}
+\caption{TASIR schedule synthesis (stage depth and prefetch distance).}
+\end{algorithm}
+
+\subsection{Effect Inference and Minimal Fence Insertion}
+TASIR uses a static pass that infers effects of each op and inserts proxy fences only when required.
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetAlgoLined
+\KwIn{Ordered TASIR op list \(\langle o_1,\dots,o_n\rangle\)}
+\KwOut{Fence-augmented TASIR op list}
+\For{\(i \leftarrow 1\) \KwTo \(n\)}{
+  Infer effect \(\epsilon_i \leftarrow \mathsf{Effect}(o_i)\)\;
+}
+\For{\(i \leftarrow 1\) \KwTo \(n\)}{
+  \For{\(j \leftarrow i+1\) \KwTo \(n\)}{
+    \If{\(\mathsf{Order}(\epsilon_i,\epsilon_j)\) and no existing happens-before path}{
+      Insert \(\textsf{PROXY\_FENCE}\) at the latest legal position dominating \(o_j\)\;
+      Update happens-before graph\;
+    }
+  }
+}
+\caption{Effect-driven proxy fence insertion (minimum necessary ordering).}
+\end{algorithm}
+
+\textbf{Design note (pragmatic MVP):}
+We deliberately restrict the fence lattice for initial implementation:
+\begin{itemize}
+  \item CTA scope only (no clusters/DSMEM in MVP),
+  \item shared memory visibility crossings (generic \(\leftrightarrow\) async) as the primary fence class,
+  \item barrier init \(\rightarrow\) TMA issue is treated as a canonical required fence pattern.
+\end{itemize}
+This keeps correctness surface area tractable for a 3--4 month artifact.
+
+\subsection{Lowering to NVIDIA PTX and AMD GCN}
+\subsubsection{NVIDIA (H100 / sm\_90)}
+TASIR lowers to:
+\begin{itemize}
+  \item \texttt{cp.async.bulk.tensor} for TMA issues,
+  \item \texttt{mbarrier.init}, \texttt{mbarrier.arrive.expect\_tx}, \texttt{mbarrier.try\_wait} for completion and staging,
+  \item \texttt{fence.proxy.async.shared::cta} (or equivalent) where inferred.
+\end{itemize}
+
+\subsubsection{AMD (MI300 / wave64)}
+MI300 does not expose TMA, but the transport IR still provides value as a \emph{portable schedule representation}. We lower transport events into:
+\begin{itemize}
+  \item software pipelined global loads feeding LDS (shared memory),
+  \item phase-aware LDS stores (instruction width dependent),
+  \item scoreboard/waitcnt style synchronization and wave/CTA barriers.
+\end{itemize}
+This enables a consistent evaluation story: TASIR is a unified abstraction for transport scheduling, with backend-specific implementations.
+
+\subsection{Illustrative TASIR Snippet}
+\begin{lstlisting}
+# Pseudocode: steady-state inner loop with S-stage pipeline
+MBAR_INIT(b[0..S-1], scope=cta)
+PROXY_FENCE(async<->generic, space=shared, scope=cta)
+
+for k in 0..K-1:
+  stage_i = (k + S) mod S
+  stage_c = k mod S
+
+  MBAR_EXPECT_TX(b[stage_i], TileBytes)
+  TMA_ISSUE(descA, coordsA(k+S), smemA[stage_i], b[stage_i])
+  TMA_ISSUE(descB, coordsB(k+S), smemB[stage_i], b[stage_i])
+
+  MBAR_TRY_WAIT(b[stage_c])
+  WGMMA(smemA[stage_c], smemB[stage_c]) -> regs
+\end{lstlisting}
+
+\section{Evaluation Plan}
+\subsection{Platforms}
+\begin{itemize}
+  \item \textbf{NVIDIA H100 (Hopper / sm\_90):} primary target for TMA correctness and performance.
+  \item \textbf{AMD MI300 (wave64):} portability and transport-IR generality; evaluate software-pipelined transport and LDS effects.
+\end{itemize}
+
+\subsection{Methodology (Real Metal)}
+\begin{itemize}
+  \item \textbf{Microbenchmarks:} isolate transport/compute overlap using controlled tiled matmul and attention inner loops, sweeping stage depth \(S\), tile bytes, and prefetch distance.
+  \item \textbf{TritonBench:} run representative kernels where overlap and barrier behavior dominates:
+  \begin{itemize}
+    \item FlashAttention-style kernels (prefill and decode variants),
+    \item Grouped GEMM / MoE-adjacent grouped matmuls,
+    \item standard GEMM configurations that are descriptor-eligible.
+  \end{itemize}
+  \item \textbf{End-to-end latency:} integrate into a serving-shaped benchmark (batched decode) using Triton kernels; report token latency distributions (P50/P95).
+\end{itemize}
+
+\subsection{Baselines}
+\begin{enumerate}
+  \item \textbf{Seed-backend baseline:} current layout-optimized lowering without TASIR schedule synthesis (layout-only; transport scheduling heuristic/manual).
+  \item \textbf{Hand-tuned kernels:} CUTLASS-style persistent/WGMMA pipelines where available.
+  \item \textbf{Library baselines:} cuBLASLt (NVIDIA) / rocBLAS (AMD) for GEMM, plus framework autotuned implementations when applicable.
+  \item \textbf{Ablations:}
+  \begin{itemize}
+    \item TASIR without effect system (conservative fences everywhere),
+    \item TASIR without schedule search (fixed \(S=2\)),
+    \item TASIR without warp specialization (single warp-group does both).
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Metrics}
+We report:
+\begin{itemize}
+  \item \textbf{SOL\% (Speed-of-Light):} roofline-normalized efficiency. For each kernel:
+  \[
+  \textsf{SOL} = \min\left(
+    \frac{\textsf{Achieved FLOP/s}}{\textsf{Peak FLOP/s}},
+    \frac{\textsf{Achieved BW}}{\textsf{Peak BW}}
+  \right)
+  \]
+  \item \textbf{HBM bandwidth utilization:} achieved vs peak; sensitivity to stage depth.
+  \item \textbf{Barrier stall attribution:} fraction of cycles stalled on barriers / waits (Nsight Compute on NVIDIA, rocprof-compute on AMD).
+  \item \textbf{Register pressure and occupancy:} registers per thread, active warps, and occupancy cliffs as \(S\) increases.
+  \item \textbf{Instruction mix:} transport instructions, synchronization instructions, and compute issue rates.
+\end{itemize}
+
+\subsection{Profiling Artifacts (Required Screenshots/Logs)}
+\begin{itemize}
+  \item \textbf{NVIDIA:} Nsight Compute sections showing overlap, barrier stalls, and memory throughput; include kernel timeline where available.
+  \item \textbf{AMD:} rocprof-compute reports highlighting LDS efficiency (bank conflicts proxy), wave occupancy, and memory pipeline behavior.
+\end{itemize}
+
+\subsection{Expected Outcomes (Falsifiable Hypotheses)}
+\begin{enumerate}
+  \item \textbf{Correctness:} TASIR eliminates proxy-ordering races by construction (effect-typed fences + token discipline).
+  \item \textbf{Performance:} TASIR reduces barrier-dominated stalls by selecting stage depth \(S\) and hoisting transport, improving SOL\% on H100 for descriptor-eligible kernels.
+  \item \textbf{Robustness:} performance is less sensitive to minor codegen changes because transport is explicit and schedule synthesis is systematic (not incidental to instruction ordering).
+\end{enumerate}
+
+\section{Conclusion}
+We propose \textbf{TASIR}, the first Triton-integrated compiler IR and pass pipeline that treats asynchronous transport as a first-class, \emph{typed} scheduling problem rather than an incidental byproduct of layout lowering. TASIR closes the hardware--math gap left by seed layout algebras by:
+\begin{itemize}
+  \item modeling transport/compute overlap as a Petri-net disciplined staged pipeline,
+  \item exploiting trace-theoretic reorderings to hoist asynchronous transfers safely,
+  \item enforcing proxy correctness via an effect system that inserts the minimum necessary fences,
+  \item emitting real-metal-ready code for H100 (TMA + mbarrier) and a portable transport schedule on MI300.
+\end{itemize}
+The core claim is architectural: \emph{layout \(\neq\) schedule}. TASIR makes schedule a compiler-visible object, enabling systematic exploitation of fixed hardware transport engines without adding any hardware.
+
+\end{document}

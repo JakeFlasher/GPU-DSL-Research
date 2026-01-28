@@ -1,0 +1,505 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{fancyvrb}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{url}
+\usepackage{cite}
+
+% ----------------------------------------------------------------------
+% Dense formatting knobs (ASPLOS-style)
+% ----------------------------------------------------------------------
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  frame=single,
+  columns=fullflexible,
+  xleftmargin=2mm,
+  xrightmargin=2mm,
+  breaklines=true,
+  keepspaces=true
+}
+\definecolor{dkgray}{rgb}{0.2,0.2,0.2}
+
+\begin{document}
+
+% ----------------------------------------------------------------------
+% NOTE: Target Gap from Stage 2
+% Gap / Cliff \#4: Async transport cliff (Hopper/Blackwell performance depends on TMA + mbarrier + proxy ordering).
+% ----------------------------------------------------------------------
+
+\title{TITAN: Typestate-Integrated Transport-Aware Scheduling for Hopper/Blackwell TMA--WGMMA Pipelines in Triton}
+
+\author{
+\IEEEauthorblockN{Anonymous Author(s)}
+\IEEEauthorblockA{(Proposal Artifact)\\
+Email: anonymous@invalid}
+}
+
+\maketitle
+\small
+
+\section{Problem Formulation}
+
+\subsection{The Hardware Reality: Hopper/Blackwell Is a Transport-Scheduled Machine}
+Modern NVIDIA GPUs (H100/Hopper and successors) expose performance-critical \emph{asynchronous transport} primitives that are not ``just faster loads,'' but a distinct execution regime with explicit correctness rules.
+
+\textbf{Tensor Memory Accelerator (TMA).}
+Hopper introduces TMA as a dedicated unit for multidimensional bulk transfers between global memory and shared memory, driven by descriptors to reduce address-generation overhead and avoid consuming SM issue bandwidth \cite{hopper_in_depth,cutlass_3x_blog_2025}. In contrast to classic vectorized loads, TMA compels developers (and compilers) to reason about:
+(i) descriptor legality (alignment/stride constraints),
+(ii) copy issue/arrival accounting via transactional barriers, and
+(iii) safe overlap of copies with tensor core compute.
+
+\textbf{Asynchronous barriers and the async proxy.}
+Hopper-class bulk copies are non-blocking; completion is tracked via barrier mechanisms (e.g., \texttt{mbarrier} variants) \cite{ptx_isa}. CUDA further specifies an \emph{async proxy} domain: certain bulk copies (TMA) and tensor-core pathways operate in a separate ordering domain, requiring explicit proxy fences to establish visibility and ordering against normal (generic proxy) memory operations \cite{cuda_guide_async}.
+
+\textbf{WGMMA/UMMA pipelines require temporal structure.}
+The highest-performing attention and GEMM kernels on H100 explicitly exploit producer--consumer overlap (warp specialization), staged shared-memory buffering, and careful barrier/fence placement \cite{flashattn3,cutlass_3x_blog_2025}. FlashAttention-3 reports large utilization gains by orchestrating TMA + Tensor Core asynchrony rather than merely choosing a clever layout \cite{flashattn3}.
+
+\subsection{The Gap: Spatial Layout Algebra Is (Largely) Solved; Temporal Transport Is Not}
+Recent work made substantial progress on \emph{spatial} layout reasoning:
+Linear Layouts formalize layout conversions using linear algebra over \(\mathbb{F}_2\) and integrate into Triton backend lowering \cite{linear_layouts_seed}. LEGO provides a frontend layout algebra to generate index expressions \cite{lego_seed}. NVIDIA's CuTe/CUTLASS provides a compositional layout vocabulary and hand-tuned or policy-driven GEMM mainloops \cite{cutlass_3x_blog_2025,cutlass_blog_2017}.
+
+However, these systems either:
+\begin{enumerate}
+  \item \textbf{Do not model transport scheduling as a first-class IR.} Layouts answer ``where in memory/registers,'' not ``when and under which proxy/barrier rules.''
+  \item \textbf{Rely on expert-written schedules.} FlashAttention-3 and CUTLASS 3.x encode scheduling expertise in templates and policy builders \cite{flashattn3,cutlass_3x_blog_2025}. This is powerful but brittle, difficult to verify, and hard to generalize across dynamic shapes and new kernel families.
+  \item \textbf{Lack correctness-typed fence/barrier synthesis.} The rules for async proxy ordering and barrier transactions are subtle; missing a fence can silently miscompile a kernel \cite{cuda_guide_async,ptx_isa}.
+\end{enumerate}
+
+\textbf{Challenge statement.}
+\emph{Spatial algebra is solved; temporal scheduling is unsolved.}
+We need a compiler layer that treats \textbf{transport} (TMA issue, barrier accounting, proxy fences, staged buffers, warp specialization) as a first-class, optimizable, and \emph{formally checked} artifact.
+
+\subsection{Goal and Scope}
+We target \textbf{Gap \#4 (Async transport cliff)} by building a Triton-integrated compiler system that:
+(i) synthesizes TMA/WGMMA schedules from a transport IR,
+(ii) guarantees proxy/barrier correctness via a typestate/effect discipline, and
+(iii) improves end-to-end performance on real hardware (H100; optionally B200 when available) using TritonBench and Nsight Compute metrics \cite{tritonbench_repo,nsight_compute_guide}.
+
+\section{Theoretical Framework}
+
+\subsection{A Minimal Semantics for Transport: Events, Proxies, and Stage Buffers}
+We model a kernel region (e.g., a matmul mainloop or attention block) as an event program:
+\[
+\mathcal{P} = \langle e_0, e_1, \dots, e_{n-1} \rangle
+\]
+Each event \(e\) has a \textbf{proxy} label \(\pi(e) \in \{\mathsf{gen}, \mathsf{async}\}\) (generic vs async proxy), and a \textbf{memory-space} label \(\mu(e) \in \{\mathsf{gmem}, \mathsf{smem}, \mathsf{reg}\}\).
+We write \(e : (\pi, \mu, \mathsf{rw}, A)\) where \(\mathsf{rw} \in \{\mathsf{R},\mathsf{W}\}\) and \(A\) is an abstract address region (tile).
+
+\textbf{Proxy-ordering axiom (informal).}
+Program order induces a happens-before relation within each proxy:
+\[
+e_i \prec e_j \;\wedge\; \pi(e_i)=\pi(e_j) \;\Rightarrow\; e_i \;\mathsf{hb}\; e_j
+\]
+Cross-proxy ordering is \emph{not} implied unless a fence is present \cite{cuda_guide_async}. TITAN makes this explicit.
+
+\subsection{Typestates for Staged Shared Memory}
+Let stage buffers be indexed by \(s \in \{0,1,\dots,S-1\}\). Each stage has a typestate:
+\[
+\mathsf{St} ::= \mathsf{Empty} \mid \mathsf{Filling}(b,n) \mid \mathsf{Ready}(b,n)
+\]
+where \(b\) is a barrier handle and \(n\) is the transaction size (bytes) expected for that stage.
+
+A typing context \(\Gamma\) maps stages and proxy-order flags:
+\[
+\Gamma = \{\, s \mapsto \mathsf{St}_s \,\} \cup \{\, \mathsf{po} \mapsto \mathsf{PO} \,\}
+\quad\text{where}\quad
+\mathsf{PO} \in \{\mathsf{Unordered}, \mathsf{Ordered}\}.
+\]
+Intuition: \(\mathsf{po}\) tracks whether we have established required ordering between generic shared-memory writes (e.g., barrier init) and subsequent async-proxy TMA traffic.
+
+\subsection{Core Typing Judgment}
+We use a state-transformer judgment:
+\[
+\Gamma \vdash I \Rightarrow \Gamma'
+\]
+meaning instruction \(I\) is well-typed under \(\Gamma\) and yields updated context \(\Gamma'\).
+
+\subsection{Selected Typing Rules (Transport-Critical)}
+We write \(\Gamma[s \mapsto x]\) for functional update.
+
+\paragraph{Barrier initialization.}
+Barrier initialization writes shared memory state in the generic proxy; after init, ordering to async proxy is not guaranteed until a proxy fence.
+\begin{equation}
+\frac{~}{\Gamma \vdash \mathsf{mbarrier\_init}(b) \Rightarrow \Gamma[\mathsf{po} \mapsto \mathsf{Unordered}]}
+\label{eq:rule_init}
+\end{equation}
+
+\paragraph{Proxy fence (generic \(\rightarrow\) async visibility).}
+A fence establishes cross-proxy visibility required by CUDA semantics \cite{cuda_guide_async}.
+\begin{equation}
+\frac{~}{\Gamma \vdash \mathsf{fence\_proxy}() \Rightarrow \Gamma[\mathsf{po} \mapsto \mathsf{Ordered}]}
+\label{eq:rule_fence}
+\end{equation}
+
+\paragraph{TMA issue into stage \(s\).}
+TMA issue requires the stage to be empty and the proxy-order flag to be ordered (conservative, but checkable).
+\begin{equation}
+\frac{
+  \Gamma(s)=\mathsf{Empty}
+  \quad
+  \Gamma(\mathsf{po})=\mathsf{Ordered}
+}{
+  \Gamma \vdash \mathsf{tma\_issue}(s,b,n) \Rightarrow \Gamma[s \mapsto \mathsf{Filling}(b,n)]
+}
+\label{eq:rule_issue}
+\end{equation}
+
+\paragraph{Barrier expect and wait.}
+We model barrier accounting explicitly. A minimal model requires that a wait only occurs on a filling stage.
+\begin{equation}
+\frac{
+  \Gamma(s)=\mathsf{Filling}(b,n)
+}{
+  \Gamma \vdash \mathsf{mbarrier\_wait}(s,b,n) \Rightarrow \Gamma[s \mapsto \mathsf{Ready}(b,n)]
+}
+\label{eq:rule_wait}
+\end{equation}
+
+\paragraph{WGMMA consume from stage \(s\).}
+Tensor core compute that consumes shared memory requires the stage to be ready.
+\begin{equation}
+\frac{
+  \Gamma(s)=\mathsf{Ready}(b,n)
+}{
+  \Gamma \vdash \mathsf{wgmma}(s) \Rightarrow \Gamma[s \mapsto \mathsf{Empty}]
+}
+\label{eq:rule_wgmma}
+\end{equation}
+
+\subsection{Theorem: Hazard Freedom for Well-Typed Transport Schedules}
+We define two hazards:
+(i) \textbf{Use-before-ready}: any shared-memory read of stage \(s\) when \(\Gamma(s)\neq \mathsf{Ready}(\cdot)\);
+(ii) \textbf{Proxy-order violation}: an async-proxy operation that depends on a generic-proxy shared-memory write without an intervening fence.
+
+\textbf{Theorem 1 (Hazard Freedom).}
+If \(\Gamma_0 \vdash I_0 \Rightarrow \Gamma_1 \vdash I_1 \Rightarrow \dots \vdash I_{k-1} \Rightarrow \Gamma_k\),
+then the instruction sequence \(\langle I_0,\dots,I_{k-1}\rangle\) is free of (i) use-before-ready and (ii) proxy-order violations under the conservative proxy model of \(\Gamma(\mathsf{po})\).
+
+\textbf{Proof sketch.}
+By induction on the derivation length.
+Rules \eqref{eq:rule_issue}--\eqref{eq:rule_wgmma} enforce that \(\mathsf{wgmma}(s)\) is only typeable if \(\Gamma(s)=\mathsf{Ready}\), preventing use-before-ready.
+Rule \eqref{eq:rule_issue} requires \(\Gamma(\mathsf{po})=\mathsf{Ordered}\), and the only rule that sets it to \(\mathsf{Ordered}\) is \eqref{eq:rule_fence}, ensuring a fence precedes any such TMA issue after a barrier init \eqref{eq:rule_init}. \hfill\(\square\)
+
+\subsection{Why This Matters: ``If It Compiles, It Is Correct'' for Transport}
+CuTe/CUTLASS relies on template-level correctness checks and policy builders \cite{cutlass_3x_blog_2025}, but proxy/fence correctness remains non-trivial and schedule-specific.
+TITAN proposes a \emph{compiler-level} typed IR where legality is checked before emitting PTX/SASS, making transport optimization safer and more automatable.
+
+\section{System Architecture}
+
+\subsection{End-to-End Compiler Pipeline (Triton Integration)}
+TITAN is implemented as a Triton backend extension that introduces an internal \textbf{TransportScheduleIR (TSIR)} layer. It composes with existing spatial layout passes (e.g., Linear Layouts) rather than replacing them \cite{linear_layouts_seed,triton2019}.
+
+\begin{figure}[t]
+\centering
+\begin{Verbatim}[fontsize=\footnotesize, commandchars=\\\{\}]
++--------------------+        +------------------------+
+|  TTIR / TTGIR      |        |  Layout Passes         |
+|  (Triton front/mid)| -----> |  (e.g., Linear Layouts)|
++--------------------+        +-----------+------------+
+                                          |
+                                          v
+                                +---------------------+
+                                | TITAN: TSIR Builder |
+                                | - tile/loop regions |
+                                | - candidate copies  |
+                                | - stage buffers     |
+                                +----------+----------+
+                                           |
+                                           v
++----------------------+        +------------------------------+
+| TITAN: Scheduler     | -----> | TITAN: Typestate Checker     |
+| - stage count S      |        | - barrier/fence legality     |
+| - issue/wait placement|       | - proxy-order constraints    |
+| - warp specialization|        +---------------+--------------+
++----------+-----------+                        |
+           |                                    v
+           v                         +---------------------------+
++----------------------+             | LLVM/PTX Lowering          |
+| Emission             | ----------> | - cp.async.bulk.tensor     |
+| - tma_issue/wait     |             | - mbarrier ops             |
+| - fence.proxy.*      |             | - wgmma/umma intrinsics    |
++----------------------+             +---------------------------+
+\end{Verbatim}
+\vspace{-1mm}
+\caption{TITAN compilation flow: spatial layout reasoning remains upstream; TITAN adds a transport IR plus a typed scheduler to synthesize correct TMA/WGMMA pipelines.}
+\label{fig:flow}
+\end{figure}
+
+\subsection{TransportScheduleIR (TSIR): What the Compiler Must Represent}
+TSIR makes transport semantics explicit:
+\begin{itemize}
+  \item \textbf{Copies:} \(\mathsf{tma\_issue}(desc,\;gmem\_tile,\;smem\_stage,\;b)\) and \(\mathsf{mbarrier\_wait}\).
+  \item \textbf{Synchronization:} \(\mathsf{mbarrier\_init}\), \(\mathsf{expect\_tx}(n)\), \(\mathsf{try\_wait}\) variants.
+  \item \textbf{Ordering:} \(\mathsf{fence\_proxy}\) nodes bridging proxy domains.
+  \item \textbf{Resource model:} stage buffers consume shared memory; warp roles consume registers.
+\end{itemize}
+This is intentionally \emph{lower} than LEGO/Linear Layouts (which manipulate index spaces), and \emph{higher} than PTX (which exposes raw instructions) \cite{lego_seed,linear_layouts_seed,ptx_isa}.
+
+\subsection{Key Algorithm: Schedule Synthesis Under Resource Constraints}
+TITAN solves a constrained scheduling problem:
+\[
+\text{maximize throughput} \quad\text{s.t.}\quad
+\text{(a) typestate correctness, (b) shared memory capacity, (c) occupancy / regs.}
+\]
+We use a two-level strategy:
+(i) pick stage depth \(S\) (pipeline buffering),
+(ii) place issue/wait/compute to maximize overlap.
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+\Input{Kernel region \(R\) (loop nest + tiles), candidate transport ops (TMA vs vector), cost model \(C\)}
+\Output{Typed TSIR schedule \(P\) (issue/wait/fence/wgmma placement) or fallback plan}
+\BlankLine
+
+\textbf{(1) Extract transport graph.}\;
+Build a per-iteration DAG \(G=(V,E)\) where nodes include:
+\(\mathsf{copy\_issue}\), \(\mathsf{copy\_wait}\), \(\mathsf{compute}\), \(\mathsf{epilogue}\).\;
+Edges include data deps, barrier deps, and proxy-order deps.\;
+
+\textbf{(2) Choose stage count \(S\).}\;
+For \(S \in \{1,2,3,4\}\):\;
+\Indp
+  Estimate steady-state initiation interval \(\mathsf{II}(S)\) using copy/compute latency estimates from \(C\).\;
+  Check shared-memory footprint \(\mathsf{smem}(S)\) and occupancy bound \(\mathsf{occ}(S)\).\;
+\Indm
+Pick \(S^\star = \arg\min \mathsf{II}(S)\) satisfying resource constraints.\;
+
+\textbf{(3) Synthesize schedule.}\;
+Perform list scheduling on \(G\) with stage buffers \(0..S^\star-1\):\;
+\Indp
+  Place \(\mathsf{mbarrier\_init}\) and required \(\mathsf{fence\_proxy}\) nodes.\;
+  Place \(\mathsf{tma\_issue}\) as early as legality allows.\;
+  Place \(\mathsf{mbarrier\_wait}\) immediately before first consumer use.\;
+  Optional: assign producer warps vs consumer warps (warp specialization) when profitable.\;
+\Indm
+
+\textbf{(4) Typecheck and repair.}\;
+Run typestate/effect checker (Sec.~II).\;
+If fail: insert missing fence/wait, or reduce asynchrony, or fall back to vector loads.\;
+
+\Return \(P\).\;
+\caption{TITAN schedule synthesis: construct a dependency graph, select buffering depth, schedule transport and compute, then enforce correctness via typestate checking.}
+\label{alg:titan}
+\end{algorithm}
+
+\subsection{Implementation Strategy (3--4 Month Artifact)}
+\textbf{Month 1:} TSIR builder + legality checks (descriptor constraints and barrier bookkeeping).\newline
+\textbf{Month 2:} Scheduler MVP for 2D/3D tiles; CTA-scoped shared memory only (no clusters initially).\newline
+\textbf{Month 3:} Typestate/effect checker + repair loop; integration with Triton codegen.\newline
+\textbf{Month 4:} Evaluation harness (TritonBench + end-to-end attention) + profiling and artifact packaging.
+
+\textbf{Non-goals for MVP:} cluster/DSMEM transport and multi-CTA collectives (stretch; still ``no new hardware''). Hopper already supports cluster features, but we treat them as a follow-on extension \cite{hopper_in_depth}.
+
+\section{Evaluation Plan}
+
+\subsection{Platforms and Tools (Real Metal Only)}
+\textbf{GPUs:} NVIDIA H100 (sm\_90) as the primary target; NVIDIA A100 as a control (no TMA) to demonstrate safe fallback behavior.\newline
+\textbf{Profilers:} Nsight Compute for SOL\% throughput, stall attribution, instruction mix, and barrier-related stalls \cite{nsight_compute_guide}.\newline
+\textbf{Benchmark harness:} TritonBench operator suite \cite{tritonbench_repo} plus end-to-end attention inference.
+
+\subsection{Baselines}
+We compare against:
+\begin{itemize}
+  \item \textbf{FlashAttention-3 (CuTe/CUTLASS-style).} Strong hand-scheduled baseline that already exploits TMA + warp specialization \cite{flashattn3,cutlass_3x_blog_2025}.
+  \item \textbf{cuBLASLt / cuBLAS.} Vendor GEMM baselines for dense math; when applicable.
+  \item \textbf{Baseline Triton kernels.} (i) no TMA, (ii) TMA descriptors used but with heuristic/manual staging.
+  \item \textbf{CUTLASS templates.} Representative CUTLASS 3.x kernels with policy-selected stage count (where available) \cite{cutlass_3x_blog_2025,cutlass_blog_2017}.
+\end{itemize}
+
+\subsection{Workloads}
+\textbf{Microbenchmarks (transport stress tests).}
+\begin{enumerate}
+  \item Pipelined GEMM mainloop: vary \(K\), tile shapes, stage count, and producer/consumer warp partitioning.
+  \item Descriptor legality boundary: shapes/strides that barely satisfy TMA constraints vs those that do not (forcing fallback).
+  \item Fence sensitivity: controlled kernels where missing proxy fences would misorder initialization vs TMA traffic.
+\end{enumerate}
+
+\textbf{Macrobenchmarks (LLM-relevant).}
+\begin{enumerate}
+  \item Attention forward kernels in the FlashAttention family \cite{flashattn,flashattn2,flashattn3}.
+  \item PagedAttention-style inference variants to ensure scheduling remains robust under dynamic tile trip counts \cite{pagedattention,pensieve}.
+\end{enumerate}
+
+\subsection{Metrics}
+\textbf{Primary:} \emph{SOL\%} (Speed-of-Light) for compute and memory, using Nsight Compute SpeedOfLight reports \cite{nsight_compute_guide}.\newline
+\textbf{Secondary:} register pressure (registers/thread), occupancy, shared memory footprint, and stall reasons (barrier stalls, scoreboard stalls, warpgroup wait/arrive where applicable).\newline
+\textbf{Correctness:} bitwise equivalence for deterministic kernels; numerical tolerances for FP8/FP16 attention.
+
+\subsection{Success Criteria}
+TITAN is successful if it:
+(i) matches or approaches hand-written schedules on H100 for key kernels,
+(ii) improves baseline Triton TMA usage by automatically selecting stage depth and placing waits/fences,
+(iii) avoids correctness pitfalls via typed scheduling (no silent races), and
+(iv) preserves portability by falling back gracefully on A100 (no TMA) while retaining layout optimizations.
+
+\section{Related Work}
+
+\subsection{Tensor Compilers and Schedule Languages}
+\textbf{Triton} provides a tile-centric language and compiler enabling custom GPU kernels in Python; TITAN extends the backend with a transport IR and typed scheduling \cite{triton2019}.\newline
+\textbf{TVM} and its Unity roadmap emphasize cross-layer optimization and dynamic shapes; however, existing tensor compilers rarely model GPU proxy domains and barrier-transaction semantics as a typed IR primitive \cite{tvm_osdi18,tvm_unity}.\newline
+\textbf{Halide} pioneered explicit schedule separation; TITAN is analogous in spirit but targets \emph{microarchitectural transport scheduling} (TMA/barriers/proxies) for modern GPUs \cite{halide_pldi13}.\newline
+\textbf{Tensor Comprehensions} combines a DSL with polyhedral optimization to generate kernels; TITAN instead focuses on low-level async transport legality/overlap that escapes classic affine scheduling models \cite{tensor_comprehensions}.\newline
+\textbf{MLIR} provides extensible multi-level IR infrastructure; TITAN is naturally implemented as an MLIR/Triton dialect extension with a dedicated verifier \cite{mlir_cgo21}.
+
+\subsection{Layout Algebra and Kernel Libraries}
+\textbf{Linear Layouts} formalize layout conversions using \(\mathbb{F}_2\) linear algebra, primarily addressing spatial mapping and conversion generation \cite{linear_layouts_seed}.\newline
+\textbf{LEGO} is a frontend for generating indexing expressions from compositional layouts \cite{lego_seed}.\newline
+\textbf{CuTe/CUTLASS} provides compositional layout primitives and highly optimized mainloops, including Hopper features like TMA/WGMMA, but scheduling remains largely template/policy-driven and not generally synthesized from program IR \cite{cutlass_3x_blog_2025,cutlass_blog_2017}. TITAN complements these by making scheduling a compiler-verified optimization.
+
+\subsection{Asynchronous Programming Models and Concurrency Theory}
+TITAN operationalizes classical concurrency theory in the service of GPU transport:
+\textbf{Petri nets} inform resource-capacity modeling for stage buffers and barrier tokens \cite{murata_petri}.\newline
+\textbf{Trace theory} captures legal reorderings of independent events; TITAN's scheduler uses dependency graphs that can be interpreted as partial orders with commutation \cite{trace_theory}.\newline
+\textbf{Effect systems} motivate typing side effects and ordering constraints; TITAN adapts this to proxy-typed memory effects \cite{lucassen_gifford}.
+
+\subsection{Polyhedral Optimization}
+Polyhedral systems (Pluto, ISL, Polly) are powerful for affine loop transformations and boundary handling \cite{pluto_pldi08,isl_icms10}. However, they do not natively encode GPU-specific proxy ordering and barrier transaction semantics, which are central to TMA correctness and performance. TITAN targets this missing layer.
+
+\subsection{Systems Competitors (Interop and Specialization)}
+\textbf{Mosaic} demonstrates compiler interoperability via binding subexpressions to external functions \cite{mosaic_pldi23}. TITAN is orthogonal: it does not choose \emph{which} library to call, but rather synthesizes \emph{how} to schedule transport inside a kernel when a call is not available or when fusion is required.
+
+\section{References}
+\begin{thebibliography}{00}
+
+\bibitem{linear_layouts_seed}
+K.~Zhou, M.~Lezcano, A.~Goucher, A.~Rakhmati, J.~Niu, J.~Lebar, P.~Szczerbuk, P.~Bell, P.~Tillet, T.~Raoux, and Z.~Moudallal,
+``Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using \(\mathbb{F}_2\),''
+arXiv:2505.23819, 2025.
+
+\bibitem{lego_seed}
+A.~M.~Tavakkoli, C.~Oancea, and M.~Hall,
+``LEGO: Layout Expression for Generating One-to-one Mapping,''
+arXiv:2505.08091, 2025.
+
+\bibitem{triton2019}
+P.~Tillet, H.-T.~Kung, and D.~D.~Cox,
+``Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations,''
+MAPL@PLDI, 2019.
+
+\bibitem{cutlass_blog_2017}
+A.~Kerr, D.~Merrill, J.~Demouth, and J.~Tran,
+``CUTLASS: Fast Linear Algebra in CUDA C++,''
+NVIDIA Technical Blog, 2017.
+
+\bibitem{cutlass_3x_blog_2025}
+C.~Cecka, V.~Thakkar, and T.~Shah,
+``CUTLASS 3.x: Orthogonal, Reusable, and Composable Abstractions for GEMM Kernel Design,''
+NVIDIA Technical Blog, 2025.
+
+\bibitem{cutlass_repo}
+NVIDIA,
+``CUTLASS: CUDA Templates and DSLs for High-Performance Linear Algebra,''
+GitHub Repository (accessed 2026).
+
+\bibitem{hopper_in_depth}
+M.~Andersch, G.~Palmer, R.~Krashinsky, N.~Stam, V.~Mehta, G.~Brito, and S.~Ramaswamy,
+``NVIDIA Hopper Architecture In-Depth,''
+NVIDIA Technical Blog, 2022.
+
+\bibitem{cuda_guide_async}
+NVIDIA,
+``CUDA C++ Programming Guide: Advanced Kernel Programming (Async Proxies, Fences, and Barriers),''
+CUDA Documentation, v13.x, 2024--2025.
+
+\bibitem{ptx_isa}
+NVIDIA,
+``Parallel Thread Execution (PTX) ISA,''
+CUDA Toolkit Documentation, v8.x, 2024.
+
+\bibitem{nsight_compute_guide}
+NVIDIA,
+``Nsight Compute Profiling Guide (SpeedOfLight, Warp Stall Sampling, Barrier Stalls),''
+Nsight Compute Documentation, 2022--2025.
+
+\bibitem{flashattn}
+T.~Dao, D.~Y.~Fu, S.~Ermon, A.~Rudra, and C.~R\'e,
+``FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness,''
+arXiv:2205.14135, 2022.
+
+\bibitem{flashattn2}
+T.~Dao,
+``FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning,''
+Technical report / project publication, 2023.
+
+\bibitem{flashattn3}
+J.~Shah, G.~Bikshandi, Y.~Zhang, V.~Thakkar, P.~Ramani, and T.~Dao,
+``FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision,''
+arXiv:2407.08608, NeurIPS, 2024.
+
+\bibitem{pagedattention}
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu, J.~E.~Gonzalez, H.~Zhang, and I.~Stoica,
+``Efficient Memory Management for Large Language Model Serving with PagedAttention,''
+arXiv:2309.06180, 2023.
+
+\bibitem{pensieve}
+L.~Yu, J.~Lin, and J.~Li,
+``Stateful Large Language Model Serving with Pensieve,''
+arXiv:2312.05516, 2023.
+
+\bibitem{mosaic_pldi23}
+M.~Bansal, O.~Hsu, K.~Olukotun, and F.~Kjolstad,
+``Mosaic: An Interoperable Compiler for Tensor Algebra,''
+Proc. ACM Program. Lang. (PLDI), 2023.
+
+\bibitem{tvm_osdi18}
+T.~Chen, T.~Moreau, Z.~Jiang, L.~Zheng, E.~Yan, M.~Cowan, H.~Shen, L.~Wang, Y.~Hu, L.~Ceze, C.~Guestrin, and A.~Krishnamurthy,
+``TVM: An Automated End-to-End Optimizing Compiler for Deep Learning,''
+OSDI, 2018.
+
+\bibitem{tvm_unity}
+A.~Sampson, T.~Chen, and J.~Roesch,
+``Apache TVM Unity: A Vision for the ML Software \& Hardware Ecosystem,''
+TVM Project Blog, 2021.
+
+\bibitem{halide_pldi13}
+J.~Ragan-Kelley, C.~Barnes, A.~Adams, S.~Paris, F.~Durand, and S.~Amarasinghe,
+``Halide: A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation in Image Processing Pipelines,''
+PLDI, 2013.
+
+\bibitem{tensor_comprehensions}
+N.~Vasilache, O.~Zinenko, T.~Theodoridis, P.~Goyal, Z.~DeVito, W.~S.~Moses, S.~Verdoolaege, A.~Adams, and A.~Cohen,
+``Tensor Comprehensions: Framework-Agnostic High-Performance Machine Learning Abstractions,''
+arXiv:1802.04730, 2018.
+
+\bibitem{mlir_cgo21}
+C.~Lattner, M.~Amini, U.~Bondhugula, A.~Cohen, A.~Davis, J.~Pienaar, R.~Riddle, T.~Shpeisman, N.~Vasilache, and O.~Zinenko,
+``MLIR: Scaling Compiler Infrastructure for Domain Specific Computation,''
+CGO, 2021.
+
+\bibitem{isl_icms10}
+S.~Verdoolaege,
+``isl: An Integer Set Library for the Polyhedral Model,''
+in \emph{Mathematical Software -- ICMS}, LNCS 6327, Springer, 2010.
+
+\bibitem{pluto_pldi08}
+U.~Bondhugula, A.~Hartono, J.~Ramanujam, and P.~Sadayappan,
+``A Practical and Automatic Polyhedral Program Optimization System,''
+PLDI, 2008.
+
+\bibitem{murata_petri}
+T.~Murata,
+``Petri Nets: Properties, Analysis and Applications,''
+\emph{Proceedings of the IEEE}, vol.~77, no.~4, pp.~541--580, 1989.
+
+\bibitem{trace_theory}
+I.~J.~Aalbersberg and G.~Rozenberg,
+``Theory of Traces,''
+\emph{Theoretical Computer Science}, vol.~60, no.~1, pp.~1--82, 1988.
+
+\bibitem{lucassen_gifford}
+J.~M.~Lucassen and D.~K.~Gifford,
+``Polymorphic Effect Systems,''
+POPL, 1988.
+
+\bibitem{tritonbench_repo}
+Meta PyTorch,
+``TritonBench: A Collection of PyTorch Operators for Evaluating Triton,''
+GitHub Repository (accessed 2026).
+
+\end{thebibliography}
+
+\end{document}

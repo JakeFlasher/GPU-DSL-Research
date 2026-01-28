@@ -1,0 +1,445 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{fancyvrb}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{url}
+\usepackage{cite}
+
+% Listing style for Triton/MLIR/PTX-like snippets
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  frame=single,
+  columns=fullflexible,
+  xleftmargin=2mm,
+  xrightmargin=2mm,
+  keepspaces=true
+}
+
+\begin{document}
+
+\title{TITAN: Typestate-Verified Tokenized TMA Pipelines for Warp-Specialized Triton Kernels on Hopper/Blackwell}
+\author{\IEEEauthorblockN{Anonymous Authors}}
+\maketitle
+\small
+
+\section{Problem Formulation}
+
+\subsection{The Hardware Reality: Hopper/Blackwell Are ``Two-Proxy, Two-Engine'' Machines}
+Modern NVIDIA GPUs (H100/Hopper and B200/Blackwell) expose a software-visible split between (i) \emph{generic} execution (regular loads/stores, most arithmetic) and (ii) an \emph{asynchronous proxy} that drives dedicated units for data movement and asynchronous warpgroup-level tensor compute.
+
+\textbf{TMA (Tensor Memory Accelerator).} Hopper introduces TMA as an asynchronous copy engine that transfers 1D--5D tensors between global memory and shared memory, and across shared memory regions in a cluster (Distributed Shared Memory, DSMEM), while avoiding register-mediated moves \cite{hopper_guide}. In PTX, this appears as non-blocking bulk/tensor copies such as \texttt{cp.async.bulk.tensor.*} with mbarrier completion mechanisms \cite{ptx_isa}. Correct overlap requires explicitly staged pipelines: issue copy, advance barriers, compute, and only block when consumption is necessary \cite{hopper_guide,ptx_isa}.
+
+\textbf{WGMMA (Warpgroup MMA) is also async-proxy.} Hopper's \texttt{wgmma.mma\_async} executes in the async proxy and uses explicit \texttt{commit\_group}/\texttt{wait\_group} synchronization; PTX explicitly documents that WGMMA requires a proxy fence (generic$\rightarrow$async) when data or descriptors are prepared via generic operations \cite{ptx_isa}.
+
+\textbf{Proxy ordering is a correctness constraint, not an optimization.} PTX defines that accesses via multiple proxies require cross-proxy fencing; for the async proxy, \texttt{fence.proxy.async} synchronizes generic and async visibility \cite{ptx_isa}. This is not optional: missing fences can create silent use-before-initialization behavior in shared memory barrier state or descriptor metadata.
+
+\textbf{Clusters and DSMEM add a new locality tier.} Thread Block Clusters (cc$\ge$9.0) permit a CTA to access shared memory belonging to other CTAs in the cluster (DSMEM) \cite{cuda_prog_guide}. Both Hopper and Blackwell tuning guides emphasize cluster-aware occupancy and note non-portable larger cluster sizes (e.g., 16) via opt-in attributes \cite{hopper_guide,blackwell_guide}.
+
+\subsection{The Gap: ``Spatial Algebra is Solved; Temporal Scheduling is Still Hand-Coded''}
+\textbf{Linear Layouts solves \emph{where} data lives, not \emph{when/how} it moves.}
+The seed system, Linear Layouts, models tensor layouts as linear maps over \(\mathbb{F}_2\) and integrates in Triton's backend to automate conversions/swizzles/vectorization \cite{seed_ll}. Its scope is primarily spatial: generating efficient address maps and layout conversions. However, it does not make TMA/mbarrier/async-proxy fencing first-class schedulable objects; consequently, it cannot globally optimize or verify the transport pipeline (copy$\rightarrow$barrier$\rightarrow$compute) that dominates Hopper/Blackwell performance.
+
+\textbf{CuTe/CUTLASS solves \emph{manual} compositionality, not \emph{automatic} schedule synthesis.}
+CuTe provides rich template abstractions for hierarchical layouts and tensors \cite{cute_docs}, and CUTLASS provides highly optimized building blocks with deep architectural specialization \cite{cutlass_github}. But the \emph{pipeline schedule} (warp roles, stage count, barrier protocol, proxy fences, WGMMA grouping) remains largely encoded by hand as policy and template metaprogramming. This yields excellent performance when expert-written, but it creates three systemic limitations:
+\begin{enumerate}
+  \item \textbf{Correctness fragility:} barrier/proxy protocols are subtle \cite{ptx_isa}.
+  \item \textbf{Optimization opacity:} schedules are not IR-level objects; cross-op transformations (fusion, epilogue scheduling, barrier hoisting) are limited.
+  \item \textbf{Search/specialization pain:} schedule exploration grows combinatorially with tile shapes, warp partitions, and stage depth.
+\end{enumerate}
+
+\textbf{High-level tensor compilers optimize graphs and loops, but not Hopper's async protocol.}
+Systems like Halide \cite{halide}, TVM and its Unity vision \cite{tvm, tvm_unity}, and polyhedral toolchains (Pluto/Polly/PPCG) \cite{pluto,polly,ppcg} excel at schedule representations, fusion, and affine transformations. However, Hopper/Blackwell require reasoning about \emph{proxy domains}, \emph{hardware completion mechanisms}, and \emph{warp-specialized producer/consumer protocols} \cite{ptx_isa,hopper_guide}. These are outside classical polyhedral (single-thread, affine) models and outside most tensor compiler IR semantics.
+
+\subsection{Problem Statement}
+Given a Triton kernel (or fused subgraph) with an already-chosen spatial tiling/layout (possibly optimized by Linear Layouts \cite{seed_ll}), we seek an \emph{automatic compiler pass} that:
+\begin{enumerate}
+  \item \textbf{Synthesizes} a warp-specialized transport pipeline (TMA/async copy + WGMMA + epilogue) that maximizes overlap.
+  \item \textbf{Verifies} correctness of barrier/fence protocols (\texttt{mbarrier} phases, cross-proxy visibility) by construction.
+  \item \textbf{Respects} resource constraints (register pressure, shared memory/DSMEM footprint, occupancy/clusters) \cite{hopper_guide,blackwell_guide}.
+  \item \textbf{Competes} with cuBLASLt/CUTLASS/FlashAttention-3 baselines on real metal \cite{cublaslt,cutlass_github,flashattn3}.
+\end{enumerate}
+
+\subsection{Proposed Solution Overview: TITAN}
+\textbf{TITAN} (Typestate-verified Tokenized Asynchrony for NVIDIA) is a Triton backend extension that introduces a first-class \emph{tokenized transport IR} for async operations and a \emph{typestate verifier} that enforces correct barrier/fence protocols. TITAN then runs a resource-aware modulo scheduler to synthesize a pipelined warp-specialized schedule and lowers the IR to PTX instructions (\texttt{cp.async.bulk.tensor.*}, \texttt{mbarrier.*}, \texttt{fence.proxy.async.*}, \texttt{wgmma.mma\_async}) \cite{ptx_isa}.
+
+\begin{figure}[t]
+\centering
+\begin{Verbatim}[fontsize=\footnotesize, commandchars=\\\{\}]
++-------------------+     +------------------------+     +------------------+
+|  Triton TTGIR     |     |  TITAN Passes          |     |  LLVM/PTX/SASS   |
+|  (spatial tiling  | --> |  1) Tokenize transport | --> |  cp.async.bulk.* |
+|   + layouts)      |     |  2) Typestate verify   |     |  mbarrier.*      |
++-------------------+     |  3) Schedule + stage   |     |  fence.proxy.*   |
+                          |     allocation          |     |  wgmma.*         |
+                          +------------------------+     +------------------+
+Key: Layout engines pick "WHERE". TITAN picks "WHEN/HOW" (async pipeline).
+\end{Verbatim}
+\caption{TITAN compilation flow: extend a spatially-optimized kernel with a verified transport schedule.}
+\end{figure}
+
+\section{Theoretical Framework}
+
+\subsection{Formal Model: Staged Shared-Memory Pipelines with Tokens and Proxies}
+We formalize a kernel fragment as a sequence of operations over a finite set of \emph{pipeline stages} \(k \in \{0,\dots,D-1\}\). Each stage corresponds to a shared-memory (or DSMEM) slot and has an associated barrier object.
+
+\paragraph{Stage states.}
+We define stage typestates:
+\[
+\mathsf{StageState} \;::=\; \mathsf{E}\;|\;\mathsf{I}\;|\;\mathsf{F}
+\]
+where \(\mathsf{E}\) is empty (overwritable), \(\mathsf{I}\) is in-flight (copy issued), and \(\mathsf{F}\) is full (safe for consumer reads).
+
+\paragraph{Proxy visibility states.}
+To model PTX's generic vs async proxies \cite{ptx_isa}, we track whether a memory region is \emph{async-visible}:
+\[
+\mathsf{Vis} \;::=\; \mathsf{Clean}\;|\;\mathsf{Dirty}
+\]
+A region becomes \(\mathsf{Dirty}\) after generic writes and becomes \(\mathsf{Clean}\) after an explicit cross-proxy fence \cite{ptx_isa}.
+
+\paragraph{Typing environment.}
+We define a typing environment as \(\Gamma = (\Sigma,\Phi)\) where:
+\[
+\Sigma : \{0,\dots,D-1\} \rightarrow \mathsf{StageState}, \quad
+\Phi : \mathsf{Region} \rightarrow \mathsf{Vis}.
+\]
+
+\paragraph{Operations.}
+We model representative TITAN IR operations:
+\begin{align}
+\mathsf{gstore}(r) &\quad \text{(generic store to region \(r\))} \\
+\mathsf{fence}(r) &\quad \text{(proxy fence: generic \(\rightarrow\) async for \(r\))} \\
+\mathsf{tma\_issue}(k,r) &\quad \text{(issue TMA load into stage \(k\), writes region \(r\))} \\
+\mathsf{tma\_wait}(k) &\quad \text{(wait on mbarrier for stage \(k\))} \\
+\mathsf{wgmma\_issue}(r) &\quad \text{(issue WGMMA reading from shared region \(r\))} \\
+\mathsf{wgmma\_wait}() &\quad \text{(wait\_group)} \\
+\mathsf{release}(k) &\quad \text{(consumer releases stage \(k\) for overwrite)}.
+\end{align}
+
+This abstraction intentionally matches the PTX-level reality: TMA and WGMMA are async-proxy operations; their correctness depends on explicit waits and cross-proxy fences \cite{ptx_isa}.
+
+\subsection{Typestate Judgment and Core Inference Rules}
+We write the judgment \(\Gamma \vdash op \Rightarrow \Gamma'\) to mean that operation \(op\) is well-typed under environment \(\Gamma\) and produces \(\Gamma'\).
+
+\paragraph{Generic store dirties async visibility.}
+\begin{equation}
+\frac{}{
+(\Sigma,\Phi) \vdash \mathsf{gstore}(r) \Rightarrow (\Sigma,\Phi[r \mapsto \mathsf{Dirty}])}
+\;\;(\textsc{G-Store})
+\end{equation}
+
+\paragraph{Proxy fence restores async visibility.}
+\begin{equation}
+\frac{}{
+(\Sigma,\Phi) \vdash \mathsf{fence}(r) \Rightarrow (\Sigma,\Phi[r \mapsto \mathsf{Clean}])}
+\;\;(\textsc{Fence})
+\end{equation}
+
+\paragraph{Issuing TMA requires a clean region and an empty stage.}
+\begin{equation}
+\frac{
+\Sigma(k)=\mathsf{E}\quad \Phi(r)=\mathsf{Clean}
+}{
+(\Sigma,\Phi) \vdash \mathsf{tma\_issue}(k,r) \Rightarrow (\Sigma[k \mapsto \mathsf{I}],\Phi)
+}
+\;\;(\textsc{TMA-Issue})
+\end{equation}
+
+\paragraph{Waiting for completion makes stage full.}
+\begin{equation}
+\frac{\Sigma(k)=\mathsf{I}}
+{(\Sigma,\Phi) \vdash \mathsf{tma\_wait}(k) \Rightarrow (\Sigma[k \mapsto \mathsf{F}],\Phi)}
+\;\;(\textsc{TMA-Wait})
+\end{equation}
+
+\paragraph{WGMMA issue requires async-visible shared operands.}
+\begin{equation}
+\frac{\Phi(r)=\mathsf{Clean}}
+{(\Sigma,\Phi) \vdash \mathsf{wgmma\_issue}(r) \Rightarrow (\Sigma,\Phi)}
+\;\;(\textsc{WGMMA-Issue})
+\end{equation}
+
+\paragraph{Release returns stage to empty, enabling overwrite.}
+\begin{equation}
+\frac{\Sigma(k)=\mathsf{F}}
+{(\Sigma,\Phi) \vdash \mathsf{release}(k) \Rightarrow (\Sigma[k \mapsto \mathsf{E}],\Phi)}
+\;\;(\textsc{Release})
+\end{equation}
+
+\subsection{Safety Theorem (Hazard Freedom + Proxy Correctness)}
+We state the primary guarantee TITAN provides via typestate checking.
+
+\paragraph{Operational intuition.}
+TMA and WGMMA execute in the async proxy; a proxy fence is required when transitioning from generic initialization (e.g., initializing mbarriers or descriptors in shared memory) to async operations that consume them \cite{ptx_isa}. Additionally, stage reuse is only legal after consumers complete.
+
+\paragraph{Theorem 1 (TITAN Safety).}
+Let \(P\) be a kernel program fragment expressed in TITAN IR and accepted by the typestate verifier, i.e., there exists a derivation:
+\[
+\Gamma_0 \vdash P \Rightarrow \Gamma_f.
+\]
+Then, for any concrete execution on Hopper/Blackwell consistent with PTX's proxy model \cite{ptx_isa}:
+\begin{enumerate}
+\item (\textbf{No overwrite-before-consume}) No TMA issue overwrites a stage \(k\) unless the previous iteration has executed \(\mathsf{release}(k)\).
+\item (\textbf{No read-before-ready}) No consumer reads from stage \(k\) unless it has executed \(\mathsf{tma\_wait}(k)\) and stage state is \(\mathsf{F}\).
+\item (\textbf{Proxy ordering correctness}) No async-proxy operation (TMA/WGMMA) observes stale metadata or barrier state for a region \(r\) that has been written by generic proxy without an intervening \(\mathsf{fence}(r)\).
+\end{enumerate}
+
+\paragraph{Proof sketch.}
+(1) follows because \textsc{TMA-Issue} requires \(\Sigma(k)=\mathsf{E}\) and \textsc{Release} is the only rule that returns a full stage to \(\mathsf{E}\). (2) follows because the only rule that yields \(\Sigma(k)=\mathsf{F}\) is \textsc{TMA-Wait}. (3) follows because \textsc{TMA-Issue} and \textsc{WGMMA-Issue} require \(\Phi(r)=\mathsf{Clean}\), while \textsc{G-Store} transitions to \(\mathsf{Dirty}\) and only \textsc{Fence} restores \(\mathsf{Clean}\). These typing constraints mirror PTX's requirement for cross-proxy fences \cite{ptx_isa}.
+
+\subsection{Resource-Aware Scheduling Objective}
+TITAN's scheduler targets overlap while respecting hard limits that directly affect Speed-of-Light (SOL\%) on H100/B200:
+\begin{align}
+\text{maximize}\quad & \text{Overlap}( \text{TMA busy}, \text{TensorCore busy}) \\
+\text{subject to}\quad &
+\text{Regs/thread} \le R_{\max},\;\;
+\text{SMEM} \le S_{\max},\;\;
+\text{Clusters} \le C_{\max} \cite{hopper_guide,blackwell_guide}.
+\end{align}
+This aligns with empirical observations from task-based models (Cypress) and warp-specialized compilers (Tawa): performance is dominated by staging depth, warp partitioning, and resource ceilings, not just index arithmetic \cite{cypress,tawa}.
+
+\section{System Architecture}
+
+\subsection{IR Design: Tokenized Transport as First-Class Ops}
+TITAN introduces a transport-centric dialect (or extends \texttt{triton-nvidia-gpu}) with explicit async operations and synchronization points, enabling:
+\begin{enumerate}
+\item \textbf{Scheduling:} treat copy/compute/wait as nodes in a DAG.
+\item \textbf{Verification:} run typestate checking over the IR.
+\item \textbf{Lowering:} emit PTX instructions that match semantics \cite{ptx_isa}.
+\end{enumerate}
+
+\begin{lstlisting}[caption={Illustrative TITAN IR fragment (pseudo-MLIR) for a 2-stage TMA$\rightarrow$WGMMA pipeline.},label={lst:titan_ir}]
+%k   : i32 = (iter mod 2)
+%rA  : !ttg.region = shared.cta.tileA[%k]
+%rB  : !ttg.region = shared.cta.tileB[%k]
+
+ttg.gstore %mbar_init_region        // generic init of barrier/descriptor
+ttg.fence_proxy_async %mbar_init_region
+
+ttg.stage.assert_empty %k
+ttg.tma.issue   %k, %descA, %coordsA -> !ttg.token
+ttg.tma.issue   %k, %descB, %coordsB -> !ttg.token
+ttg.tma.wait    %k                   // mbarrier complete_tx
+
+ttg.wgmma.issue  %rA, %rB, %acc      // async-proxy compute
+ttg.wgmma.wait_group
+
+ttg.stage.release %k
+\end{lstlisting}
+
+\subsection{Key Compiler Passes}
+\textbf{(1) Tokenization pass.} Identify memory ops eligible for bulk/tensor async copy and represent them as \texttt{tma.issue}/\texttt{tma.wait} with explicit stage indices. Use PTX constraints and descriptor legality checks (alignment, rank, destination space) \cite{ptx_isa,cccl_cp_async_tensor}.
+
+\textbf{(2) Typestate verification pass.} Run inference rules (\textsc{G-Store}, \textsc{Fence}, \textsc{TMA-Issue}, \textsc{TMA-Wait}, \textsc{WGMMA-Issue}, \textsc{Release}) over each control-flow region. Reject or rewrite illegal protocols (e.g., missing fences, overwrite-before-release).
+
+\textbf{(3) Modulo pipeline scheduler.} Perform resource-constrained scheduling and stage allocation (depth \(D\)), selecting warp roles (producer/consumer) and placement (Shared::CTA vs Shared::Cluster) when clusters are enabled \cite{cuda_prog_guide,hopper_guide,blackwell_guide}.
+
+\subsection{Scheduling Algorithm (Algorithm2e)}
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+\Input{TTGIR region \(R\) with tiling/layout fixed; target \(T\in\{\text{sm80, sm90a, sm100}\}\)}
+\Output{TTGIR region \(R'\) with TITAN async schedule or safe fallback}
+\BlankLine
+\textbf{Step 0: Build dependence graph.}\;
+Extract nodes for loads/stores, math ops, and known sync points.\;
+Compute data dependencies and memory-region dependencies.\;
+
+\BlankLine
+\textbf{Step 1: Identify async-eligible transfers.}\;
+For each global$\rightarrow$shared sub-tile load:
+check (rank, alignment, contiguity, address space) eligibility.\;
+If eligible on \(T\): mark as TMA candidate; else mark as cp.async candidate (sm80) or generic.\;
+
+\BlankLine
+\textbf{Step 2: Choose pipeline structure.}\;
+Enumerate candidate stage depths \(D \in \{2,3,4,5\}\).\;
+Enumerate warp partitions \((W_p,W_c)\) for producer/consumer roles.\;
+For each candidate, estimate resource usage (Regs, SMEM, barriers).\;
+
+\BlankLine
+\textbf{Step 3: Resource-constrained modulo scheduling.}\;
+For candidates in increasing estimated cost:
+attempt modulo schedule with initiation interval \(II\).\;
+Insert explicit \texttt{tma.issue}/\texttt{tma.wait} and \texttt{wgmma.commit/wait}.\;
+Insert \texttt{fence.proxy.async.*} when generic$\rightarrow$async transitions occur \cite{ptx_isa}.\;
+If schedule violates reg/SMEM/cluster occupancy constraints: continue.\;
+
+\BlankLine
+\textbf{Step 4: Typestate verification.}\;
+Run typestate checker on scheduled IR:
+ensure no overwrite-before-release, no read-before-wait, and proxy visibility.\;
+If verified: \Return scheduled region \(R'\).\;
+
+\BlankLine
+\textbf{Fallback.}\;
+\Return original region with conservative generic loads/stores and barriers.\;
+\caption{TITAN schedule synthesis: tokenization + verified modulo scheduling.}
+\label{alg:titan}
+\end{algorithm}
+
+\subsection{Lowering to PTX and CUDA Toolchain Integration}
+TITAN lowers to PTX instructions that match the modeled semantics:
+\begin{enumerate}
+\item \textbf{TMA:} \texttt{cp.async.bulk.tensor.*} with \texttt{mbarrier::complete\_tx::bytes} completion \cite{ptx_isa}.
+\item \textbf{Cross-proxy fences:} \texttt{fence.proxy.async.shared::cta} (or \texttt{::cluster}) \cite{ptx_isa}.
+\item \textbf{WGMMA:} \texttt{wgmma.mma\_async} plus \texttt{commit\_group}/\texttt{wait\_group} \cite{ptx_isa}.
+\item \textbf{Clusters/DSMEM:} use cluster launch attributes and address spaces as per CUDA Programming Guide \cite{cuda_prog_guide}; tune cluster sizes per Hopper/Blackwell guidance \cite{hopper_guide,blackwell_guide}.
+\end{enumerate}
+
+\section{Evaluation Plan}
+
+\subsection{Platforms (Real Metal Only)}
+We will evaluate on:
+\begin{enumerate}
+\item \textbf{NVIDIA H100 (sm90a)} to stress TMA/WGMMA and cluster-enabled kernels \cite{hopper_guide}.
+\item \textbf{NVIDIA B200 (sm100)} to test cluster scaling rules and portability assumptions \cite{blackwell_guide}.
+\item \textbf{NVIDIA A100 (sm80)} as a control: TITAN should degrade to \texttt{cp.async} or generic copies, isolating scheduler benefits from TMA hardware.
+\end{enumerate}
+All measurements use Nsight Compute and end-to-end kernel timing (no simulation).
+
+\subsection{Benchmarks}
+\textbf{Microbenchmarks (TritonBench-style):}
+\begin{enumerate}
+\item \textbf{TMA bandwidth kernels:} rank-2/3/5 tensor moves global$\leftrightarrow$shared with varying alignment and tile sizes \cite{ptx_isa,cccl_cp_async_tensor}.
+\item \textbf{Producer/consumer overlap:} synthetic kernel with controllable compute intensity (Tensor Core WGMMA) to measure overlap vs stall.
+\item \textbf{Barrier protocol stress:} kernels with deliberate proxy transitions to quantify TITAN's fence insertion overhead and correctness.
+\end{enumerate}
+
+\textbf{End-to-end kernels:}
+\begin{enumerate}
+\item \textbf{GEMM and fused epilogues:} compare against cuBLASLt \cite{cublaslt} and CUTLASS templates \cite{cutlass_github}.
+\item \textbf{Attention blocks:} compare against FlashAttention-3 (CuTe/CUTLASS kernel) \cite{flashattn3}.
+\end{enumerate}
+
+\subsection{Baselines}
+We will compare:
+\begin{enumerate}
+\item \textbf{cuBLASLt} (vendor-tuned GEMM baseline) \cite{cublaslt}.
+\item \textbf{CUTLASS/CuTe} (hand-scheduled pipeline baseline) \cite{cutlass_github,cute_docs}.
+\item \textbf{FlashAttention-3} (state-of-the-art async attention pipeline) \cite{flashattn3}.
+\item \textbf{Triton + Linear Layouts} without TITAN (spatial optimization only) \cite{seed_ll,triton}.
+\item \textbf{Research comparators (where available):} Cypress and Tawa results motivate our model; if code is available, we reproduce; otherwise we compare qualitatively to published claims \cite{cypress,tawa}.
+\end{enumerate}
+
+\subsection{Metrics and Methodology}
+\textbf{Primary metrics:}
+\begin{enumerate}
+\item \textbf{SOL\% (Speed-of-Light):} achieved FLOP/s divided by theoretical peak for the chosen precision (FP16/BF16/FP8), and achieved BW divided by peak HBM/SMEM BW.
+\item \textbf{Overlap efficiency:} fraction of cycles with both copy engine and Tensor Cores busy (via Nsight counters).
+\item \textbf{Register pressure and occupancy:} registers/thread, achieved occupancy, and cluster occupancy \cite{hopper_guide,blackwell_guide}.
+\item \textbf{Stall attribution:} mbarrier wait stalls, instruction issue stalls, memory throttle.
+\end{enumerate}
+
+\textbf{Secondary metrics:}
+\begin{enumerate}
+\item \textbf{Compile-time robustness:} schedule synthesis time vs template compile-time (CuTe/CUTLASS).
+\item \textbf{Correctness robustness:} negative tests that omit fences/barrier transitions should be rejected by typestate checker.
+\end{enumerate}
+
+\section{Related Work (Dense)}
+
+\subsection{Layout and Tensor Kernel Systems}
+\textbf{Linear Layouts} formalizes layouts as \(\mathbb{F}_2\) linear maps and automates layout conversions/swizzles in Triton's backend \cite{seed_ll}. TITAN is complementary: we treat layout as a solved ``where'' problem and address the ``when/how'' pipeline scheduling that Linear Layouts does not model.
+
+\textbf{Triton} provides a tile-level programming model with an LLVM-based codegen stack \cite{triton}. TITAN targets Triton's backend to avoid requiring new languages while still exploiting Hopper/Blackwell async mechanisms.
+
+\textbf{CuTe/CUTLASS and cuBLASLt} represent the performance ceiling for dense GEMM and attention kernels \cite{cute_docs,cutlass_github,cublaslt}. They demonstrate that hand-written warp-specialized pipelines can approach peak, but schedules are largely manual and not IR-level objects; TITAN aims to close this gap with compiler synthesis and verification.
+
+\textbf{FlashAttention-3} shows that exploiting TMA+asynchrony and low precision yields major utilization gains on H100 \cite{flashattn3}. TITAN seeks to generalize this style of pipeline across a wider class of Triton kernels by making the protocol and schedule compiler-derived and verified.
+
+\subsection{Tensor Compilers and Scheduling Frameworks}
+\textbf{Halide} pioneered the separation of algorithm and schedule, enabling systematic exploration of locality/parallelism tradeoffs \cite{halide}. \textbf{TVM} extends this idea to tensor programs and learning-driven search for performance portability \cite{tvm}, and \textbf{TVM Unity} argues for cross-layer optimization boundaries \cite{tvm_unity}. \textbf{Ansor} demonstrates powerful search in tensor program spaces \cite{ansor}. TITAN shares the core idea that schedules must be explicit artifacts, but focuses on Hopper/Blackwell-specific transport protocols (async proxy + barriers + WGMMA) that are not captured by conventional schedule primitives.
+
+\textbf{Mosaic} (PLDI'23) focuses on interoperability and verified composition for sparse tensor algebra across library boundaries \cite{mosaic}. TITAN similarly elevates correctness-by-construction, but targets dense AI kernels where correctness hazards arise from barrier/proxy protocols rather than sparse algebra semantics.
+
+\subsection{Asynchronous Programming Models for Modern GPUs}
+\textbf{Cypress} (PLDI'25) introduces task-based sequential semantics lowered to warp-specialized pipelines orchestrating TMA and Tensor Cores \cite{cypress}. \textbf{Tawa} introduces an IR abstraction (asynchronous references) that drives automatic warp specialization and shows competitiveness with cuBLAS and FlashAttention-3 on H100 \cite{tawa}. TITAN differs by embedding an async-token IR and typestate checker inside Triton's backend pipeline, designed to compose with existing Triton/Linear-Layouts infrastructure and to be deployable as a compiler pass rather than a new front-end.
+
+\subsection{Polyhedral Compilation (Affine, Static-Control) Baselines}
+Pluto \cite{pluto}, Polly \cite{polly}, and PPCG \cite{ppcg} represent the strongest classical line for affine schedule synthesis and locality optimization. They do not model Hopper's cross-proxy memory semantics, asynchronous completion mechanisms, or warpgroup-level Tensor Core pipelines \cite{ptx_isa,hopper_guide}. TITAN can be viewed as an ``async-proxy-aware'' scheduling layer that operates where polyhedral assumptions break: inside warp-specialized, multi-engine pipelines.
+
+\subsection{Protocol Verification Foundations}
+\textbf{Typestate} tracks program states to enforce protocol adherence \cite{typestate}. \textbf{Session types} formalize structured communication protocols \cite{sessiontypes}. \textbf{Separation logic} provides modular reasoning about disjoint heap resources \cite{seplogic}. \textbf{Linear types} enforce single-use resources, matching GPU pipeline buffers and tokens \cite{lineartypes}. TITAN instantiates these PL ideas for GPU transport correctness: barriers, stage buffers, and proxy fences become typestate-governed resources.
+
+\begin{thebibliography}{99}
+
+\bibitem{seed_ll}
+K.~Zhou \emph{et~al.}, ``Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using \(\mathbb{F}_2\),'' arXiv:2505.23819, 2025. \url{https://arxiv.org/abs/2505.23819}
+
+\bibitem{triton}
+P.~Tillet, H.~T.~Kung, and D.~Cox, ``Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations,'' MAPL/PLDI, 2019. \url{https://research.ibm.com/publications/triton-an-intermediate-language-and-compiler-for-tiled-neural-network-computations}
+
+\bibitem{hopper_guide}
+NVIDIA, ``NVIDIA Hopper Tuning Guide,'' CUDA Toolkit Documentation, 2023--2025. \url{https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html}
+
+\bibitem{blackwell_guide}
+NVIDIA, ``NVIDIA Blackwell Tuning Guide,'' CUDA Toolkit Documentation, 2024--2025. \url{https://docs.nvidia.com/cuda/archive/12.9.0/blackwell-tuning-guide/index.html}
+
+\bibitem{ptx_isa}
+NVIDIA, ``Parallel Thread Execution (PTX) ISA,'' CUDA Toolkit Documentation (includes \texttt{cp.async.bulk.tensor}, \texttt{fence.proxy.async}, \texttt{wgmma.mma\_async}), 2023--2025. \url{https://docs.nvidia.com/cuda/archive/12.0.1/parallel-thread-execution/index.html}
+
+\bibitem{cuda_prog_guide}
+NVIDIA, ``CUDA C++ Programming Guide (Thread Block Clusters and Distributed Shared Memory),'' 2023--2025. \url{https://docs.nvidia.com/cuda/archive/12.4.0/cuda-c-programming-guide/}
+
+\bibitem{cccl_cp_async_tensor}
+NVIDIA, ``CUDA C++ Core Compute Libraries: \texttt{cp.async.bulk.tensor},'' 2024--2025. \url{https://nvidia.github.io/cccl/libcudacxx/ptx/instructions/cp_async_bulk_tensor.html}
+
+\bibitem{cublaslt}
+NVIDIA, ``cuBLAS and cuBLASLt Documentation,'' CUDA Toolkit Documentation, 2023--2025. \url{https://docs.nvidia.com/cuda/cublas/}
+
+\bibitem{cutlass_github}
+NVIDIA, ``CUTLASS: CUDA Templates and DSLs for High-Performance Linear Algebra,'' GitHub repository, 2017--2026. \url{https://github.com/NVIDIA/cutlass}
+
+\bibitem{cute_docs}
+NVIDIA, ``CuTe: Getting Started With CuTe,'' CUTLASS Documentation, 2023--2025. \url{https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/00_quickstart.html}
+
+\bibitem{flashattn3}
+J.~Shah \emph{et~al.}, ``FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision,'' arXiv:2407.08608, 2024. \url{https://arxiv.org/abs/2407.08608}
+
+\bibitem{cypress}
+R.~Yadav, M.~Garland, A.~Aiken, and M.~Bauer, ``Task-Based Tensor Computations on Modern GPUs (Cypress),'' arXiv:2504.07004, 2025. \url{https://arxiv.org/abs/2504.07004}
+
+\bibitem{tawa}
+H.~Chen \emph{et~al.}, ``Tawa: Automatic Warp Specialization for Modern GPUs with Asynchronous References,'' arXiv:2510.14719, 2025. \url{https://arxiv.org/abs/2510.14719}
+
+\bibitem{halide}
+J.~Ragan-Kelley \emph{et~al.}, ``Halide: A Language and Compiler for Optimizing Parallelism, Locality, and Recomputation in Image Processing Pipelines,'' PLDI, 2013. doi:10.1145/2462156.2462176
+
+\bibitem{tvm}
+T.~Chen \emph{et~al.}, ``TVM: An Automated End-to-End Optimizing Compiler for Deep Learning,'' OSDI, 2018. \url{https://www.usenix.org/conference/osdi18/presentation/chen}
+
+\bibitem{tvm_unity}
+A.~Sampson, T.~Chen, and J.~Roesch, ``Apache TVM Unity: a vision for the ML software \& hardware ecosystem,'' Apache TVM Blog, Dec. 2021. \url{https://tvm.apache.org/2021/12/15/tvm-unity}
+
+\bibitem{ansor}
+L.~Zheng \emph{et~al.}, ``Ansor: Generating High-Performance Tensor Programs for Deep Learning,'' OSDI, 2020. \url{https://www.usenix.org/conference/osdi20/presentation/zheng}
+
+\bibitem{mosaic}
+M.~Bansal, O.~Hsu, K.~Olukotun, and F.~Kjolstad, ``Mosaic: An Interoperable Compiler for Tensor Algebra,'' Proc. ACM Program. Lang. (PLDI), 2023. doi:10.1145/3591236
+
+\bibitem{pluto}
+U.~Bondhugula, A.~Hartono, J.~Ramanujam, and P.~Sadayappan, ``A Practical and Automatic Polyhedral Program Optimization System (Pluto),'' PLDI, 2008. \url{https://www.ece.lsu.edu/jxr/pluto/}
+
+\bibitem{polly}
+T.~Grosser, A.~Gr\"o\ss linger, and C.~Lengauer, ``Polly: Performing Polyhedral Optimizations on a Low-level Intermediate Representation,'' Parallel Processing Letters, 2012. doi:10.1142/S0129626412500107
+
+\bibitem{ppcg}
+S.~Verdoolaege \emph{et~al.}, ``Polyhedral Parallel Code Generation for CUDA (PPCG),'' ACM TACO, 2013. doi:10.1145/2400682.2400713
+
+\bibitem{typestate}
+R.~E.~Strom and S.~Yemini, ``Typestate: A Programming Language Concept for Enhancing Software Reliability,'' IEEE Trans. Software Eng., 12(1), 1986. doi:10.1109/TSE.1986.6312929
+
+\bibitem{sessiontypes}
+K.~Honda, ``Types for Dyadic Interaction,'' CONCUR, LNCS 715, 1993. doi:10.1007/3-540-57208-2\_35
+
+\bibitem{seplogic}
+J.~C.~Reynolds, ``Separation Logic: A Logic for Shared Mutable Data Structures,'' LICS, 2002. doi:10.1109/LICS.2002.1029817
+
+\bibitem{lineartypes}
+P.~Wadler, ``Linear Types Can Change the World!,'' in \emph{Programming Concepts and Methods}, 1990. \url{https://homepages.inf.ed.ac.uk/wadler/topics/linear-logic.html}
+
+\end{thebibliography}
+
+\end{document}
