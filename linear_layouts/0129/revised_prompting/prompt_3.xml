@@ -1,0 +1,374 @@
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>PL/Compiler Research Lead (e-graphs + GPU legality + async schedules)</role>
+    <mission>
+      Produce a final proposal centered on LegalEGraph: legality-aware equality saturation that co-optimizes
+      tensor layouts and asynchronous schedules while guaranteeing hardware admissibility on modern GPUs
+      (TMA tensor maps, WGMMA descriptors, bulk async semantics, and mbarrier protocols; optionally TMEM on Blackwell).
+    </mission>
+  </persona>
+
+  <non_negotiables>
+    <rule id="L1">
+      The proposal's primary contribution must be LegalEGraph (legality-aware equality saturation for layout+schedule co-optimization).
+      TxGraph and TMEM-IR may appear only as integrated analyses, case studies, or future extensions.
+    </rule>
+
+    <rule id="L2">
+      Every major technical contribution must map to:
+      (a) an IR design (MLIR dialect/attrs/types),
+      (b) an algorithm/pass (rewrite, analysis, extraction, scheduling, verification),
+      (c) a concrete prototype path (Triton→MLIR→NVGPU/NVVM/PTX and/or CuTe/CUTLASS integration).
+    </rule>
+
+    <rule id="L3">
+      Legality is a hard constraint, not a soft cost:
+      the system must never emit illegal TMA/WGMMA/mbarrier/TMEM behavior.
+      Define (i) the legality predicate(s), (ii) the analysis lattice, (iii) the extraction rule that chooses only legal representatives,
+      and (iv) the fallback boundary when no legal fast-path exists.
+    </rule>
+
+    <rule id="L4">
+      Temporal semantics must be treated explicitly:
+      bulk-async intra-group non-ordering, mbarrier phase/tx-count completion conditions, and visibility rules must be referenced.
+      Any schedule rewrite must be justified by dependence analysis and/or explicit barrier/commit/wait structure.
+    </rule>
+
+    <rule id="L5">
+      The evaluation plan must report metrics beyond speedup, including at minimum:
+      compile time, e-graph size/memory, number of candidates explored, number pruned by legality (with rejection reasons),
+      code size, registers/thread (or occupancy proxy), bank-conflict indicators, achieved bandwidth, and barrier stall indicators.
+    </rule>
+
+    <rule id="L6">
+      Use web research (2019–2026) and cite primary sources for every “breakthrough” claim:
+      egg/e-graphs; MLIR NVGPU; Triton; CUDA Driver API tensor maps; CUDA Programming Guide async copies; PTX ISA barrier/async semantics;
+      and baselines like FlashAttention-3, CUTLASS/CuTe, TritonBench.
+      If a source cannot be accessed, say so and do not fabricate details.
+    </rule>
+
+    <rule id="L7">
+      When citing ISA behavior, state exact target assumptions (e.g., SM90 vs SM100) and note version drift risk explicitly.
+      Avoid “PTX says …” without a version and a concrete citation.
+    </rule>
+
+    <rule id="L8">
+      The final output must be a single, standalone IEEETran LaTeX source that compiles without external figures or bib files
+      (include references in a thebibliography environment).
+    </rule>
+  </non_negotiables>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - If asked for IEEETran LaTeX, output exactly one fenced ```latex``` block (no additional blocks).
+      - Prefer crisp systems writing: contributions, design, invariants, algorithms, failure modes, and an evaluation plan with ablations.
+      - Include at least one figure as ASCII in a Verbatim environment (no external images).
+      - Keep formalism minimal but precise: define the e-graph term language, the legality analysis lattice, and the extraction objective.
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="3" model="gpt-5.2-pro" reasoning_effort="xhigh">
+
+  <input_sources>
+    <instruction>
+      Verify access and retrieve content from the seed papers (read fully; corner cases matter),
+      AND retrieve primary sources for GPU legality + equality saturation + compiler IR.
+      Use web research (2019–2026) and prefer primary sources.
+    </instruction>
+
+    <seed_papers>
+      1. ```https://arxiv.org/html/2505.23819v3``` (Linear Layouts)
+      2. ```https://arxiv.org/html/2511.10374v1``` (ISL for Layouts)
+      3. ```https://arxiv.org/pdf/2601.05972v1``` (Categorical Foundations)
+    </seed_papers>
+
+    <must_include_primary_system_sources>
+      - PTX ISA (current relevant version for Hopper/Blackwell targets): ```https://docs.nvidia.com/cuda/parallel-thread-execution/index.html```
+      - CUDA Driver API tensor map documentation: ```https://docs.nvidia.com/cuda/archive/13.0.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html```
+      - CUDA Programming Guide async copies / TMA swizzle constraints: ```https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html```
+      - MLIR NVGPU dialect docs: ```https://mlir.llvm.org/docs/Dialects/NVGPU/```
+      - egg / equality saturation paper (primary): use the official POPL 2021 paper page and/or PDF.
+    </must_include_primary_system_sources>
+
+    <baselines_and_context_sources>
+      - CUTLASS/CuTe TMA documentation (baseline reference path)
+      - TritonBench repository (benchmark harness)
+      - FlashAttention-3 paper (case study for async pipelines)
+    </baselines_and_context_sources>
+  </input_sources>
+
+  <task>
+    Generate the FINAL Research Proposal as a complete IEEETran LaTeX source block.
+
+    Core decision: choose Direction 2 (LegalEGraph) from Stage-2 as the PRIMARY proposal.
+    Incorporate insights from Direction 1 (TxGraph) and Direction 3 (TMEM-IR) ONLY as:
+      (i) legality analyses and constraints inside LegalEGraph,
+      (ii) post-extraction verification modules,
+      (iii) extensions/future work (e.g., Blackwell TMEM legality domain).
+
+    Do NOT present three competing directions; present ONE system with optional modules.
+  </task>
+
+  <required_content_structure>
+
+    <section_I>
+      <title>Introduction & Motivation</title>
+
+      <cliff>
+        Explain the combinatorial explosion:
+        (layout equivalences) × (async pipeline schedules) × (hardware legality predicates).
+        Make the argument concrete using:
+          - TMA tensor-map admissibility cliffs (alignment/stride/box/rank),
+          - WGMMA descriptor encodability (quantized offsets + enumerated swizzles),
+          - bulk async non-ordering within a group,
+          - mbarrier phase completion with tx-count.
+      </cliff>
+
+      <hazard>
+        Explain why “layout equivalence” alone is insufficient:
+        a rewrite can preserve a bijection but destroy descriptor legality,
+        and a schedule rewrite can preserve SSA dependencies but violate PTX ordering/visibility assumptions.
+      </hazard>
+
+      <solution>
+        Present LegalEGraph:
+        a legality-aware equality saturation engine that co-optimizes layout and schedule,
+        uses e-class analyses to enforce legality, and extracts only legal programs.
+        Mention TxGraph-style temporal protocol checks as an internal legality analysis or post-pass verifier.
+        Mention TMEM-IR as an extension: add a TMEM legality domain (allocation/lifetime/warpgroup lanes) when targeting Blackwell.
+      </solution>
+    </section_I>
+
+    <section_II>
+      <title>Theoretical Framework (Formalism)</title>
+
+      <A_eqsat>
+        Define an expression language for:
+          - layouts (split/merge/permute/pad/swizzle; convertible to linear layouts matrices and/or ISL relations),
+          - async schedules (stage, commit_group, wait_group(k), mbarrier_phase transitions).
+        Define equality saturation at a high level (e-graph, rewrite rules, saturation bound).
+        Cite egg and relevant compiler sources.
+      </A_eqsat>
+
+      <B_legality_analysis>
+        Define legality as an e-class analysis lattice (or product lattice).
+        At minimum, track invariants sufficient to decide:
+          - TMA admissibility (rank/align/stride modular constraints/box bounds/swizzle restrictions),
+          - WGMMA descriptor encodability (16B quantization of offsets; enumerated swizzle field),
+          - schedule legality (no rewrite assumes intra-group ordering; barrier protocol obligations).
+        Include one clear formal judgment, e.g.:
+          “An extracted term is legal iff its analysis summary implies all required predicates.”
+      </B_legality_analysis>
+
+      <C_cost_and_extraction>
+        Define extraction as multi-objective optimization over legal representatives:
+          instruction count proxy + predicted BW + predicted stalls + padding overhead + reg pressure proxy.
+        Specify the cost model strategy:
+          analytic features first; optional learned ranking as an add-on.
+      </C_cost_and_extraction>
+    </section_II>
+
+    <section_III>
+      <title>Compiler Architecture (Implementation)</title>
+
+      <IR_design>
+        Describe the MLIR design as TWO dialects (or one dialect with two sub-IRs):
+          - layout dialect (round-trippable to linear layouts and ISL forms),
+          - async_schedule dialect (explicit pipeline structure).
+        Describe how legality facts are represented (attrs, refined types, or analysis summaries).
+      </IR_design>
+
+      <pass_pipeline>
+        Describe the pass pipeline (must include an ASCII diagram):
+          Pass 0: Lower from Triton/CuTe/MLIR into layout + schedule terms.
+          Pass 1: Build e-graph and run bounded equality saturation (spatial + temporal rewrites).
+          Pass 2: Run legality-aware e-class analyses; prune/annotate illegal e-classes early.
+          Pass 3: Extract the best legal representative via the cost model.
+          Pass 4: Lower to NVGPU → NVVM → PTX, emitting:
+            - host-side tensor map creation boundary when needed,
+            - PTX async copy/barrier sequences consistent with the extracted schedule,
+            - WGMMA descriptor generation only when encodable.
+          Pass 5 (optional but recommended): TxGraph-style temporal verifier over the extracted schedule token graph.
+      </pass_pipeline>
+
+      <key_algorithms>
+        Include at least one algorithm block (Algorithm2e) for:
+          - legality-aware equality saturation loop OR
+          - extraction under legality constraints OR
+          - e-class analysis update + pruning.
+      </key_algorithms>
+
+      <failure_modes>
+        Clearly describe fallback behavior:
+          - What happens if no legal TMA descriptor exists?
+          - What happens if schedule legality fails?
+          - How are diagnostics produced (top rejection reasons)?
+      </failure_modes>
+    </section_III>
+
+    <section_IV>
+      <title>Evaluation Strategy</title>
+
+      <baselines>
+        Must include:
+          - Triton backend without legality-aware equality saturation (heuristic selection),
+          - CUTLASS/CuTe where applicable,
+          - FlashAttention-3-style kernels as a “hand-written async pipeline” baseline when relevant.
+      </baselines>
+
+      <benchmarks>
+        Must include:
+          - TritonBench operator suite,
+          - at least one attention kernel family,
+          - at least one GEMM/WGMMA-heavy family.
+        Optional:
+          - ragged/variable sequence length attention to stress legality + schedule.
+      </benchmarks>
+
+      <metrics>
+        Must report:
+          1) Compile time: saturation iterations, e-graph size, extraction time.
+          2) Legality pruning: #candidates pruned and top rejection reasons.
+          3) Fast-path hit rate: percent of kernels using TMA fast path vs fallback.
+          4) Runtime: throughput/latency; achieved bandwidth.
+          5) Stall/bubble indicators (barrier stalls / pipeline bubbles) via Nsight Compute.
+          6) Code size + registers/thread (occupancy proxy).
+      </metrics>
+
+      <ablations>
+        Include ablations isolating:
+          - legality pruning vs none,
+          - ISL canonicalization-based merging vs none,
+          - schedule rewrites enabled vs disabled,
+          - learned cost model vs analytic-only.
+      </ablations>
+    </section_IV>
+
+    <section_V>
+      <title>Related Work</title>
+
+      <positioning>
+        Contrast with:
+          - egg / equality saturation systems,
+          - tensor compiler/tuning systems (Ansor-style, superoptimizers),
+          - polyhedral methods (affine limits),
+          - Halide (domain focus),
+          - Mosaic (if relevant; ensure correct citation or omit),
+          - and explicitly position vs the three seed papers:
+            Linear Layouts, ISL relations, Categorical CuTe foundations.
+      </positioning>
+    </section_V>
+
+    <bibliography_instructions>
+      - Total 20–25 references.
+      - Must cite the three seed papers.
+      - Must cite PTX ISA + CUDA Driver API tensor map docs + CUDA Programming Guide async copies.
+      - Must cite egg (POPL 2021) and MLIR NVGPU dialect docs.
+      - Must cite at least two recent tensor compiler papers (PLDI/ASPLOS/OSDI range) that you can actually access.
+      - Do not fabricate citations; if a requested item cannot be sourced, omit and explain briefly in the paper text.
+    </bibliography_instructions>
+
+  </required_content_structure>
+
+  <formatting_template>
+    ```latex
+    \documentclass[conference]{IEEEtran}
+    \usepackage{amsmath, amssymb, amsfonts, amsthm}
+    \usepackage{fancyvrb}
+    \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+    \usepackage{listings}
+    \usepackage{cite}
+    \usepackage{graphicx}
+    \usepackage{booktabs}
+    \usepackage{url}
+
+    \newtheorem{definition}{Definition}
+    \newtheorem{theorem}{Theorem}
+
+    \begin{document}
+
+    \title{LegalEGraph: Legality-Aware Equality Saturation for Layout and Asynchronous Schedule Co-Optimization on Modern GPUs}
+
+    \author{\IEEEauthorblockN{Principal Architect}}
+    \maketitle
+
+    \begin{abstract}
+    Modern GPUs use descriptor-driven, asynchronous data movement (e.g., tensor-memory access engines) and weakly ordered async operations.
+    As a result, many layout transformations and pipeline schedules that are equivalent at the index-algebra or SSA level are either illegal
+    (violating descriptor admissibility or operand encoding constraints) or temporally unsafe (violating barrier protocols or relying on absent ordering guarantees).
+    We propose LegalEGraph, a legality-aware equality saturation engine that jointly searches layout and schedule spaces while enforcing hard hardware legality constraints via e-class analyses.
+    LegalEGraph extracts only legal fast-path implementations and falls back with diagnoses when no legal candidate exists.
+    \end{abstract}
+
+    \section{Introduction}
+    % Motivation: equivalences vs legality vs temporal contracts.
+    % Define the cliff and why existing layout formalisms are insufficient on modern GPUs.
+
+    \section{Theoretical Framework}
+    \subsection{Equality Saturation over Layout and Schedule Terms}
+    % Define term language and rewrite rules; cite egg.
+
+    \subsection{Legality as an E-Class Analysis Lattice}
+    % Define legality domains: TMA admissibility, WGMMA encodability, schedule legality.
+
+    \subsection{Cost and Extraction under Hard Legality Constraints}
+    % Multi-objective extraction.
+
+    \section{System Architecture}
+    \begin{figure}[t]
+    \begin{Verbatim}[fontsize=\scriptsize, commandchars=\\\{\}]
+    [Input: Triton/CuTe kernel]
+          |
+    [Lower: layout dialect + async_schedule dialect]
+          |
+    [Build E-Graph]
+          |
+    [EqSat: bounded rewrites (layout + schedule)]
+          |
+    [E-Class Analyses: legality lattices]
+          |----(no legal reps)----> [Fallback + diagnostics]
+          |
+    [Extract: best legal rep (cost model)]
+          |
+    [Lower: NVGPU -> NVVM -> PTX]
+          |
+    [Output: legal fast-path kernel]
+    \end{Verbatim}
+    \caption{LegalEGraph compilation flow.}
+    \end{figure}
+
+    \section{Implementation Plan}
+    % Passes, analyses, extraction algorithm, version gating, diagnostics.
+
+    \section{Evaluation}
+    \begin{table}[t]
+    \caption{Planned metrics and where they are measured.}
+    \centering
+    \begin{tabular}{ll}
+    \toprule
+    Metric & Measurement \\
+    \midrule
+    E-graph size / saturation iters & compiler logs \\
+    Candidates pruned by legality & compiler logs (rejection reasons) \\
+    Fast-path hit rate & codegen classification (TMA vs fallback) \\
+    Runtime throughput / latency & benchmark harness \\
+    Bandwidth + stalls & profiler (Nsight Compute) \\
+    Code size + registers/thread & compiler back-end reports \\
+    \bottomrule
+    \end{tabular}
+    \end{table}
+
+    \section{Related Work}
+    % egg, tensor compilers, layout theories, GPU ISA constraints, etc.
+
+    \begin{thebibliography}{00}
+    % 20-25 refs, primary sources preferred.
+    \end{thebibliography}
+
+    \end{document}
+    ```
+  </formatting_template>
+
+</user_prompt>

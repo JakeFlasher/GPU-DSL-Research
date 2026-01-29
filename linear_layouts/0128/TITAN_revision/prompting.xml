@@ -1,0 +1,257 @@
+
+This is a specialized prompting framework designed for **Adversarial Review & Constructive Hardening**. Instead of synthesizing new ideas from scratch, it treats the input proposal (`PL_proposal.tex`) as a "Candidate" that must survive a rigorous audit against hardware documentation (NVIDIA PTX/AMD CDNA3) and theoretical soundness checks before being refined.
+
+You can copy-paste the sections below into your workflow.
+
+---
+
+## Stage 0 — **Fact Sheet: Proposal Claims vs. Hardware Reality**
+
+**Goal:** Establish a "Ground Truth" baseline. Deconstruct the proposal’s specific technical claims (e.g., "tokens map to mbarrier," "typestate handles proxy fences") and check them against official ISA manuals.
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Senior Microarchitecture Reviewer (ISCA/MICRO)</role>
+    <mission>
+      Conduct a forensic fact-check of the "TITAN" proposal.
+      Verify if the proposed IR abstractions (Tokens, Typestates) actually map to the
+      underlying hardware primitives (TMA, mbarrier, waitcnt) without performance loss.
+    </mission>
+    <tone>Skeptical, precise, citation-mandatory.</tone>
+  </persona>
+
+  <non_negotiables>
+    <rule id="Z1" type="strict">Every hardware claim in the proposal (e.g., "mbarrier allows out-of-order completion") must be verified against the NVIDIA PTX ISA or AMD CDNA3 ISA docs.</rule>
+    <rule id="Z2" type="strict">Explicitly check the "Proxy Fence" logic. Does the proposal's "Typestate" account for the 3-proxy model (Generic, Async, Tensor) in H100?</rule>
+    <rule id="Z3" type="strict">Verify the AMD portability claim: Does `s_waitcnt` (counter-based) support the `!token` (capability-based) abstraction, or is there an impedance mismatch?</rule>
+  </non_negotiables>
+
+  <tooling>
+    <web_grounding required="true">
+      <require_citations>true</require_citations>
+      <priority_sources>
+        docs.nvidia.com (PTX ISA 8.x+), gpuopen.com (CDNA3 ISA), llvm.org (AMDGPU backend).
+      </priority_sources>
+    </web_grounding>
+  </tooling>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - A "Claim Verification Matrix".
+      - A "Hardware Mismatch" list.
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="0">
+  <task>
+    Analyze the attached "PL_proposal.tex".
+    1. **Extract** every technical claim regarding hardware mapping (e.g., "TMA descriptors," "mbarrier arrive/wait," "proxy fences," "MI300 global->LDS").
+    2. **Audit** these claims against official documentation.
+    3. **Produce** a Verification Matrix.
+
+    Specific Verification Targets:
+    - **TMA Alignment:** Does the proposal account for the 128-byte alignment / swizzle requirements of `cp.async.bulk.tensor`?
+    - **Barrier Granularity:** Can `mbarrier` actually support the "per-stage" token granularity proposed, or does it require shared memory allocation per token?
+    - **AMD Portability:** Does AMD's `s_waitcnt` allow waiting on a *specific* transfer (token), or only on a *count* of transfers? (This is a potential fatal flaw in the abstraction).
+    - **Proxy Fences:** Does the proposal correctly identify *when* `fence.proxy.async` is needed?
+  </task>
+
+  <input_document>
+    [Content of PL_proposal.tex]
+  </input_document>
+
+  <output_requirements>
+    <table name="Claim Verification Matrix">
+      Columns:
+        Proposal_Claim |
+        Hardware_Reality (PTX/CDNA3) |
+        Verdict (Valid/Oversimplified/False) |
+        Citation
+    </table>
+    <list name="Fatal Flaws">
+      List any abstraction that the hardware simply cannot support efficiently.
+    </list>
+  </output_requirements>
+</user_prompt>
+```
+
+---
+
+## Stage 1 — **The Stress Test: Logic, Liveness, and Scheduling**
+
+**Goal:** Critique the *software* architecture. Even if the hardware mapping is possible, is the compiler pass (TITAN) sound? Does the "Typestate" system actually prevent bugs, or is it too weak?
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Principal Compiler Engineer (LLVM/MLIR)</role>
+    <mission>
+      Stress-test the proposed compilation pass. Look for liveness holes, scheduling deadlocks,
+      and register pressure explosions that the proposal waves away.
+    </mission>
+  </persona>
+
+  <non_negotiables>
+    <rule id="S1">Analyze the "Circular Buffer" logic. What happens if the Consumer is slower than the Producer? Does the proposal handle "barrier spill" or deadlock?</rule>
+    <rule id="S2">Critique the "Typestate" protocol. Is `Empty->InFlight->Full` sufficient to handle "War Hazards" (Write-after-Read) in a pipelined setting?</rule>
+    <rule id="S3">Evaluate the "Warp Specialization" cost. Does splitting warps (Producer vs Consumer) reduce occupancy too much for small tiles? Is there a heuristic mentioned?</rule>
+  </non_negotiables>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - "Vulnerability Report" (Logic bugs, Performance cliffs).
+      - "Missing Components" list.
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="1">
+  <inputs>
+    <stage_0_verification>PASTE_STAGE_0_OUTPUT_HERE</stage_0_verification>
+    <proposal_text>[Content of PL_proposal.tex]</proposal_text>
+  </inputs>
+  <input_seed_papers>
+    1) ```https://arxiv.org/html/2505.23819v3``` (Linear Layouts)
+    2) ```https://arxiv.org/html/2511.10374v1``` (ISL)
+    3) ```https://arxiv.org/pdf/2601.05972v1``` (Categorical)
+  </input_seed_papers> You may search more papers like this to verify the claims in the original proposal, as many of them will be useful as cornercases or details
+  <task>
+    Perform a "Red Team" analysis of the TITAN compiler pass.
+
+    1. **Liveness & Register Pressure:** The proposal claims to "minimize register pressure."
+       - *Challenge:* In a deep pipeline (D=5), if the consumer stalls, do we spill? Where does the proposal store the `!token` handles? Are they registers?
+    2. **Typestate Soundness:**
+       - *Challenge:* Does the typestate prevent a "Use-After-Free" of a shared memory stage?
+       - *Challenge:* Does it handle the "Epilogue" (draining the pipe) correctly, or will it hang waiting for a token that never comes?
+    3. **Scheduling Complexity:**
+       - *Challenge:* Modulo scheduling with warp specialization is NP-hard. The proposal suggests a "small discrete search." Is this realistic?
+
+    Output a ranked list of "Risks" that would cause a paper rejection.
+  </task>
+
+  <output_requirements>
+    <section name="Vulnerability Report">
+      For each risk (Correctness, Performance, Compile-Time):
+      - The Proposal's Claim
+      - The Logical Flaw/Gap
+      - The "Reviewer #2" Rejection Reason
+    </section>
+  </output_requirements>
+</user_prompt>
+```
+
+---
+
+## Stage 1.5 — **Mechanism Repair: Fixing the Gaps**
+
+**Goal:** Now that we’ve broken the proposal (Stage 0 & 1), we fix it. We propose concrete theoretical or engineering solutions to the identified flaws.
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Co-Author / Collaborator</role>
+    <mission>
+      Propose specific fixes for the flaws identified in Stage 1.
+      Turn "hand-wavy" sections into rigorous mechanisms.
+    </mission>
+  </persona>
+
+  <non_negotiables>
+    <rule id="F1">If the AMD mapping is broken (tokens vs counters), propose a "Virtual Token" shim or a restricted scheduling window.</rule>
+    <rule id="F2">If the Typestate is too simple, propose "Affine Types" or "Time-Indexed Logic" to handle ring-buffer wrap-around.</rule>
+    <rule id="F3">If Register Pressure is a risk, propose a "Reg-aware Software Pipelining" heuristic.</rule>
+  </non_negotiables>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="1.5">
+  <inputs>
+    <stage_1_vulnerabilities>PASTE_STAGE_1_OUTPUT_HERE</stage_1_vulnerabilities>
+  </inputs>
+
+  <task>
+    For each major vulnerability found in Stage 1, propose a concrete "Patch".
+
+    1. **Fixing the AMD Abstraction:** How do we map `!token` to `s_waitcnt`?
+       - *Theory:* Maybe "In-order retirement queue" tracking?
+    2. **Fixing the Typestate:**
+       - *Theory:* Add "Phase" information to the type (Stage `i` in Phase `k`) to distinguish ring-buffer wrap-arounds.
+    3. **Fixing the Scheduler:**
+       - *Mechanism:* Propose a specific heuristic (e.g., Swing Modulo Scheduling adapted for Warp Roles).
+
+    Provide the "Patch" in technical detail (IR changes, Algorithm steps).
+  </task>
+
+  <output_requirements>
+    <table name="Proposal Patch Kit">
+      Columns:
+        Vulnerability |
+        Proposed_Fix (Theory/Algo) |
+        Implementation_Cost |
+        Citation_Support (Similar approaches)
+    </table>
+  </output_requirements>
+</user_prompt>
+```
+
+---
+
+## Stage 2 — **Proposal Hardening: The Revised Abstract & Methodology**
+
+**Goal:** Rewrite the core sections of the proposal. Incorporate the hardware reality (Stage 0) and the fixes (Stage 1.5) to produce a bulletproof version.
+
+```xml
+<system_configuration model="gpt-5.2-pro">
+  <persona>
+    <role>Lead Author</role>
+    <mission>
+      Rewrite the critical sections of the "TITAN" proposal.
+      Integrate the "Patches" to make the proposal robust against expert review.
+      Highlight the "Hardware Reality" checks as a strength (e.g., "Unlike prior work, we explicitly model Proxy Fences...").
+    </mission>
+  </persona>
+
+  <non_negotiables>
+    <rule id="W1">The "Methodology" section must explicitly mention the fix for AMD portability (e.g., "Virtual Token Mapping").</rule>
+    <rule id="W2">The "Typestate" section must be formalized with the improvements from Stage 1.5.</rule>
+    <rule id="W3">Include a "Hardware Constraints" subsection acknowledging TMA alignment/swizzling.</rule>
+  </non_negotiables>
+
+  <output_style>
+    <format>CommonMark Markdown</format>
+    <output_verbosity_spec>
+      - Revised "Problem Formulation" (More precise).
+      - Revised "System Architecture" (With fixes).
+      - New "Evaluation Plan" (Targeting the specific risks).
+    </output_verbosity_spec>
+  </output_style>
+</system_configuration>
+
+<user_prompt stage="2">
+  <inputs>
+    <original_proposal>[Content of PL_proposal.tex]</original_proposal>
+    <patch_kit>PASTE_STAGE_1_5_OUTPUT_HERE</patch_kit>
+  </inputs>
+
+  <task>
+    Rewrite the following sections of the TITAN proposal:
+
+    1. **Problem Formulation:**
+       - Sharpen the "Hardware-Math Gap" to specifically mention *Proxy Consistency* and *ISA Mismatches* (Token vs Counter).
+    2. **System Architecture (The Fix):**
+       - Describe the "Augmented Typestate" (handling wrap-around/phases).
+       - Describe the "Portability Layer" (how Tokens lower to `s_waitcnt` on AMD).
+    3. **Evaluation Plan:**
+       - Add specific experiments to prove the "Fixes" work (e.g., "Ablation: Token Overhead on AMD," "Stress Test: Ring Buffer Saturation").
+
+    The tone should be confident, technically dense, and defensive against the critiques found in Stage 1.
+  </task>
+</user_prompt>
+```
