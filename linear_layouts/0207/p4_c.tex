@@ -1,0 +1,1842 @@
+% ============================================================
+%  BUTA — Blackwell Unified Tile Algebra
+%  Part 4: Evaluation Strategy, Benchmark Suite,
+%          Reproducibility, Threats, Limitations,
+%          and Risk Assessment
+% ============================================================
+\documentclass[10pt,twocolumn]{article}
+
+% ---- Geometry & Typography ----
+\usepackage[margin=0.85in,columnsep=0.25in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% ---- Mathematics ----
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+
+% ---- Figures & Tables ----
+\usepackage{graphicx,booktabs,array,multirow}
+\usepackage{fancyvrb}
+\usepackage{float}
+
+% ---- Cross-references & Links ----
+\usepackage[colorlinks,citecolor=blue!70!black,
+            linkcolor=blue!60!black,urlcolor=blue!50!black]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+% ---- Misc ----
+\usepackage{xcolor}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+% ---- Theorem-like environments ----
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{invariant}[definition]{Invariant}
+\newtheorem{remark}[definition]{Remark}
+\newtheorem{procedure}[definition]{Procedure}
+\newtheorem{criterion}[definition]{Criterion}
+\theoremstyle{plain}
+\newtheorem{proposition}[definition]{Proposition}
+\newtheorem{obligation}[definition]{Proof Obligation}
+
+% ---- Convenience macros (matching Parts 1--3) ----
+\newcommand{\BUTA}{\textsc{Buta}}
+\newcommand{\Ftwo}{\mathbb{F}_2}
+\newcommand{\ZZ}{\mathbb{Z}}
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\ISL}{\textsc{ISL}}
+\newcommand{\CuTe}{\textsc{CuTe}}
+\newcommand{\TileIR}{Tile\,IR}
+\newcommand{\TMEM}{\textsc{TMEM}}
+\newcommand{\SMEM}{\textsc{SMEM}}
+\newcommand{\tcgen}{\texttt{tcgen05}}
+\newcommand{\tma}{\textsc{TMA}}
+\newcommand{\II}{\mathit{II}}
+\newcommand{\reuse}{d_{\mathrm{reuse}}}
+\newcommand{\unverified}{\textsc{[unverified]}}
+\newcommand{\inference}{\textsc{[inference]}}
+
+% ---- Continue section numbering from Part 3 ----
+\setcounter{section}{16}
+
+% ---- Title ----
+\title{%
+  \BUTA{}: Blackwell Unified Tile Algebra\\[4pt]
+  \large Part~4 --- Evaluation Strategy, Benchmark Suite,\\
+         Reproducibility, Threats to Validity,\\
+         Known Limitations, and Risk Assessment}
+
+\author{%
+  \textit{[Authors redacted for review]}\\
+  Target architecture: NVIDIA Blackwell (B200 cc\,10.0;
+  Grace-Blackwell GB10 cc\,12.0)\\
+  Toolchain: CUDA ${>}\,13.0$ (prefer 13.1+),
+  PTX ${>}\,9.0$ (strict)}
+
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+% ====================================================================
+%  OVERVIEW
+% ====================================================================
+\noindent
+Parts~1--3 have, respectively, framed the Blackwell
+optimisation challenge and its formal preliminaries
+(Part~1), defined the seven-object \BUTA{} model with
+semantic layers, invariants, and proof obligations
+(Part~2), and specified the solver encodings, layout
+tooling, data-movement pipeline, cache analysis, and
+calibration microbenchmark plan required to
+operationalise the model (Part~3).
+This concluding part establishes how \BUTA{} will be
+\emph{evaluated} against ground-truth baselines
+(\cref{sec:eval}); defines the concrete benchmark
+suite and measurement methodology (\cref{sec:bench});
+specifies the hardware, toolchain, and release plan
+for reproducibility (\cref{sec:repro}); analyses
+threats to validity (\cref{sec:threats}); enumerates
+known theoretical and practical limitations
+(\cref{sec:limitations}); and presents a severity-ranked
+risk assessment for the nine identified gaps~G1--G9
+with a phased mitigation timeline
+(\cref{sec:risk}).
+
+
+% ====================================================================
+%  SECTION 17 — EVALUATION STRATEGY
+% ====================================================================
+\section{Evaluation Strategy}
+\label{sec:eval}
+
+The \BUTA{} evaluation must establish three claims:
+(i)~the solver produces schedules competitive with or
+superior to expert-designed implementations;
+(ii)~the analytic cache model predicts hardware
+behaviour with bounded error; and
+(iii)~the layout verification pipeline correctly
+classifies layouts at all three representation layers.
+Each claim requires a distinct validation methodology,
+defined below.
+
+\subsection{Solver Output vs.\ Expert Schedules}
+\label{sec:eval:solver}
+
+\begin{definition}[Schedule Quality
+  Metric~\cite{OPT_PIPE}]
+\label{def:sched-metric}
+For a given tile-level dependence graph $G = (V, E)$
+and cost vector $\mathbf{c}(x)$~\cite{ARCH_BW},
+the primary quality metric is the \emph{achieved
+initiation interval} $\II_{\mathrm{solver}}$ produced
+by the SMT formulation (Part~3,
+\cref{def:smt-clauses}).
+The baseline comparison is the \emph{expert initiation
+interval} $\II_{\mathrm{expert}}$ extracted from
+published Flash Attention implementations (FA3, FA4)
+on Blackwell~\cite{OPT_PIPE}.
+The evaluation reports:
+\begin{equation}
+  \rho_{\II} =
+  \frac{\II_{\mathrm{expert}}}
+       {\II_{\mathrm{solver}}}
+  \label{eq:ii-ratio}
+\end{equation}
+where $\rho_{\II} \leq 1$ indicates the solver
+matches or improves upon the expert, and
+$\rho_{\II} > 1$ indicates the solver discovers a
+superior schedule.
+\end{definition}
+
+\begin{definition}[End-to-End Throughput
+  Comparison~\cite{OPT_PIPE, ARCH_BW}]
+\label{def:throughput-metric}
+The secondary metric is \emph{achieved throughput}
+$\Theta$ in TFLOPS, measured on hardware:
+\begin{equation}
+  \Theta =
+  \frac{2 \cdot M \cdot N \cdot K}
+       {t_{\mathrm{kernel}} \cdot 10^{12}}
+  \label{eq:tflops}
+\end{equation}
+for an $M \times N \times K$ problem executed in
+$t_{\mathrm{kernel}}$ seconds.
+Solver-generated schedules are compiled to PTX
+($> 9.0$) and executed on both B200 (cc\,10.0,
+148~SMs) and GB10 (cc\,12.0)~\cite{ARCH_BW}.
+Comparison baselines include:
+\begin{enumerate}[label=(\alph*)]
+  \item Expert FA3/FA4 implementations for Flash
+    Attention~\cite{OPT_PIPE}.
+  \item cuBLAS default schedule for dense
+    GEMM~\cite{ARCH_BW}.
+  \item Triton-to-\TileIR{} auto-generated
+    schedules~\cite{NV_BLOG_TILE}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Cross-Generation Schedule
+  Distinction~\cite{OPT_PIPE}]
+\label{def:cross-gen}
+To confirm that the Blackwell cost vector
+$\mathbf{c}(10.0)$ captures genuine architectural
+differences, the evaluation verifies that solver-optimal
+schedules for Blackwell \emph{differ structurally} from
+Hopper-optimal schedules produced by the same
+solver with Hopper cost
+parameterisation~\cite{OPT_PIPE}.
+Structural difference is measured by:
+\begin{equation}
+  d_{\mathrm{struct}} =
+  \bigl|\{v \in V :
+    W_{\mathrm{BW}}(v) \neq W_{\mathrm{HP}}(v)
+    \;\lor\;
+    \theta_{\mathrm{BW}}(v) \neq \theta_{\mathrm{HP}}(v)
+  \}\bigr| / |V|
+  \label{eq:struct-diff}
+\end{equation}
+where $W(\cdot)$ is the warp assignment and
+$\theta(\cdot)$ is the pipeline stage assignment.
+A nonzero $d_{\mathrm{struct}}$ confirms the cost
+vector's discriminative
+power~\cite{OPT_PIPE, ARCH_BW}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Evaluation Flow: Solver vs Expert                        |
++===========================================================+
+|                                                           |
+|  INPUT:                                                   |
+|    Dependence graph G = (V, E)  [per benchmark kernel]    |
+|    Cost vector c(x) [calibrated, Part 3, ARCH_BW]         |
+|    Expert schedule (M_exp, W_exp, II_exp) [OPT_PIPE]      |
+|                                                           |
+|  PHASE A: Solver Execution                                |
+|  +-----------------------------------------------------+  |
+|  | Run ILP -> II_lb  (Phase 1, Part 3)                  |  |
+|  | Run SMT -> (M_sol, W_sol, II_sol)  (Phase 2)        |  |
+|  | IF num_ctas=2: include Phi_2cta  [NV_BLOG_TILE]      |  |
+|  | Record: solve_time, II_sol                           |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  PHASE B: Schedule Comparison                             |
+|  +-----------------------------------------------------+  |
+|  | Compute rho_II = II_exp / II_sol                     |  |
+|  | Compute d_struct (warp + stage diff)                 |  |
+|  | Verify INV-S1..S5 on solver output [Part 2]          |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  PHASE C: Hardware Execution                              |
+|  +-----------------------------------------------------+  |
+|  | Compile solver schedule -> PTX > 9.0                 |  |
+|  | Execute on B200 (cc 10.0) and GB10 (cc 12.0)        |  |
+|  | Measure Theta (TFLOPS) via Nsight Compute            |  |
+|  | Compare: Theta_sol vs Theta_exp vs Theta_triton      |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  OUTPUT:                                                  |
+|    Table: kernel x platform x {II, Theta, rho_II}        |
+|    Structural diff d_struct (Blackwell vs Hopper)         |
+|    Invariant verification report                          |
++===========================================================+
+\end{BVerbatim}
+\caption{Three-phase evaluation flow for solver
+  output comparison.
+  Phase~A invokes the ILP+SMT pipeline
+  (Part~3)~\cite{OPT_PIPE};
+  Phase~B compares against expert baselines;
+  Phase~C validates on Blackwell
+  hardware~\cite{ARCH_BW} with Tile~IR
+  compilation~\cite{NV_BLOG_TILE}.}
+\label{fig:eval-solver}
+\end{figure}
+
+\begin{remark}
+Soi et al.~\cite{OPT_PIPE} report that their Twill
+system rediscovers expert Flash Attention schedules on
+both Hopper and Blackwell.
+The \BUTA{} evaluation extends this by additionally
+testing the 2CTA extension
+$\Phi_{\mathrm{2cta}}$~\cite{NV_BLOG_TILE} and the
+joint layout-schedule formulation (gap~G4), which are
+absent from the Twill baseline.
+Solve time is expected to remain below 60~seconds for
+Flash Attention-scale
+problems~\cite{OPT_PIPE}.
+\end{remark}
+
+
+\subsection{Cache Model Validation}
+\label{sec:eval:cache}
+
+\begin{definition}[Miss Prediction Error
+  Metric~\cite{SEED_3, ARCH_BW}]
+\label{def:cache-metric}
+For a given tile program, tile ordering~$\sigma$, and
+platform with parameters
+$(N_{\mathrm{SM}}, C_{\mathrm{L2}})$, the
+\emph{relative prediction error} is:
+\begin{equation}
+  \varepsilon_{\mathrm{miss}}(\sigma) =
+  \frac{|\mathcal{C}(\sigma, N_{\mathrm{SM}},
+    C_{\mathrm{L2}}) -
+    M_{\mathrm{hw}}(\sigma)|}
+    {M_{\mathrm{hw}}(\sigma)}
+  \label{eq:miss-error}
+\end{equation}
+where $\mathcal{C}$ is the predicted miss count
+(Part~2, \cref{def:cache-func}) and
+$M_{\mathrm{hw}}$ is the measured miss count obtained
+from Nsight Compute \texttt{l2\_sector\_misses}
+hardware performance counters.
+\end{definition}
+
+\begin{definition}[Validation Protocol~\cite{SEED_3}]
+\label{def:cache-valid-protocol}
+The cache model is validated in three tiers of
+increasing generality:
+
+\smallskip\noindent
+\textbf{Tier~1 (reproduction).}
+Reproduce the SEED\_3 result on GB10
+(cc\,12.0, 128\,KB \SMEM{}): sawtooth ordering
+reduces L2 misses by $67\% \pm 5\%$ (370M $\to$ 120M
+sectors) for Flash Attention causal
+mask~\cite{SEED_3}.
+The model prediction
+$\mathcal{C}(\sigma_{\mathrm{saw}})$ must satisfy
+$\varepsilon_{\mathrm{miss}} < 0.15$
+(15\% relative error)~\cite{SEED_3}.
+
+\smallskip\noindent
+\textbf{Tier~2 (cross-platform).}
+Execute the same Flash Attention configuration on B200
+(cc\,10.0, 228\,KB \SMEM{}, 148~SMs) with platform
+parameters from~\cite{ARCH_BW}.
+Verify that the model adapts to the larger \SMEM{}
+capacity and different SM count, with
+$\varepsilon_{\mathrm{miss}} < 0.20$ \inference{}.
+The 58\% cache-miss latency
+reduction~\cite{ARCH_BW} may alter the
+performance-per-miss relationship but should not
+affect miss count prediction.
+
+\smallskip\noindent
+\textbf{Tier~3 (generalisation).}
+Extend to dense GEMM and mixed-precision GEMM
+(gap~G5).
+For non-streaming access patterns where tile reuse is
+significant, the model must either maintain
+$\varepsilon_{\mathrm{miss}} < 0.20$ or correctly
+identify when its streaming assumption is violated
+and report degraded confidence \inference{}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Cache Model Validation Tiers                             |
++===========================================================+
+|                                                           |
+|  TIER 1: Reproduction (GB10)                [SEED_3]      |
+|  +-----------------------------------------------------+  |
+|  | Workload: Flash Attention causal, N=8192, d=128      |  |
+|  | Platform: GB10 cc 12.0, SMEM 128 KB                  |  |
+|  | Orderings: raster, sawtooth                          |  |
+|  | Target:    eps_miss < 0.15                           |  |
+|  | Baseline:  370M -> 120M sectors (67% reduction)      |  |
+|  +--+--------------------------------------------------+  |
+|     | PASS => proceed                                     |
+|     v                                                     |
+|  TIER 2: Cross-Platform (B200)              [ARCH_BW]     |
+|  +-----------------------------------------------------+  |
+|  | Workload: Flash Attention (same config)              |  |
+|  | Platform: B200 cc 10.0, SMEM 228 KB, 148 SMs        |  |
+|  | Adjust:   tile size for 228 KB SMEM                  |  |
+|  | Target:   eps_miss < 0.20 [INFERENCE]                |  |
+|  | Verify:   model adapts to different N_SM, C_SMEM     |  |
+|  +--+--------------------------------------------------+  |
+|     | PASS => proceed                                     |
+|     v                                                     |
+|  TIER 3: Generalisation                     [gap G5]      |
+|  +-----------------------------------------------------+  |
+|  | Workloads: dense GEMM, mixed-prec GEMM, conv         |  |
+|  | Platforms: B200 + GB10                                |  |
+|  | Target:    eps_miss < 0.20 for streaming patterns    |  |
+|  |            OR correct degraded-confidence flag        |  |
+|  | Classify:  per NV_workloads taxonomy [NV_workloads]  |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  FAILURE PROTOCOL:                                        |
+|    If Tier 1 fails => model is unsound; revise d_reuse   |
+|    If Tier 2 fails => cross-platform params incorrect     |
+|    If Tier 3 fails => streaming assumption insufficient;  |
+|                       extend model (gap G5)               |
++===========================================================+
+\end{BVerbatim}
+\caption{Three-tier cache model validation.
+  Tier~1 reproduces~\cite{SEED_3};
+  Tier~2 tests cross-platform transfer to
+  B200~\cite{ARCH_BW};
+  Tier~3 generalises beyond Flash Attention,
+  classified by the HARP
+  taxonomy~\cite{NV_workloads}.
+  Failure at each tier triggers a specific
+  remediation.}
+\label{fig:cache-valid}
+\end{figure}
+
+
+\subsection{Layout Correctness Testing}
+\label{sec:eval:layout}
+
+\begin{definition}[Layout Verification
+  Acceptance Criteria~\cite{SEED_1, SEED_2, SEED_4}]
+\label{def:layout-criteria}
+The three-layer layout verification pipeline
+(Part~3, \cref{fig:layout-pipeline}) is tested
+against ground-truth layout libraries from the
+golden sources.
+Acceptance requires:
+\begin{enumerate}[label=(\alph*)]
+  \item \textbf{$\Ftwo$ layer}: for every
+    linear layout $L$ in the Triton test suite
+    of~\cite{SEED_1}, the pipeline correctly
+    computes $\mathrm{rank}(L)$, verifies
+    injectivity, and produces correct composition
+    $L_2 \cdot L_1$ for all tested pairs.
+  \item \textbf{\ISL{} layer}: for every \CuTe{} layout
+    $H$ convertible by Algorithm~1
+    of~\cite{SEED_2}, the pipeline produces an
+    \ISL{} relation $R_H$ satisfying
+    $|R_H| = |H|$ (layout size) and
+    $\|R_H\| = \|H\|$ (co-size).
+    Swizzle patterns are correctly represented as
+    bit-level \ISL{} operations~\cite{SEED_2}.
+  \item \textbf{Categorical layer}: for every layout
+    in the CUTLASS test suite of~\cite{SEED_4},
+    the pipeline correctly identifies whether the
+    layout is \emph{tractable} (arises from
+    $\mathbf{Nest}$ categorical construction) and
+    produces a matching descriptor:
+    $L_{\mathrm{computed}} = L_{\mathrm{CUTLASS}}$
+    element-wise over the tile
+    domain~\cite{SEED_4}.
+  \item \textbf{Cross-layer consistency}: for every
+    layout representable at multiple layers, the
+    embedding $\phi$
+    (Part~2, \cref{def:phi-embed}) and functor~$F$
+    (Part~2, \cref{def:F-functor}) produce
+    consistent results: $\phi(L) = R_L$ at the
+    $\Ftwo$--\ISL{} boundary, and
+    $F(f) = R_f$ at the
+    $\mathbf{Nest}$--\ISL{} boundary.
+    This validates PO-1 and PO-2
+    (Part~2)~\cite{SEED_1, SEED_2, SEED_4}.
+\end{enumerate}
+\end{definition}
+
+\begin{remark}
+Layouts for FP4 and FP6 precisions have not been
+characterised in the golden sources \unverified{}
+(gap~G8).
+The evaluation will include FP4/FP6 layouts
+\emph{only} if empirical \tcgen{} microbenchmarks
+(Part~3, \cref{def:mma-calib}) reveal their structure;
+otherwise, FP4/FP6 layout testing is deferred and
+labelled accordingly~\cite{ARCH_BW, SEED_1}.
+\end{remark}
+
+
+% ====================================================================
+%  SECTION 18 — BENCHMARK SUITE
+% ====================================================================
+\section{Benchmark Suite}
+\label{sec:bench}
+
+\subsection{Kernel Selection and Justification}
+\label{sec:bench:kernels}
+
+The benchmark suite is designed to exercise all four
+\BUTA{} semantic layers across multiple workload types.
+Kernel selection is governed by two criteria:
+(i)~coverage of the HARP taxonomy axes
+(mixed-reuse, compute-bound, memory-bound)%
+~\cite{NV_workloads}; and
+(ii)~availability of expert baselines for
+comparative evaluation~\cite{OPT_PIPE, ARCH_BW}.
+
+\begin{definition}[Benchmark Kernel
+  Set]
+\label{def:kernel-set}
+The benchmark suite $\mathcal{B}$ consists of five
+kernel families:
+
+\smallskip\noindent
+\textbf{B1: Flash Attention Forward.}
+$Q, K, V \in \mathbb{R}^{N \times d}$;
+split-$Q$ dataflow with persistent CTAs;
+$N \in \{2048, 4096, 8192, 16384\}$,
+$d \in \{64, 128, 256\}$;
+causal and non-causal variants.
+This is the primary evaluation kernel:
+expert baselines exist~\cite{OPT_PIPE},
+cache model is validated~\cite{SEED_3},
+2CTA mode is critical~\cite{NV_BLOG_TILE},
+and the workload is mixed-reuse
+(MMA + softmax epilogue)~\cite{NV_workloads}.
+
+\smallskip\noindent
+\textbf{B2: Flash Attention Backward.}
+Gradient computation with $dQ$, $dK$, $dV$ accumulation;
+more complex dependence graph than forward;
+higher memory pressure (three gradient matrices
+co-resident).
+Tests scheduling constraint system scalability.
+Expert baselines from~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+\textbf{B3: Dense GEMM.}
+$C = A \cdot B$ with
+$M, N, K \in \{1024, 2048, 4096, 8192\}$;
+$\{$FP16, BF16, FP8, FP4$\}$ input types;
+FP16 and FP32 accumulation.
+Tests precision lattice $\mathcal{P}$
+conditioning~\cite{ARCH_BW},
+2CTA mode ($\texttt{num\_ctas} = 2$
+mandatory)~\cite{NV_BLOG_TILE}, and
+layout enumeration for the joint
+formulation~\cite{SEED_1}.
+
+\smallskip\noindent
+\textbf{B4: Mixed-Precision GEMM.}
+Input operands at different precisions
+(e.g., $A$ in FP8, $B$ in FP16);
+block scaling formats (MXFP4/MXFP8)
+\unverified{}.
+Tests precision-dependent layout space
+$\mathcal{L}(p)$~\cite{ARCH_BW, SEED_1}
+and heterogeneous cost vectors
+(gap~G8)~\cite{NV_workloads}.
+
+\smallskip\noindent
+\textbf{B5: Implicit GEMM Convolution.}
+2D convolution lowered to GEMM via im2col
+transformation;
+$C_{\mathrm{in}} \in \{64, 128, 256\}$,
+$C_{\mathrm{out}} \in \{128, 256, 512\}$,
+kernel sizes $\{1{\times}1, 3{\times}3\}$.
+Tests \tma{} im2col descriptor type
+(\texttt{idesc})~\cite{NV_BLOG_TILE},
+non-linear swizzle in \ISL{}
+representation~\cite{SEED_2}, and
+cache model generalisation (gap~G5).
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Benchmark Suite Coverage Matrix                          |
++===========================================================+
+|                                                           |
+|  Kernel    | BUTA Layers Exercised  | HARP Class   | 2CTA |
+|  ----------+------------------------+--------------+------+
+|  B1: FA Fwd| L + S + D + C          | mixed-reuse  | YES  |
+|  B2: FA Bwd| L + S + D + C          | mixed-reuse  | YES  |
+|  B3: GEMM  | L + S + D + (C)        | compute-bnd  | YES  |
+|  B4: MxGEMM| L + S + D              | mixed-reuse  | YES  |
+|  B5: Conv  | L + S + D + (C)        | mixed-reuse  | opt  |
+|  ----------+------------------------+--------------+------+
+|                                                           |
+|  Legend:                                                   |
+|    L = Layout Morphism Space [SEED_1, SEED_2, SEED_4]     |
+|    S = Schedule Constraint System [OPT_PIPE, ARCH_BW]     |
+|    D = Data Movement Relation [NV_BLOG_TILE, ARCH_BW]     |
+|    C = Cache Traffic Function [SEED_3, ARCH_BW]           |
+|    (C) = cache model applied but INFERENCE (gap G5)       |
+|    opt = optional; depends on kernel configuration        |
+|                                                           |
+|  Precision coverage:                                      |
+|    B1, B2: FP16, BF16  (primary: FP16)                    |
+|    B3:     FP16, BF16, FP8, FP4  [ARCH_BW]               |
+|    B4:     mixed FP8+FP16, MXFP4/MXFP8 [UNVERIFIED]     |
+|    B5:     FP16, FP8                                      |
+|                                                           |
+|  All benchmarks cite: ARCH_BW (hw params), OPT_PIPE       |
+|    (solver), NV_BLOG_TILE (Tile IR target)                |
++===========================================================+
+\end{BVerbatim}
+\caption{Benchmark suite coverage matrix.
+  Every kernel exercises the layout and scheduling
+  layers; cache traffic analysis is primary for
+  Flash Attention~\cite{SEED_3} and \inference{}
+  for GEMM/convolution (gap~G5).
+  The HARP taxonomy~\cite{NV_workloads} classifies
+  each kernel by workload type.
+  2CTA mode is required for all dense MMA
+  kernels~\cite{NV_BLOG_TILE}.}
+\label{fig:bench-coverage}
+\end{figure}
+
+
+\subsection{Platform Configuration}
+\label{sec:bench:platform}
+
+\begin{definition}[Hardware
+  Configurations~\cite{ARCH_BW, SEED_3}]
+\label{def:hw-config}
+All benchmarks execute on two platforms:
+
+\smallskip\noindent
+\textbf{Platform~A: NVIDIA B200} (cc\,10.0).
+148~SMs across 8~GPCs (dual-die NV-HBI);
+\SMEM{} 228\,KB/SM; \TMEM{} 256\,KB/SM;
+L2 $\approx 65$\,MB unified;
+HBM3e 192\,GB at 8\,TB/s;
+up to 64 concurrent warps per SM;
+4~warp schedulers per SM~\cite{ARCH_BW}.
+
+\smallskip\noindent
+\textbf{Platform~B: NVIDIA Grace-Blackwell GB10}
+(cc\,12.0).
+\SMEM{} 128\,KB/SM; \TMEM{} 256\,KB/SM;
+L2 $\approx 65$\,MB;
+up to 48 concurrent warps per SM~\cite{ARCH_BW}.
+SM count differs from B200; measured at
+runtime~\cite{SEED_3}.
+\end{definition}
+
+\begin{definition}[Software
+  Configuration~\cite{NV_BLOG_TILE}]
+\label{def:sw-config}
+Toolchain requirements:
+\begin{enumerate}[label=(\roman*)]
+  \item CUDA $\geq 13.1$~\cite{NV_BLOG_TILE}.
+  \item PTX $> 9.0$ (strict)~\cite{NV_BLOG_TILE}.
+  \item NVIDIA Nsight Compute for hardware performance
+    counters (L2 sector misses, SM active cycles,
+    tensor core utilisation).
+  \item SMT solver: Z3 $\geq 4.12$ or cvc5 $\geq 1.0$
+    for the constraint
+    system~\cite{OPT_PIPE}.
+  \item ILP solver: HiGHS, Gurobi, or CPLEX for
+    the initiation interval lower
+    bound~\cite{OPT_PIPE}.
+  \item \ISL{} library $\geq 0.26$ for layout
+    analysis~\cite{SEED_2}.
+\end{enumerate}
+Clock frequencies are locked to avoid DVFS artefacts.
+Each measurement is repeated $\geq 100$ times with
+warm-up; reported as median $\pm$ IQR
+(Part~3, \cref{def:meas-protocol}).
+\end{definition}
+
+
+\subsection{Metrics and Measurement Methodology}
+\label{sec:bench:metrics}
+
+\begin{definition}[Evaluation Metrics]
+\label{def:all-metrics}
+The evaluation reports six primary metrics per
+benchmark-platform pair:
+
+\smallskip\noindent
+(M1)~\textbf{Initiation interval} $\II_{\mathrm{sol}}$
+and ratio $\rho_{\II}$
+(\cref{def:sched-metric})~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+(M2)~\textbf{Throughput} $\Theta$ in TFLOPS
+(\cref{def:throughput-metric})~\cite{ARCH_BW}.
+
+\smallskip\noindent
+(M3)~\textbf{L2 miss prediction error}
+$\varepsilon_{\mathrm{miss}}$
+(\cref{def:cache-metric})~\cite{SEED_3}.
+
+\smallskip\noindent
+(M4)~\textbf{Layout verification pass rate}:
+fraction of test layouts correctly verified at each
+layer~\cite{SEED_1, SEED_2, SEED_4}.
+
+\smallskip\noindent
+(M5)~\textbf{Solve time} $t_{\mathrm{solve}}$ in
+seconds for the ILP+SMT
+pipeline~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+(M6)~\textbf{Data-race freedom}: count of
+well-formed token DAGs verified DRF by the procedure
+of Part~3, \cref{def:drf-verify}~\cite{NV_BLOG_TILE}.
+
+\smallskip\noindent
+Metrics M1--M3 require hardware execution; M4--M6 are
+computed offline from solver and verification
+outputs.
+\end{definition}
+
+
+% ====================================================================
+%  SECTION 19 — REPRODUCIBILITY PLAN
+% ====================================================================
+\section{Reproducibility Plan}
+\label{sec:repro}
+
+\subsection{Hardware and Toolchain Requirements}
+\label{sec:repro:hw}
+
+\begin{definition}[Minimum Reproduction
+  Configuration]
+\label{def:min-repro}
+Full reproduction of \BUTA{} evaluation results
+requires:
+\begin{enumerate}[label=(\roman*)]
+  \item At least one NVIDIA Blackwell GPU
+    (B200 or GB10)~\cite{ARCH_BW}.
+  \item CUDA Toolkit $\geq 13.1$ with
+    \TileIR{} support~\cite{NV_BLOG_TILE}.
+  \item PTX compiler targeting
+    $> 9.0$~\cite{NV_BLOG_TILE}.
+  \item Root or equivalent access for clock frequency
+    locking and Nsight Compute profiling.
+\end{enumerate}
+Solver-only evaluation (M1, M4--M6) requires no GPU:
+the ILP/SMT formulation can be validated on any
+machine with Z3 and the \ISL{}
+library~\cite{OPT_PIPE, SEED_2}.
+\end{definition}
+
+\begin{remark}
+Blackwell hardware availability may be constrained
+during the review period.
+We provide a \emph{solver-only} reproduction path
+that validates the constraint encodings, layout
+pipeline, and token DAG verification without hardware,
+and a \emph{full} reproduction path that additionally
+validates throughput and cache predictions on
+hardware.
+\end{remark}
+
+
+\subsection{Open-Source Release Plan}
+\label{sec:repro:release}
+
+\begin{definition}[Artifact
+  Components]
+\label{def:artifacts}
+The release comprises five components:
+
+\smallskip\noindent
+\textbf{A1: Solver implementation.}
+Python/C++ implementation of the ILP+SMT pipeline
+(Part~3, \cref{sec:solver}) with the 2CTA extension
+$\Phi_{\mathrm{2cta}}$~\cite{NV_BLOG_TILE, OPT_PIPE}
+and ZLP normalisation~\cite{OPT_PIPE}.
+Input: dependence graph $G$ and cost vector
+$\mathbf{c}(x)$.
+Output: schedule $(M, W, \II, \mathrm{cta})$.
+
+\smallskip\noindent
+\textbf{A2: Layout verification pipeline.}
+Three-layer pipeline implementation with $\Ftwo$
+library~\cite{SEED_1}, \ISL{} analysis
+module~\cite{SEED_2}, and categorical
+validation module extending the SEED\_4
+Python codebase~\cite{SEED_4}.
+Input: layout descriptor.
+Output: per-layer verification report.
+
+\smallskip\noindent
+\textbf{A3: Cache traffic analyser.}
+Reuse-distance computation engine and parameterised
+miss predictor~\cite{SEED_3} with
+Blackwell-specific platform parameters
+from~\cite{ARCH_BW}.
+Input: tile loop nest and ordering $\sigma$.
+Output: predicted miss count $\mathcal{C}(\sigma)$.
+
+\smallskip\noindent
+\textbf{A4: Calibration microbenchmark suite.}
+PTX-level microbenchmarks for \tcgen{}\texttt{.mma}
+latency, \TMEM{} bandwidth, \tma{} overhead, and L2
+characterisation (Part~3,
+\cref{sec:calibration})~\cite{ARCH_BW}.
+
+\smallskip\noindent
+\textbf{A5: Benchmark harness.}
+Automated execution of the benchmark suite
+(\cref{def:kernel-set}) with result collection,
+metric computation, and
+comparison~\cite{ARCH_BW, OPT_PIPE}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Artifact Package Structure                               |
++===========================================================+
+|                                                           |
+|  buta/                                                    |
+|  |-- solver/                                              |
+|  |   |-- ilp_encoder.py       # ILP Phase 1 [OPT_PIPE]   |
+|  |   |-- smt_encoder.py       # SMT Phase 2 [OPT_PIPE]   |
+|  |   |-- cta2_extension.py    # 2CTA [NV_BLOG_TILE]      |
+|  |   |-- zlp_normalise.py     # ZLP [OPT_PIPE]           |
+|  |   +-- cost_vectors/                                    |
+|  |       |-- blackwell_b200.json   # c(10.0) [ARCH_BW]   |
+|  |       +-- blackwell_gb10.json   # c(12.0) [ARCH_BW]   |
+|  |                                                        |
+|  |-- layout/                                              |
+|  |   |-- f2_library.py        # F2 ops [SEED_1]          |
+|  |   |-- isl_analysis.py      # ISL layer [SEED_2]       |
+|  |   |-- cat_validation.py    # Nest/Tuple [SEED_4]      |
+|  |   +-- pipeline.py          # 3-layer verifier          |
+|  |                                                        |
+|  |-- cache/                                               |
+|  |   |-- reuse_distance.py    # LRU stack [SEED_3]       |
+|  |   |-- miss_predictor.py    # C(sigma) [SEED_3]        |
+|  |   +-- ordering_opt.py      # sigma search [SEED_3]    |
+|  |                                                        |
+|  |-- calibration/                                         |
+|  |   |-- tcgen05_latency.cu   # MMA bench [ARCH_BW]      |
+|  |   |-- tmem_bandwidth.cu    # TMEM bench [ARCH_BW]     |
+|  |   |-- tma_overhead.cu      # TMA bench [NV_BLOG_TILE] |
+|  |   +-- l2_probe.cu          # L2 bench [ARCH_BW]       |
+|  |                                                        |
+|  |-- benchmarks/                                          |
+|  |   |-- flash_attn_fwd.py    # B1                        |
+|  |   |-- flash_attn_bwd.py    # B2                        |
+|  |   |-- dense_gemm.py        # B3                        |
+|  |   |-- mixed_gemm.py        # B4                        |
+|  |   +-- conv_igemm.py        # B5                        |
+|  |                                                        |
+|  +-- tests/                                               |
+|      |-- test_layouts.py      # CUTLASS test suite        |
+|      |-- test_invariants.py   # INV-* checks              |
+|      +-- test_token_dag.py    # DRF verification          |
++===========================================================+
+\end{BVerbatim}
+\caption{Artifact package structure.
+  Each module is anchored to its defining golden
+  source.
+  The solver-only path (no GPU required) exercises
+  \texttt{solver/}, \texttt{layout/},
+  \texttt{cache/}, and \texttt{tests/}.
+  Full evaluation additionally requires
+  \texttt{calibration/} and \texttt{benchmarks/}
+  on Blackwell hardware~\cite{ARCH_BW}.}
+\label{fig:artifact-structure}
+\end{figure}
+
+
+\subsection{Artifact Evaluation Criteria}
+\label{sec:repro:ae}
+
+\begin{criterion}[Artifact Badges]
+\label{crit:badges}
+The release targets three standard artifact evaluation
+badges:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Available}: all five components (A1--A5)
+    released under an open-source licence on a public
+    repository.
+  \item \textbf{Functional}: solver-only path executes
+    to completion on all benchmark dependence graphs,
+    produces valid schedules (invariants verified), and
+    layout pipeline passes all CUTLASS test
+    layouts~\cite{SEED_4}.
+  \item \textbf{Reproduced}: on Blackwell hardware, the
+    benchmark harness reproduces key results within
+    stated tolerances: $\rho_{\II} \leq 1.05$
+    (within 5\% of expert
+    $\II$)~\cite{OPT_PIPE};
+    $\varepsilon_{\mathrm{miss}} < 0.15$ for Tier~1
+    cache validation~\cite{SEED_3};
+    throughput $\Theta_{\mathrm{sol}} \geq 0.90 \cdot
+    \Theta_{\mathrm{expert}}$ for Flash
+    Attention~\cite{OPT_PIPE, ARCH_BW}.
+\end{enumerate}
+\end{criterion}
+
+
+% ====================================================================
+%  SECTION 20 — THREATS TO VALIDITY
+% ====================================================================
+\section{Threats to Validity}
+\label{sec:threats}
+
+\subsection{Internal Threats}
+\label{sec:threats:internal}
+
+\begin{definition}[Internal Threat
+  Enumeration]
+\label{def:internal-threats}
+The following factors may compromise the
+internal validity of \BUTA{} results:
+
+\smallskip\noindent
+\textbf{IT-1: Compiler maturity.}
+Jarmusch and Chandrasekaran~\cite{ARCH_BW} observe
+that Blackwell dense GEMM throughput lags Hopper by
+up to $4\times$, despite $1.56\times$ mixed-precision
+throughput gains.
+This is attributed to compiler maturity rather than
+architectural limitation~\cite{ARCH_BW}.
+If the baseline compiler improves substantially
+during the evaluation period, reported relative
+improvements may shrink.
+
+\smallskip\noindent
+\textbf{IT-2: Triton code generation.}
+Soi et al.~\cite{OPT_PIPE} identify instances where
+Triton makes incorrect code generation decisions.
+If solver-generated schedules are compiled via the
+Triton-to-\TileIR{} path~\cite{NV_BLOG_TILE},
+Triton-level errors may mask solver-level optimality.
+
+\smallskip\noindent
+\textbf{IT-3: Undocumented microarchitecture.}
+Certain Blackwell parameters are partially documented
+or derived from secondary analysis~\cite{ARCH_BW}:
+\TMEM{} bandwidth ($\approx$16/8~TB/s read/write per
+SM) is \unverified{};
+pipeline depth and cache interaction details are
+partially unknown~\cite{ARCH_BW}.
+Cost vector errors propagate to solver output.
+
+\smallskip\noindent
+\textbf{IT-4: \SMEM{} capacity divergence.}
+The \SMEM{} capacity differs between B200 (228\,KB,
+cc\,10.0) and GB10 (128\,KB,
+cc\,12.0)~\cite{ARCH_BW}.
+Benchmarks that saturate \SMEM{} on one platform may
+behave differently on the other, complicating
+cross-platform comparison.
+
+\smallskip\noindent
+\textbf{IT-5: ZLP rounding sensitivity.}
+The ZLP normalisation procedure
+(Part~3)~\cite{OPT_PIPE} introduces
+$|\hat{\II} - \II^{*}| \leq 1$ error.
+For kernels with very small $\II$, this rounding may
+dominate the schedule quality metric.
+\end{definition}
+
+
+\subsection{External Threats}
+\label{sec:threats:external}
+
+\begin{definition}[External Threat
+  Enumeration]
+\label{def:external-threats}
+Factors that may limit the generalisability of
+\BUTA{} results:
+
+\smallskip\noindent
+\textbf{ET-1: Workload diversity.}
+The benchmark suite (\cref{def:kernel-set}) covers
+five kernel families.
+Workloads with fundamentally different access
+patterns (e.g., sparse operators, sequence-to-sequence
+with variable-length batching) are not represented.
+The HARP taxonomy~\cite{NV_workloads} classifies
+additional workload types (cross-depth heterogeneous)
+that \BUTA{} does not target.
+
+\smallskip\noindent
+\textbf{ET-2: Architecture specificity.}
+\BUTA{} is defined exclusively for Blackwell
+(cc\,10.0, cc\,12.0)~\cite{ARCH_BW}.
+The model's applicability to future NVIDIA architectures
+or non-NVIDIA accelerators is not established.
+The \TileIR{} backend targets Blackwell
+only~\cite{NV_BLOG_TILE}.
+
+\smallskip\noindent
+\textbf{ET-3: Problem scale.}
+The ILP+SMT solver is validated on singly-nested
+tile loops~\cite{OPT_PIPE}.
+Workloads with deeply nested control flow, dynamic
+shapes, or conditional branching exceed the modelling
+scope.
+\end{definition}
+
+
+\subsection{Construct Threats}
+\label{sec:threats:construct}
+
+\begin{definition}[Construct Threat
+  Enumeration]
+\label{def:construct-threats}
+Threats arising from the modelling abstractions:
+
+\smallskip\noindent
+\textbf{CT-1: Singly-nested loop restriction.}
+The OPT\_PIPE formulation~\cite{OPT_PIPE} is
+restricted to singly-nested loops without additional
+control flow.
+Flash Attention's inner loop satisfies this
+constraint, but backward passes and fused kernels may
+violate it.
+
+\smallskip\noindent
+\textbf{CT-2: Token abstraction fidelity.}
+The \TileIR{} token model~\cite{NV_BLOG_TILE} is an
+abstraction of hardware memory ordering.
+If the abstraction is overly conservative (ordering
+more than necessary), the solver may produce
+sub-optimal schedules.
+If insufficiently conservative, data races may occur
+despite passing the DRF verifier.
+
+\smallskip\noindent
+\textbf{CT-3: Cache model simplification.}
+The reuse-distance model~\cite{SEED_3} assumes LRU
+replacement.
+Blackwell's L2 may use a different eviction policy;
+if so, the prediction error
+$\varepsilon_{\mathrm{miss}}$ may exceed stated
+bounds~\cite{ARCH_BW, SEED_3}.
+
+\smallskip\noindent
+\textbf{CT-4: $\texttt{num\_warps}$ abstraction.}
+\TileIR{} does not expose $\texttt{num\_warps}$ in
+CUDA~13.1~\cite{NV_BLOG_TILE};
+only an occupancy hint is available.
+The warp assignment $W(v)$ in $\mathcal{S}$ is
+therefore a logical mapping whose fidelity to physical
+scheduling depends on compiler
+behaviour \inference{}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Threat-to-Validity Summary Matrix                        |
++===========================================================+
+|                                                           |
+|  ID   | Category | Severity | Mitigation              |   |
+|  ------+----------+----------+-------------------------+  |
+|  IT-1 | Internal | HIGH     | Report compiler version; |  |
+|       |          |          | normalize against cuBLAS |  |
+|  IT-2 | Internal | MEDIUM   | Use PTX direct path;     |  |
+|       |          |          | bypass Triton where poss.|  |
+|  IT-3 | Internal | HIGH     | Calibrate; label UNVER.; |  |
+|       |          |          | sensitivity analysis     |  |
+|  IT-4 | Internal | MEDIUM   | Separate configs per cc  |  |
+|  IT-5 | Internal | LOW      | Report eps; use eps=0    |  |
+|       |          |          | for small-II kernels     |  |
+|  ------+----------+----------+-------------------------+  |
+|  ET-1 | External | MEDIUM   | Extend suite post-publ.  |  |
+|  ET-2 | External | LOW      | Scope clearly stated     |  |
+|  ET-3 | External | MEDIUM   | Characterize solver fail |  |
+|  ------+----------+----------+-------------------------+  |
+|  CT-1 | Constr.  | HIGH     | Mark multi-nest INFER.   |  |
+|  CT-2 | Constr.  | MEDIUM   | Validate DRF on hardware |  |
+|  CT-3 | Constr.  | MEDIUM   | Measure eviction policy  |  |
+|  CT-4 | Constr.  | LOW      | Occupancy hint sweep     |  |
+|  ------+----------+----------+-------------------------+  |
+|                                                           |
+|  Sources anchoring threat identification:                 |
+|    IT-1, IT-3, IT-4: ARCH_BW                              |
+|    IT-2, CT-1:       OPT_PIPE                             |
+|    CT-2, CT-4:       NV_BLOG_TILE                         |
+|    ET-1:             NV_workloads                          |
+|    CT-3:             SEED_3, ARCH_BW                       |
++===========================================================+
+\end{BVerbatim}
+\caption{Threat-to-validity summary with severity
+  ranking and primary mitigation strategy.
+  HIGH-severity threats (IT-1, IT-3, CT-1)
+  require active mitigation in the evaluation
+  design.}
+\label{fig:threat-matrix}
+\end{figure}
+
+
+% ====================================================================
+%  SECTION 21 — KNOWN LIMITATIONS
+% ====================================================================
+\section{Known Limitations}
+\label{sec:limitations}
+
+This section enumerates the theoretical and practical
+boundaries of the \BUTA{} model as defined in
+Parts~1--3.
+Each limitation is traced to a specific golden source
+and, where applicable, linked to a gap (G1--G9).
+
+\subsection{Scheduling Scope Limitations}
+\label{sec:limitations:sched}
+
+\begin{definition}[Scheduling
+  Limitations~\cite{OPT_PIPE}]
+\label{def:sched-limits}
+The schedule constraint system $\mathcal{S}$
+(Part~2) inherits the following restrictions from the
+OPT\_PIPE formulation:
+\begin{enumerate}[label=(SL-\arabic*)]
+  \item \textbf{Singly-nested loops only.}
+    The ILP+SMT formulation models one software-pipelined
+    loop body with a single initiation
+    interval~$\II$~\cite{OPT_PIPE}.
+    Multiply-nested tile loops (e.g., outer tiling
+    over batch/head dimensions in multi-head attention)
+    require hierarchical scheduling not supported by
+    the current model.
+  \item \textbf{Orthogonal optimisations excluded.}
+    Memory layout selection and register allocation are
+    not handled within $\mathcal{S}$;
+    they are treated as independent pre-decisions or
+    addressed by the joint formulation (gap~G4, Part~3,
+    \cref{sec:solver:joint}), which is
+    \inference{} and not yet
+    validated~\cite{OPT_PIPE}.
+  \item \textbf{Fixed dependence graph.}
+    The graph $G = (V, E)$ is constructed statically
+    from the tile loop body.
+    Data-dependent control flow (e.g., conditional
+    masking, early exit) cannot be modelled as
+    static dependencies~\cite{OPT_PIPE}.
+\end{enumerate}
+\end{definition}
+
+
+\subsection{Layout Representation Scope Limitations}
+\label{sec:limitations:layout}
+
+\begin{definition}[Layout
+  Limitations~\cite{SEED_1, SEED_2, SEED_4}]
+\label{def:layout-limits}
+The layout morphism space $\mathcal{L}$ (Part~2)
+has three inherent boundaries:
+\begin{enumerate}[label=(LL-\arabic*)]
+  \item \textbf{$\Ftwo$ linearity restriction.}
+    Non-linear swizzle patterns (XOR-based bank-conflict
+    avoidance) are not representable as $\Ftwo$
+    matrices~\cite{SEED_1}.
+    The efficient computational path
+    $\mathcal{L}^{\Ftwo}$ is unavailable for such
+    patterns; the \ISL{} layer is
+    required~\cite{SEED_2}.
+  \item \textbf{Tractable layout subset.}
+    The categorical characterisation~\cite{SEED_4}
+    defines a strict subset of all possible layouts
+    as ``tractable.''
+    Layouts that are not decomposable into
+    $\mathbf{Nest}$ morphisms cannot be verified at
+    Layer~3 of the pipeline; their correctness
+    relies on the \ISL{} layer alone.
+  \item \textbf{Unestablished embeddings.}
+    The embedding $\phi$ (PO-1, gap~G1) and functor
+    $F$ (PO-2, gap~G2) are \inference{} constructs
+    whose correctness has not been formally
+    proved~\cite{SEED_1, SEED_2, SEED_4}.
+    Until established, cross-layer layout verification
+    carries residual uncertainty.
+  \item \textbf{FP4/FP6 layouts uncharacterised.}
+    Precision-specific layout spaces for FP4 and FP6
+    are not documented in the golden sources;
+    the valid tile shapes and swizzle patterns for
+    these precisions are \unverified{}
+    (gap~G8)~\cite{ARCH_BW, SEED_1}.
+\end{enumerate}
+\end{definition}
+
+
+\subsection{Cache Model Scope Limitations}
+\label{sec:limitations:cache}
+
+\begin{definition}[Cache Model
+  Limitations~\cite{SEED_3}]
+\label{def:cache-limits}
+The cache traffic function $\mathcal{C}$
+(Part~2) has the following scope boundaries:
+\begin{enumerate}[label=(CL-\arabic*)]
+  \item \textbf{Flash Attention-only validation.}
+    The reuse-distance model has been validated
+    exclusively for Flash Attention on GB10
+    (cc\,12.0, 128\,KB \SMEM{})~\cite{SEED_3}.
+    All claims for GEMM, convolution, or B200 are
+    \inference{} (gap~G5).
+  \item \textbf{L1 excluded for streaming.}
+    The model treats L1 as negligible for
+    streaming tile
+    patterns~\cite{SEED_3}.
+    For non-streaming patterns where tile reuse is
+    significant (e.g., GEMM with large tiles), L1 may
+    contribute meaningfully; the model does not
+    capture this.
+  \item \textbf{LRU assumption.}
+    The reuse-distance formalism~\cite{SEED_3}
+    assumes LRU replacement.
+    Actual Blackwell L2 eviction policy is not fully
+    documented~\cite{ARCH_BW};
+    deviation from LRU degrades prediction accuracy.
+  \item \textbf{Tropical semiring \inference{}.}
+    The $(\min, +)$ semiring structure on
+    $\mathcal{C}$ (Part~2) is not established in the
+    golden sources.
+    Its validity depends on the assumption of
+    independent data footprints between composed tile
+    programs; shared footprints break additive
+    decomposition.
+\end{enumerate}
+\end{definition}
+
+
+\subsection{Platform and Toolchain Scope}
+\label{sec:limitations:platform}
+
+\begin{definition}[Platform
+  Limitations~\cite{NV_BLOG_TILE, ARCH_BW}]
+\label{def:platform-limits}
+\begin{enumerate}[label=(PL-\arabic*)]
+  \item \textbf{Blackwell-only.}
+    \TileIR{} targets only compute capability
+    10.x and 12.x~\cite{NV_BLOG_TILE}.
+    The entire \BUTA{} model---seven objects and all
+    invariants---is parameterised by Blackwell-specific
+    constants.
+    Extension to other architectures (Hopper, future
+    generations) requires re-parameterisation at minimum
+    and potentially structural changes.
+  \item \textbf{$\texttt{num\_warps}$ not exposed.}
+    The \TileIR{} backend in CUDA~13.1 does not expose
+    $\texttt{num\_warps}$~\cite{NV_BLOG_TILE}.
+    The warp assignment $W(v)$ is a logical construct
+    within $\mathcal{S}$; its mapping to physical
+    resources is compiler-mediated.
+  \item \textbf{Register spilling.}
+    Large reduction dimensions may cause register
+    spilling in the \TileIR{}
+    backend~\cite{NV_BLOG_TILE}.
+    The scheduling model does not account for spill
+    costs, which may degrade actual performance
+    relative to solver-predicted $\II$.
+  \item \textbf{Small-GEMM performance.}
+    Small GEMM performance on the \TileIR{} backend
+    is reported as poor~\cite{NV_BLOG_TILE};
+    not all Triton operations are implemented.
+    Benchmarks at small problem sizes may not reflect
+    the model's capabilities.
+\end{enumerate}
+\end{definition}
+
+
+% ====================================================================
+%  SECTION 22 — RISK ASSESSMENT AND MITIGATION
+% ====================================================================
+\section{Risk Assessment and Mitigation}
+\label{sec:risk}
+
+This section provides a severity-ranked assessment of
+the nine identified gaps (G1--G9) and defines a phased
+mitigation timeline.
+
+\subsection{Gap Severity Ranking}
+\label{sec:risk:ranking}
+
+\begin{definition}[Severity
+  Classification]
+\label{def:severity}
+Each gap is assigned a severity level based on two
+dimensions: (i)~\emph{impact on model soundness}
+(whether the gap invalidates a proof obligation or
+invariant) and (ii)~\emph{feasibility of resolution}
+(whether the gap is resolvable with available tools
+and hardware).
+The classification uses three levels:
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Critical}: gap blocks one or more
+    proof obligations;
+    model soundness is conditional on resolution.
+  \item \textbf{Major}: gap limits model applicability
+    or accuracy for specific workloads/configurations;
+    core model remains sound.
+  \item \textbf{Minor}: gap affects peripheral model
+    features or calibration precision; core results
+    are not sensitive to resolution.
+\end{enumerate}
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Gap Severity Ranking                                     |
++===========================================================+
+|                                                           |
+|  Gap  | Severity  | Blocks PO | Sources            | Ph  |
+|  ------+-----------+-----------+--------------------+-----+
+|  G1   | CRITICAL  | PO-1,PO-6 | SEED_1, SEED_2     | P1  |
+|  G2   | CRITICAL  | PO-2,PO-6 | SEED_4, SEED_2     | P1  |
+|  G7   | CRITICAL  | PO-5,PO-6 | NV_BLOG_TILE,      | P1  |
+|       |           |           | OPT_PIPE           |     |
+|  ------+-----------+-----------+--------------------+-----+
+|  G3   | MAJOR     | (PO-3)    | ARCH_BW,           | P2  |
+|       |           |           | NV_BLOG_TILE       |     |
+|  G4   | MAJOR     | ---       | OPT_PIPE, SEED_1,  | P2  |
+|       |           |           | SEED_2, ARCH_BW    |     |
+|  G5   | MAJOR     | PO-4      | SEED_3, ARCH_BW,   | P2  |
+|       |           |           | NV_workloads       |     |
+|  G6   | MAJOR     | PO-3      | NV_BLOG_TILE,      | P2  |
+|       |           |           | OPT_PIPE, ARCH_BW  |     |
+|  ------+-----------+-----------+--------------------+-----+
+|  G8   | MINOR     | ---       | ARCH_BW, SEED_1,   | P3  |
+|       |           |           | NV_BLOG_TILE       |     |
+|  G9   | MINOR     | ---       | OPT_PIPE, ARCH_BW  | P3  |
+|  ------+-----------+-----------+--------------------+-----+
+|                                                           |
+|  PO dependency:                                           |
+|    PO-6 (end-to-end) requires PO-1..PO-5                  |
+|    G1 -> PO-1 -> PO-6    [layout foundation]              |
+|    G2 -> PO-2 -> PO-6    [layout foundation]              |
+|    G7 -> PO-5 -> PO-6    [memory ordering]                |
+|    G5 -> PO-4             [cache fidelity]                |
+|    G6 -> PO-3             [schedule soundness]            |
+|                                                           |
+|  Ph = Phase assignment (P1 = months 1-3, P2 = 4-8,       |
+|                         P3 = 9-12)                        |
++===========================================================+
+\end{BVerbatim}
+\caption{Gap severity ranking with proof obligation
+  dependencies.
+  Critical gaps (G1, G2, G7) block the capstone
+  proof obligation PO-6 and must be resolved in
+  Phase~1.
+  Major gaps (G3--G6) affect model applicability.
+  Minor gaps (G8, G9) affect calibration precision.}
+\label{fig:gap-ranking}
+\end{figure}
+
+
+\subsection{Mitigation Timeline}
+\label{sec:risk:timeline}
+
+\begin{definition}[Phased Mitigation Plan]
+\label{def:mitigation-plan}
+The nine gaps are resolved in three phases aligned
+with proof obligation dependencies:
+
+\smallskip\noindent
+\textbf{Phase~1 (Months 1--3): Foundation.}
+Resolve the three critical gaps that block PO-6:
+\begin{enumerate}[label=(P1.\arabic*)]
+  \item \textbf{G1} ($\Ftwo \to \ISL{}$ embedding):
+    constructive proof of $\phi$ injectivity and
+    composition preservation using \ISL{} library
+    automated verification on all Triton test
+    layouts~\cite{SEED_1, SEED_2}.
+    Deliverable: formal proof document and
+    \ISL{}-based checker (artifact~A2).
+  \item \textbf{G2} ($\mathbf{Nest} \to \ISL{}$
+    functor):
+    define $F$ on objects and morphisms;
+    extend SEED\_4 Python codebase~\cite{SEED_4} to
+    emit \ISL{} relations;
+    validate against CUTLASS test suite and Algorithm~1
+    of~\cite{SEED_2}.
+    Deliverable: functor implementation and
+    compatibility test suite.
+  \item \textbf{G7} (token ordering integration):
+    formalise token DAG as additional edges in
+    $G$~\cite{NV_BLOG_TILE, OPT_PIPE};
+    implement DRF verifier (Part~3,
+    \cref{def:drf-verify});
+    encode in SMT formulation.
+    Deliverable: token-augmented solver (artifact~A1).
+\end{enumerate}
+
+\smallskip\noindent
+\textbf{Phase~2 (Months 4--8): Breadth.}
+Resolve the four major gaps that affect model
+applicability:
+\begin{enumerate}[label=(P2.\arabic*)]
+  \item \textbf{G3} (\TMEM{} lifecycle model):
+    formalise state machine
+    (Part~2, \cref{def:tmem-lifecycle}) as resource
+    constraint in solver;
+    calibrate allocation latency via
+    microbenchmarks~\cite{ARCH_BW}.
+    Deliverable: \TMEM{}-aware solver extension.
+  \item \textbf{G4} (joint layout-schedule):
+    implement enumeration strategy (Part~3,
+    \cref{def:joint-formulation}) for $\Ftwo$ linear
+    layouts~\cite{SEED_1};
+    benchmark against separate optimisation.
+    Deliverable: joint solver module (artifact~A1).
+  \item \textbf{G5} (generalised cache model):
+    extend reuse-distance model~\cite{SEED_3} to
+    dense GEMM with workload
+    classification~\cite{NV_workloads};
+    calibrate on B200 ($C_{\mathrm{L2}} \approx 65$\,MB,
+    228\,KB \SMEM{})~\cite{ARCH_BW}.
+    Deliverable: parameterised cache analyser
+    (artifact~A3).
+  \item \textbf{G6} (2CTA scheduling):
+    implement $\Phi_{\mathrm{2cta}}$ extension
+    (Part~3, \cref{def:2cta-clauses})~\cite{NV_BLOG_TILE};
+    microbenchmark TPC-internal sync
+    latency~\cite{ARCH_BW};
+    validate on Flash Attention with 2CTA.
+    Deliverable: 2CTA-capable solver.
+\end{enumerate}
+
+\smallskip\noindent
+\textbf{Phase~3 (Months 9--12): Precision.}
+Resolve the two minor gaps that refine calibration:
+\begin{enumerate}[label=(P3.\arabic*)]
+  \item \textbf{G8} (precision-dependent layouts):
+    empirical characterisation of FP4/FP6 layout
+    requirements via \tcgen{} microbenchmarks on
+    B200~\cite{ARCH_BW};
+    extend $\mathcal{L}(p)$ with validated
+    constraints~\cite{SEED_1}.
+    Deliverable: precision-parameterised layout library.
+  \item \textbf{G9} (calibrated cost vector):
+    full cost table
+    $\mathbf{c}(\mathrm{op}, p, T)$ for all
+    precisions and tile sizes via PTX microbenchmark
+    suite~\cite{ARCH_BW};
+    ZLP normalisation validated~\cite{OPT_PIPE}.
+    Deliverable: calibrated cost vectors
+    (artifact~A4 data).
+\end{enumerate}
+\end{definition}
+
+
+\subsection{Contingency Plans}
+\label{sec:risk:contingency}
+
+\begin{definition}[Contingency Strategies]
+\label{def:contingency}
+For each severity class, a fallback strategy is
+defined:
+
+\smallskip\noindent
+\textbf{Critical gap failure.}
+If any of G1, G2, or G7 proves intractable:
+\begin{enumerate}[label=(\alph*)]
+  \item For G1/G2: reduce the layout hierarchy to a
+    two-layer system ($\Ftwo$ + \ISL{} without
+    categorical verification).
+    The model loses the semantic foundation
+    of~\cite{SEED_4} but retains operational
+    correctness via the \ISL{} layer~\cite{SEED_2}.
+    PO-6 is weakened to a two-layer simulation.
+  \item For G7: treat token ordering as
+    \emph{pre-validated} by the \TileIR{} compiler
+    rather than verified within $\mathcal{S}$.
+    PO-5 is replaced by a trust assumption on the
+    \TileIR{} memory model~\cite{NV_BLOG_TILE}.
+\end{enumerate}
+
+\smallskip\noindent
+\textbf{Major gap failure.}
+If G5 (cache generalisation) fails: restrict
+$\mathcal{C}$ applicability to Flash Attention
+(per~\cite{SEED_3}); report GEMM/convolution
+cache predictions as \unverified{}.
+If G6 (2CTA) fails: restrict solver to single-CTA
+mode; report 2CTA results using expert baselines
+only~\cite{NV_BLOG_TILE}.
+
+\smallskip\noindent
+\textbf{Minor gap failure.}
+If G8/G9 (FP4/FP6 layouts, full cost table) fail:
+restrict benchmarks to FP16/BF16/FP8 precisions for
+which calibration data exists~\cite{ARCH_BW};
+FP4/FP6 results labelled \unverified{}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Mitigation Timeline (12-month plan)                      |
++===========================================================+
+|                                                           |
+|  Month: 1   2   3   4   5   6   7   8   9  10  11  12    |
+|         |----PHASE 1----|----PHASE 2--------|--PHASE 3-|  |
+|                                                           |
+|  G1 (F2->ISL) :  [=====]                                  |
+|    PO-1 proof      ^                                      |
+|                                                           |
+|  G2 (Cat->ISL):  [=====]                                  |
+|    PO-2 proof      ^                                      |
+|                                                           |
+|  G7 (Tokens)  :  [=====]                                  |
+|    PO-5 proof      ^                                      |
+|                                                           |
+|  G3 (TMEM)    :           [========]                      |
+|    Calibrate               ^                              |
+|                                                           |
+|  G4 (Joint)   :           [========]                      |
+|    Solver ext              ^                              |
+|                                                           |
+|  G5 (Cache)   :           [===========]                   |
+|    PO-4 valid              ^                              |
+|                                                           |
+|  G6 (2CTA)    :           [========]                      |
+|    PO-3 valid              ^                              |
+|                                                           |
+|  G8 (Prec.)   :                          [======]         |
+|    FP4/FP6 char.                          ^               |
+|                                                           |
+|  G9 (Costs)   :                          [======]         |
+|    Full cost tbl                          ^               |
+|                                                           |
+|  PO-6 (E2E)   :                                [===]     |
+|    Capstone                                      ^        |
+|                                                           |
+|  Milestones:                                              |
+|    M3:  All critical gaps resolved; PO-1,2,5 proved       |
+|    M8:  All major gaps resolved; PO-3,4 validated         |
+|    M12: Full model validated; PO-6 established            |
+|         Artifact release with all benchmarks              |
++===========================================================+
+\end{BVerbatim}
+\caption{Twelve-month mitigation timeline.
+  Critical gaps (G1, G2, G7) are resolved in
+  Phase~1 (months~1--3) to establish the
+  foundational proof obligations.
+  Major gaps (G3--G6) are resolved in Phase~2
+  (months~4--8).
+  Minor gaps (G8, G9) and the capstone PO-6 are
+  completed in Phase~3 (months~9--12).}
+\label{fig:timeline}
+\end{figure}
+
+
+\subsection{Risk-Adjusted Confidence Assessment}
+\label{sec:risk:confidence}
+
+\begin{proposition}[Model Viability
+  Assessment \inference{}]
+\label{prop:viability}
+The \BUTA{} model is viable under the following
+conditions, each linked to gap resolution and
+evidence from the golden sources:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Layout foundation} (G1, G2):
+    the constructive nature of both $\phi$ and $F$
+    (domain-restricted \ISL{} relations over binary
+    or natural-number domains) makes formal proofs
+    tractable using existing \ISL{} library
+    capabilities~\cite{SEED_1, SEED_2, SEED_4}.
+    Risk: \textbf{LOW}.
+  \item \emph{Scheduling optimality} (G6, G9):
+    the Twill system~\cite{OPT_PIPE} demonstrates
+    that ILP+SMT solvers rediscover expert schedules
+    on Blackwell, establishing the approach's
+    feasibility.
+    The 2CTA extension adds complexity but preserves
+    the core SAT+ILP structure.
+    MMA latency constancy~\cite{ARCH_BW} simplifies
+    cost calibration.
+    Risk: \textbf{LOW-MEDIUM}.
+  \item \emph{Cache model generalisation} (G5):
+    the SEED\_3 model is validated for one workload
+    on one platform~\cite{SEED_3}.
+    Generalisation is the highest-uncertainty
+    component: non-streaming patterns may require
+    fundamentally different modelling.
+    The HARP taxonomy~\cite{NV_workloads} provides
+    structural guidance for pattern-specific
+    sub-models.
+    Risk: \textbf{MEDIUM-HIGH}.
+  \item \emph{Token ordering} (G7):
+    the \TileIR{} memory model~\cite{NV_BLOG_TILE}
+    is well-defined as a partial order;
+    encoding as dependency edges in the SMT
+    formulation is a direct extension of
+    existing techniques~\cite{OPT_PIPE}.
+    Risk: \textbf{LOW}.
+  \item \emph{TMEM lifecycle} (G3):
+    partially documented~\cite{ARCH_BW};
+    microbenchmark calibration is required.
+    Risk: \textbf{MEDIUM} (documentation-dependent).
+\end{enumerate}
+\end{proposition}
+
+
+% ====================================================================
+%  SECTION 23 — CONCLUSION
+% ====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+This four-part proposal has defined the Blackwell
+Unified Tile Algebra (\BUTA{}): a compositional formal
+model that jointly captures layout transformations as
+algebraic morphisms (grounded in the $\Ftwo$ binary
+matrix formalism of~\cite{SEED_1}, the \ISL{}
+quasi-affine relations of~\cite{SEED_2}, and the
+categorical foundations of~\cite{SEED_4}); pipeline
+scheduling as constraint optimisation (extending the
+ILP+SMT formulation of~\cite{OPT_PIPE} with
+Blackwell-specific parameterisation
+from~\cite{ARCH_BW} and 2CTA constraints
+from~\cite{NV_BLOG_TILE}); data movement as
+token-ordered descriptor relations (formalising the
+\TileIR{} memory model of~\cite{NV_BLOG_TILE} over
+the Blackwell memory hierarchy
+of~\cite{ARCH_BW}); and cache traffic as analytic
+reuse models (building on the reuse-distance formalism
+of~\cite{SEED_3} with workload classification
+from~\cite{NV_workloads}).
+
+The model comprises seven mathematical objects whose
+composition is governed by 18~invariants
+(INV-L1--L4, INV-D1--D4, INV-S1--S5, INV-T1--T4),
+three objective functions (OBJ-1--OBJ-3), and six
+proof obligations (PO-1--PO-6).
+Nine research gaps (G1--G9) have been identified,
+severity-ranked, and assigned to a three-phase
+mitigation timeline.
+The evaluation strategy validates the model against
+expert baselines from~\cite{OPT_PIPE}, hardware
+measurements on B200 and GB10~\cite{ARCH_BW, SEED_3},
+and ground-truth layout libraries
+from~\cite{SEED_1, SEED_2, SEED_4}.
+
+The core question posed in Part~1---whether a
+compositional formal model can jointly capture layout
+algebra, scheduling, data movement, and cache traffic
+for Blackwell while preserving semantic
+correctness---has been answered affirmatively at the
+specification level.
+The constructive components (solver encodings, layout
+pipeline, cache analyser, calibration plan) have been
+defined with sufficient precision for implementation.
+The proof obligations establish the formal agenda that
+must be discharged for soundness; the contingency
+plans ensure that partial resolution still yields a
+useful, if reduced, model.
+
+
+% ====================================================================
+%  SUMMARY
+% ====================================================================
+\section*{Part~4 Summary}
+
+This final part has defined the evaluation strategy
+(\cref{sec:eval}) with three validation axes:
+solver output vs.\ expert schedules~\cite{OPT_PIPE},
+cache model fidelity~\cite{SEED_3, ARCH_BW}, and
+layout correctness~\cite{SEED_1, SEED_2, SEED_4}.
+The benchmark suite (\cref{sec:bench}) comprises five
+kernel families covering mixed-reuse, compute-bound,
+and memory-bound workloads~\cite{NV_workloads} on
+both B200 and GB10~\cite{ARCH_BW}.
+The reproducibility plan (\cref{sec:repro}) defines
+five artifact components, a solver-only reproduction
+path, and artifact evaluation
+criteria~\cite{OPT_PIPE, NV_BLOG_TILE}.
+Threats to validity (\cref{sec:threats}) enumerate
+eleven factors across internal, external, and
+construct categories, with mitigations anchored to
+specific golden sources~\cite{ARCH_BW, OPT_PIPE,
+NV_BLOG_TILE, SEED_3, NV_workloads}.
+Known limitations (\cref{sec:limitations}) trace
+twelve model boundaries to the golden
+sources~\cite{OPT_PIPE, SEED_1, SEED_2, SEED_3,
+SEED_4, NV_BLOG_TILE, ARCH_BW}.
+The risk assessment (\cref{sec:risk}) severity-ranks
+nine gaps, assigns them to a twelve-month phased
+timeline, and defines contingency strategies for
+each severity class.
+
+Across all four parts, every non-trivial claim has been
+cited to one of the eight golden sources; claims
+derived by logical composition of source-grounded
+constructs are marked \inference{}; claims not
+supported by the sources are marked \unverified{}.
+
+
+% ====================================================================
+%  SOURCE AUDIT
+% ====================================================================
+\section*{Source Audit (Part~4)}
+\label{sec:audit-p4}
+
+\noindent
+All eight golden sources are cited in this part.
+\Cref{tab:audit-p4} records usage.
+
+\begin{table}[H]
+\centering
+\caption{Part~4 source audit: usage and anchors.}
+\label{tab:audit-p4}
+\footnotesize
+\begin{tabular}{@{}p{1.3cm}p{6.0cm}@{}}
+\toprule
+\textbf{ID} & \textbf{Used for (anchor)} \\
+\midrule
+ARCH\_BW &
+  Platform configuration (B200 148~SMs, 228\,KB \SMEM{},
+  \TMEM{} 256\,KB, L2 ${\sim}$65\,MB;
+  GB10 128\,KB \SMEM{}, 48 warps);
+  throughput metric baseline; dense GEMM lag ($4\times$)
+  as threat IT-1; 58\% cache-miss latency reduction;
+  undocumented microarchitecture (IT-3);
+  precision lattice FP4/FP6 (gap G8);
+  cost vector calibration (gap G9);
+  cross-platform parameterisation;
+  benchmark hardware anchor. \\
+\addlinespace
+OPT\_PIPE &
+  Schedule quality metric ($\II$ ratio); Twill
+  rediscovery as baseline; cross-generation schedule
+  distinction; solve time prediction ($< 60$\,s);
+  singly-nested loop limitation (SL-1, CT-1);
+  orthogonal optimisation exclusion (SL-2);
+  Triton code generation issues (IT-2);
+  ILP+SMT solver requirements;
+  ZLP rounding sensitivity (IT-5);
+  solver artifact specification;
+  gap G4 joint layout-schedule;
+  gap G6 2CTA extension anchor;
+  gap G9 cost calibration anchor. \\
+\addlinespace
+NV\_BLOG\_ TILE &
+  \TileIR{} compilation target; 2CTA
+  (\texttt{num\_ctas=2}) in evaluation;
+  Triton-to-\TileIR{} baseline comparison;
+  $\texttt{num\_warps}$ limitation (CT-4, PL-2);
+  register spilling (PL-3);
+  small-GEMM performance (PL-4);
+  CUDA $\geq 13.1$ / PTX $> 9.0$ requirements;
+  token ordering (CT-2); \tma{} descriptor types
+  (im2col for convolution benchmark B5);
+  Blackwell-only scope (ET-2, PL-1);
+  gap G7 token integration anchor. \\
+\addlinespace
+NV\_work\-loads &
+  Benchmark kernel HARP classification (mixed-reuse,
+  compute-bound);
+  external threat ET-1 (workload diversity);
+  cache model Tier~3 classification;
+  mixed-precision workload characterisation (B4);
+  gap G5 generalisation guidance;
+  workload descriptor conditioning. \\
+\addlinespace
+SEED\_1 &
+  Layout verification criterion (a): $\Ftwo$ layer
+  testing against Triton test suite;
+  linearity restriction (LL-1);
+  FP4/FP6 layout gap (LL-4, G8);
+  layout enumeration for joint solver (G4);
+  artifact A2 $\Ftwo$ library;
+  gap G1 mitigation (Phase~1). \\
+\addlinespace
+SEED\_2 &
+  Layout verification criterion (b): \ISL{} layer
+  testing via Algorithm~1;
+  swizzle representation for convolution (B5);
+  cross-layer consistency ($\phi$ validation);
+  artifact A2 \ISL{} module;
+  gap G1 target representation;
+  gap G2 cross-validation source. \\
+\addlinespace
+SEED\_3 &
+  Cache validation Tiers~1--3 (67\% miss reduction
+  reproduction, cross-platform, generalisation);
+  miss prediction error metric $\varepsilon_{\mathrm{miss}}$;
+  Flash Attention-only limitation (CL-1);
+  L1 negligible for streaming (CL-2);
+  LRU assumption (CL-3);
+  artifact A3 cache analyser;
+  gap G5 anchor;
+  GB10 platform anchor. \\
+\addlinespace
+SEED\_4 &
+  Layout verification criterion (c): categorical
+  tractability check against CUTLASS test suite;
+  tractable layout subset limitation (LL-2);
+  functor $F$ gap G2 (Phase~1 mitigation);
+  artifact A2 categorical module;
+  cross-layer consistency ($F$ validation). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ====================================================================
+%  BIBLIOGRAPHY
+% ====================================================================
+\begin{thebibliography}{8}
+
+\bibitem{ARCH_BW}
+A.~Jarmusch and S.~Chandrasekaran,
+``Microbenchmarking NVIDIA's Blackwell Architecture:
+An In-Depth Architectural Analysis,''
+\emph{arXiv:2512.02189v1}, Dec.~2025.
+\url{https://arxiv.org/html/2512.02189v1}
+
+\bibitem{OPT_PIPE}
+K.~Soi, A.~Venkat, T.~Nowicki, and
+G.~Biros,
+``Optimal Software Pipelining and Warp
+Specialization for Tensor Core GPUs,''
+\emph{arXiv:2512.18134v1}, Dec.~2025.
+\url{https://arxiv.org/html/2512.18134v1}
+
+\bibitem{NV_BLOG_TILE}
+NVIDIA,
+``Advancing GPU Programming with the CUDA Tile IR
+Backend for OpenAI Triton,''
+\emph{NVIDIA Developer Blog}, Jan.~2026.
+\url{https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/}
+
+\bibitem{NV_workloads}
+S.~Garg, M.~Pellauer, and T.~Krishna,
+``HARP: A Taxonomy for Heterogeneous and
+Hierarchical Processors for Mixed-Reuse Workloads,''
+\emph{arXiv:2502.13113}, Feb.~2025.
+\url{https://arxiv.org/html/2502.13113}
+
+\bibitem{SEED_1}
+J.~Zhou, M.~Lezcano, A.~Goucher, et~al.,
+``Linear Layouts: Robust Code Generation of Efficient
+Tensor Computation Using $\mathbb{F}_2$,''
+\emph{arXiv:2505.23819v3}, Oct.~2025.
+\url{https://arxiv.org/html/2505.23819v3}
+
+\bibitem{SEED_2}
+S.~Bhaskaracharya, N.~Acharya, M.~Hagedorn,
+and S.~Grover,
+``Modeling Layout Abstractions Using Integer Set
+Relations,''
+\emph{arXiv:2511.10374v1}, Nov.~2025.
+\url{https://arxiv.org/html/2511.10374v1}
+
+\bibitem{SEED_3}
+Z.~Zhu, J.~Pan, and Y.~Ding,
+``Sawtooth Wavefront Reordering: Enhanced CuTile
+FlashAttention on NVIDIA GB10,''
+\emph{arXiv:2601.16032v2}, Jan.~2026.
+\url{https://arxiv.org/html/2601.16032v2}
+
+\bibitem{SEED_4}
+R.~Carlisle, A.~Shah, H.~Stern, and
+D.~VanKoughnett,
+``Categorical Foundations for CuTe Layouts,''
+\emph{arXiv:2601.05972v1}, Jan.~2026.
+\url{https://arxiv.org/pdf/2601.05972v1}
+
+\end{thebibliography}
+
+\end{document}

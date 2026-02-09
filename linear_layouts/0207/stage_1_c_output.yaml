@@ -1,0 +1,789 @@
+context_pack_version: "S1.v2"
+generated_at_utc: "2026-02-06T00:00:00Z"
+
+project_profile:
+  objective: "Develop a theory-first formal model to evaluate and solve Blackwell GPU architecture problems under CUDA>13 and PTX>9; output a 9-part academic LaTeX proposal."
+  hard_constraints:
+    architecture: "NVIDIA Blackwell (Grace-Blackwell allowed when relevant)"
+    cuda: "> 13.0 (prefer 13.1+)"
+    ptx: "> 9.0 (strict)"
+    required_sources_each_run:
+      - ARCH_BW
+      - OPT_PIPE
+      - NV_BLOG_TILE
+      - NV_workloads
+      - SEED_1
+      - SEED_2
+      - SEED_3
+      - SEED_4
+  writing_constraints:
+    latex_style: "academic, math-first"
+    output_split: ">= 9 LaTeX parts; each LaTeX run emits exactly 1 part"
+    citation_policy: "no uncited non-trivial claims; mark UNVERIFIED if not in sources"
+  scope_boundaries:
+    include:
+      - "formal semantics/models"
+      - "layout algebra"
+      - "integer relations"
+      - "constraint optimization (SMT/ILP)"
+      - "cache/traffic modeling"
+      - "TMEM/TMA/tile IR as modeled objects"
+      - "scheduling (SWP/WS/CTA)"
+    exclude:
+      - "marketing-only claims without evidence"
+      - "non-Blackwell architectures except as explicit comparison or modeling baseline"
+
+golden_sources:
+  ARCH_BW:
+    url: "https://arxiv.org/html/2512.02189v1"
+    tier: "tier_1_insight"
+    title: "Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth Architectural Analysis"
+    authors: "Jarmusch, Chandrasekaran"
+    date: "2025-12-01"
+  OPT_PIPE:
+    url: "https://arxiv.org/html/2512.18134v1"
+    tier: "tier_1_insight"
+    title: "Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs"
+    authors: "Soi et al."
+    date: "2025-12-19"
+  NV_BLOG_TILE:
+    url: "https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/"
+    tier: "tier_1_insight"
+    title: "Advancing GPU Programming with the CUDA Tile IR Backend for OpenAI Triton"
+    authors: "NVIDIA"
+    date: "2026-01"
+  NV_workloads:
+    url: "https://arxiv.org/html/2502.13113"
+    tier: "tier_2_modeling_context"
+    title: "HARP: A Taxonomy for Heterogeneous and Hierarchical Processors for Mixed-reuse Workloads"
+    authors: "Garg, Pellauer, Krishna"
+    date: "2025-02-18"
+  SEED_1:
+    url: "https://arxiv.org/html/2505.23819v3"
+    tier: "tier_4_context"
+    title: "Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using F_2"
+    authors: "Zhou, Lezcano, Goucher, Rakhmati, Niu, Lebar, Szczerbuk, Bell, Tillet, Raoux, Moudallal"
+    date: "2025-10-22"
+  SEED_2:
+    url: "https://arxiv.org/html/2511.10374v1"
+    tier: "tier_4_context"
+    title: "Modeling Layout Abstractions Using Integer Set Relations"
+    authors: "Bhaskaracharya, Acharya, Hagedorn, Grover"
+    date: "2025-11-13"
+  SEED_3:
+    url: "https://arxiv.org/html/2601.16032v2"
+    tier: "tier_4_context"
+    title: "Sawtooth Wavefront Reordering: Enhanced CuTile FlashAttention on NVIDIA GB10"
+    authors: "Zhu, Pan, Ding"
+    date: "2026-01-26"
+  SEED_4:
+    url: "https://arxiv.org/pdf/2601.05972v1"
+    tier: "tier_4_context"
+    title: "Categorical Foundations for CuTe Layouts"
+    authors: "Carlisle, Shah, Stern, VanKoughnett"
+    date: "2026-01-09"
+
+source_audit:
+  ARCH_BW:
+    used_for: "Blackwell B200 microarchitectural parameters, TMEM characterization, 5th-gen Tensor Core pipeline (tcgen05), FP4/FP6 precision data, memory hierarchy latencies, dual-die configuration, decompression engine throughput, performance baselines vs H200"
+    anchors:
+      - "Section V: PTX Microbenchmark Methodology"
+      - "Section VI: Tensor Core pipeline characterization"
+      - "Fig. 2: Tensor Core instruction pipeline for tcgen05 vs wgmma vs Volta/Ampere"
+      - "Table: B200 SM count (148 SMs), L2 cache (4 partitions), HBM3e (8 stacks)"
+      - "Result: 1.56x mixed-precision throughput over H200"
+      - "Result: 42% better energy efficiency vs H200"
+      - "Result: 58% reduction in memory access latency in cache misses"
+  OPT_PIPE:
+    used_for: "Joint SWP+WS formulation as constraint-optimization problem, ILP/SMT solver approach, Twill system architecture, optimal schedule proofs for Flash Attention on Hopper and Blackwell, cost normalization as ZLP, machine-specific constraint parameterization"
+    anchors:
+      - "Section: Twill system definition and architecture"
+      - "Definition: SWP and WS as joint optimization problem"
+      - "Theorem: Twill rediscovers and proves optimal expert-designed Flash Attention schedules"
+      - "Constraint: Hopper and Blackwell SMs have four execution contexts"
+      - "Evaluation platform: CUDA 13.0"
+      - "Cost normalization framed as ZLP problem"
+  NV_BLOG_TILE:
+    used_for: "CUDA Tile IR definition, tile-based programming model, Triton-to-TileIR backend architecture, MLIR infrastructure, TMA API migration, unordered memory model with memory tokens, Blackwell compute capability 10.x/12.x, num_ctas=2 for 2CTA MMA, known limitations"
+    anchors:
+      - "CUDA 13.1 introduction of CUDA Tile"
+      - "Tile IR as virtual ISA for tile-based programs"
+      - "Triton-to-TileIR conversion pass (TritonToCudaTile)"
+      - "Tensor-of-pointer suboptimal performance note"
+      - "num_ctas=2 critical for dense dot workloads on Blackwell"
+      - "Unordered memory model with memory token semantics"
+      - "Blackwell-only support in CUDA 13.1"
+  NV_workloads:
+    used_for: "Two-axis taxonomy of heterogeneous/hierarchical processors, classification of Blackwell B100 as leaf-only architecture, GPU-with-tensor-core as intra-node heterogeneous, mixed-reuse workload modeling, cross-depth vs cross-node heterogeneity definitions"
+    anchors:
+      - "Fig. 4: Taxonomy visualization of leaf-only vs hierarchical"
+      - "Definition: Leaf-only = compute only at leaves of memory hierarchy near L1"
+      - "Definition: Hierarchical = compute distributed across multiple memory hierarchy levels"
+      - "Example: NVIDIA B100 GPU classified as leaf-only"
+      - "Example: GPU with tensor core as intra-node heterogeneous (Fig. 4c)"
+      - "Section VII: Configuration focus"
+  SEED_1:
+    used_for: "F_2 linear algebra framework for tensor layouts, binary matrix representation of layout mappings, generic layout-to-layout conversions, elimination of quadratic explosion in layout handling, integration with Triton"
+    anchors:
+      - "Definition: Linear Layouts as binary matrices over F_2"
+      - "Key result: generic layout definition replacing case-by-case approach"
+      - "Key result: generic layout-to-layout conversions eliminating quadratic explosion"
+      - "Integration: Triton operator optimization and kernel compilation"
+  SEED_2:
+    used_for: "ISL-based unified representation for CuTe and Triton linear layouts, integer set relations encoding stride-based mappings, quasi-affine transformations for tiling, swizzle operations modeled as bit-level manipulations, formal analysis framework"
+    anchors:
+      - "Algorithm 1: CuTe layout to integer set relation conversion"
+      - "Definition: Layout size |H| and co-size ||H||"
+      - "Definition: Coordinate mapping M_H as quasi-affine integer set relation"
+      - "Listing 4: Tiled loop-nest with access expression as quasi-affine relation"
+      - "CuTe layout shape-stride tuple formalism: (i,j) -> 4i+j example"
+      - "Linear layouts: binary vector spaces with XOR addition and AND multiplication"
+  SEED_3:
+    used_for: "L2 cache behavior analysis on Grace Blackwell GB10, reuse distance modeling for Flash Attention, sawtooth alternating scan pattern, persistent CTA scheduling, CuTile programming model validation, split-Q dataflow tiling"
+    anchors:
+      - "Algorithm 1: Split-Q Fused Multihead Attention with Square Tiling"
+      - "Algorithm 4: Alternating scan pattern (Sawtooth)"
+      - "Definition: Reuse distance (LRU stack distance) formalism"
+      - "Result: 67% reduction in L2 misses (370M to 120M sectors)"
+      - "Result: up to 60% throughput increase on GB10 causal variant"
+      - "Observation: L2 hit rate correlates with number of active SMs"
+      - "Limitation: tile size must be smaller than shared memory capacity"
+  SEED_4:
+    used_for: "Category-theoretic foundation for CuTe layout algebra, Tuple and Nest categories, morphism-based layout definitions, composition/logical-product/logical-division operations with proofs of compatibility, complete characterization of tractable layouts"
+    anchors:
+      - "Definition: Categories Tuple and Nest"
+      - "Theorem: Morphisms in Tuple and Nest give rise to layouts"
+      - "Proof: Compatibility of categorical operations with CuTe layout operations (composition, logical product, logical division)"
+      - "Theorem: Complete characterization of layouts arising from the construction"
+      - "Implementation: Python categorical constructions with CUTLASS alignment tests"
+
+formalism_index:
+  ARCH_BW:
+    definitions:
+      - "Blackwell SM: 148 SMs across 8 GPCs, dual-die via NV-HBI"
+      - "TMEM: dedicated on-chip tensor memory per SM, distinct from SMEM and RF"
+      - "tcgen05: 5th-gen Tensor Core PTX instruction family replacing wgmma"
+      - "Precision set: {FP64, TF32, BF16, FP16, FP8, FP6, FP4, INT8} with SASS mappings {DMMA, HMMA, QMMA, OMMA, IMMA}"
+      - "L2 cache: ~64-65 MB monolithic (or 8x8MB sliced), up from Hopper 50 MB"
+      - "L1/SMEM: 128 KB per SM configurable (reduced from Hopper 256 KB)"
+      - "Decompression Engine (DE): hardware unit for compressed model weight access"
+    operators_or_constructions:
+      - "Microbenchmark methodology: true latency (serialized dependency chains), completion latency (parallel independent instructions), throughput measurement"
+      - "PTX-to-SASS translation validation pipeline"
+    theorems_or_propositions:
+      - "CLAIM: B200 tensor core achieves 1.56x higher mixed-precision throughput vs H200"
+      - "CLAIM: 42% better energy efficiency in end-to-end transformer training vs H200"
+      - "CLAIM: 58% reduction in cache-miss memory access latency vs H200"
+      - "CLAIM: tcgen05 instruction latency ~11 cycles, approximately constant across tile sizes and precisions [INFERENCE from secondary source]"
+      - "CLAIM: warp-level single-thread MMA dispatch reduces instruction latency 2.9-11.6x vs Hopper warp-group dispatch [INFERENCE from secondary source]"
+    proof_techniques:
+      - "Empirical microbenchmarking with controlled PTX-level experiments"
+      - "Generational comparison methodology (B200 vs H200)"
+    algorithmic_artifacts:
+      - "Open-source microbenchmark suite (code pending release due to double-blind)"
+      - "Benchmarks: dense/sparse GEMM, transformer inference, training workloads"
+    modeling_assumptions:
+      - "Single B200 GPU characterization; multi-GPU NV-HBI coherence not deeply benchmarked"
+      - "Critical microarchitectural info (pipeline depth, cache interaction details) acknowledged as partially unknown"
+      - "TMEM allocation and data movement details partially documented"
+  OPT_PIPE:
+    definitions:
+      - "Software Pipelining (SWP): loop transformation exploiting instruction-level parallelism within and across iterations"
+      - "Warp Specialization (WS): assigning distinct roles (producer/consumer) to warps for different functional units"
+      - "Execution context: Hopper and Blackwell SMs have 4 execution contexts hosting active warps"
+      - "Joint SWP+WS optimization: simultaneous determination of best SWP schedule and WS strategy as a single problem"
+      - "Tile-based loop description: high-level iterative program specification for TC GPUs"
+      - "Cost normalization as Integer Linear Program (ZLP)"
+    operators_or_constructions:
+      - "Constraint solver formulation: joint SWP+WS encoded as ILP solvable by off-the-shelf solvers"
+      - "Machine-specific constraint parameterization: altering GPU operation costs to target different architectures"
+      - "Modulo scheduling: classical SWP technique adapted for TC GPU multi-unit pipelines"
+    theorems_or_propositions:
+      - "THEOREM: Twill produces provably optimal schedules for singly-nested loops without additional control flow"
+      - "THEOREM: Twill rediscovers and proves optimal the manually-developed expert SWP+WS schedules for Flash Attention on both Hopper and Blackwell"
+      - "CLAIM: Twill is heuristic-free, easily extensible to new GPU architectures"
+      - "CLAIM: The interaction between SWP and WS was previously poorly understood with no technical framework for reasoning about combined optimality"
+    proof_techniques:
+      - "Constraint satisfaction: optimality proven via solver exhaustiveness over feasible schedule space"
+      - "Equivalence demonstration: solver-found schedules match expert-designed ones"
+      - "Architecture portability: same formulation with different cost parameters yields different optimal schedules"
+    algorithmic_artifacts:
+      - "Twill system: input = tile-based loop description + machine cost parameters; output = optimal SWP schedule + WS strategy"
+      - "Evaluation platform: CUDA 13.0, Intel Xeon Platinum 8570 for solver timing"
+    modeling_assumptions:
+      - "Restricted to singly-nested loops without additional control flow"
+      - "Assumes quantifiable costs for GPU operations (TMA loads, MMA, etc.)"
+      - "Orthogonal optimizations (memory layout, register allocation) not handled by Twill"
+      - "Triton found to make incorrect code generation decisions orthogonal to scheduling"
+  NV_BLOG_TILE:
+    definitions:
+      - "CUDA Tile IR: virtual ISA for tile-based parallel programming, introduced in CUDA 13.1"
+      - "CUDA Tile: programming model raising abstraction from SIMT threads to tile operations on data blocks"
+      - "cuTile Python: domain-specific language for authoring tile-based kernels in Python"
+      - "Triton-to-TileIR backend: MLIR-based bridge converting Triton IR to CUDA Tile IR"
+      - "Unordered memory model: global memory accesses not ordered by default in CUDA Tile IR"
+      - "Memory tokens: explicit ordering mechanism for global memory operations when needed"
+      - "Occupancy attribute: new CUDA Tile IR tuning parameter replacing num_warps"
+      - "2CTA mode MMA: Blackwell architecture mode requiring num_ctas=2 for dense dot workloads"
+    operators_or_constructions:
+      - "TTIR-to-CUDA-Tile-IR conversion pass (TritonToCudaTile)"
+      - "Rewrite assume pass: converts assume ops to CUDA Tile IR assume ops"
+      - "TMA API: Tensor Memory Accelerator load/store replacing tensor-of-pointer patterns"
+      - "Per-kernel backend selection: ENABLE_TILE=1 environment variable"
+      - "Fallback mechanism: compilation bug in Tile IR backend triggers fallback to PTX backend"
+    theorems_or_propositions:
+      - "CLAIM: CUDA Tile represents the largest CUDA platform advancement since 2006"
+      - "CLAIM: Tile-based model allows compiler/runtime to handle thread scheduling, hardware mapping, resource allocation automatically"
+      - "CLAIM: Tensor-of-pointer patterns show suboptimal performance with CUDA 13.1"
+      - "KNOWN_LIMITATION: Small GEMM performance currently poor in Tile IR"
+      - "KNOWN_LIMITATION: Not all Triton operations implemented yet"
+      - "KNOWN_LIMITATION: XXXNorm kernels with large reduction dimensions may degrade due to register spilling"
+    proof_techniques: []
+    algorithmic_artifacts:
+      - "Triton-to-TileIR incubator repo (GitHub triton-lang organization)"
+      - "tileiras assembler, ptxas, libnvvm.so from CUDA 13.1"
+    modeling_assumptions:
+      - "Blackwell-only support (compute capability 10.x and 12.x)"
+      - "CUDA 13.1 required; num_warps not exposed yet"
+      - "Memory aliasing between different global memory accesses may produce incorrect results without memory tokens"
+      - "Data transactions across tile blocks (splitK/streamK) require lock logic in global memory"
+  NV_workloads:
+    definitions:
+      - "HARP taxonomy: two-axis classification of heterogeneous/hierarchical processors"
+      - "Axis 1 - Depth of compute: leaf-only (compute at L1 leaves only) vs hierarchical (compute across multiple memory hierarchy levels)"
+      - "Axis 2 - Location of heterogeneity: homogeneous, intra-node, cross-node, cross-depth, compound"
+      - "Mixed-reuse workloads: AI workloads with tensor operations having both high and low arithmetic intensities"
+      - "Sub-accelerator: distinct compute unit within a heterogeneous processor (e.g., tensor core within GPU SM)"
+    operators_or_constructions:
+      - "Taxonomy composition: axes are not mutually exclusive; compound heterogeneity combines multiple sources"
+      - "Tree-structured memory hierarchy model with compute placed at nodes/leaves"
+    theorems_or_propositions:
+      - "CLAIM: NVIDIA B100 GPU is a leaf-only architecture"
+      - "CLAIM: GPU with tensor core exemplifies intra-node heterogeneous architecture"
+      - "CLAIM: Cross-depth heterogeneous is the only category that cannot have a leaf-only counterpart"
+      - "CLAIM: Hierarchical and heterogeneous accelerators are emerging as popular way to process mixed-reuse workloads"
+    proof_techniques:
+      - "Taxonomy-based classification with architectural case studies"
+    algorithmic_artifacts: []
+    modeling_assumptions:
+      - "Taxonomy focuses on architectural structure, not detailed performance modeling"
+      - "Blackwell referenced as B100 example; B200 dual-die not separately classified"
+      - "INFERENCE: Blackwell TMEM could be interpreted as introducing hierarchical compute characteristics within leaf-only design"
+  SEED_1:
+    definitions:
+      - "Linear Layout: tensor layout represented as binary matrix over F_2 acting on bits of hardware representation"
+      - "F_2 linear algebra: field with two elements {0,1}; layout mappings are linear maps in this field"
+      - "Hardware representation bits: physical addresses decomposed into binary dimensions"
+      - "Layout-to-layout conversion: generic transformation between any two linear layouts via matrix operations"
+    operators_or_constructions:
+      - "Binary matrix multiplication: composing layout transformations"
+      - "Generic layout conversion: eliminates quadratic explosion of case-by-case conversions"
+      - "Triton integration: linear layouts applied to optimize individual operators and full kernels"
+    theorems_or_propositions:
+      - "CLAIM: Linear layout approach enables a generic layout definition as opposed to case-by-case"
+      - "CLAIM: Eliminates quadratic explosion in layout handling for existing systems"
+      - "CLAIM: Binary matrix representation is sufficient to model tensor layouts as mappings between logical tensors and hardware resources"
+    proof_techniques:
+      - "Algebraic construction over F_2"
+      - "Implementation-validated correctness in Triton compiler"
+    algorithmic_artifacts:
+      - "Linear Layout library integrated with Triton"
+      - "Triton operator and kernel optimization pipeline using linear layouts"
+    modeling_assumptions:
+      - "Layouts must be linear (representable as F_2 matrices); non-linear swizzle patterns require extension"
+      - "Assumes bit-level decomposition of addresses is meaningful for hardware mapping"
+      - "Triton-specific integration; not directly targeting CUDA Tile IR"
+  SEED_2:
+    definitions:
+      - "Integer Set Library (ISL) relations: unified mathematical representation for layout systems"
+      - "CuTe layout: mapping from n-D coordinate spaces to 1-D index spaces using shape and stride tuples"
+      - "Triton linear layout: mapping m-D coordinate spaces to n-D index spaces via binary vector spaces (XOR addition, AND multiplication)"
+      - "Layout mapping relation M_H: integer set relation encoding coordinate-to-index transformation"
+      - "Layout size |H|: lexicographic maximum of domain + 1"
+      - "Layout co-size ||H||: lexicographic maximum of range + 1"
+      - "Quasi-affine relation: represents non-trivial 1-D to n-D coordinate mappings including tiling"
+      - "Swizzle operation: bit-level manipulation on offsets/pointers for memory access optimization"
+    operators_or_constructions:
+      - "CuTe-to-ISL conversion algorithm: shape-stride tuples encoded as integer set relations with bounds and dot-product constraints"
+      - "Tiling as successive quasi-affine transformations: C = {c -> [c mod s0, floor(c/s0) mod s1, ...]}"
+      - "Swizzle modeling: bit-level manipulations represented as integer set operations"
+      - "Coordinate mapping composition: ISL relation composition for chained layout transformations"
+    theorems_or_propositions:
+      - "CLAIM: ISL provides unified representation bridging CuTe and Triton linear layouts"
+      - "CLAIM: Enables rigorous formal analysis, correctness verification, and cross-system optimization"
+      - "CLAIM: Both CuTe and Triton layouts can be represented as quasi-affine integer set relations"
+      - "PROPERTY: Tiling is a quasi-affine transformation expressible in ISL"
+    proof_techniques:
+      - "Constructive: explicit algorithm converting CuTe shape-stride to ISL relation"
+      - "ISL framework: leverages existing polyhedral analysis tools for verification"
+    algorithmic_artifacts:
+      - "Algorithm: Input CuTe layout (s,d) -> Output integer set relations for coordinate, index, and layout mappings"
+    modeling_assumptions:
+      - "Assumes layouts expressible as quasi-affine integer relations"
+      - "CuTe and Triton operate independently with distinct mathematical underpinnings prior to unification"
+      - "Scope limited to layout representation; does not address scheduling or pipeline optimization"
+  SEED_3:
+    definitions:
+      - "Reuse distance (LRU stack distance): volume of distinct data accessed between two accesses to the same cache line"
+      - "Sawtooth Wavefront Reordering: alternating scan direction of inner KV loop (0->N in even iterations, N->0 in odd)"
+      - "Split-Q dataflow: Query tiles resident in shared memory, Key/Value tiles streamed from global memory"
+      - "Persistent CTA pattern: long-lived CTAs with round-robin tile assignment for deterministic cache study"
+      - "Square tiling: block size for query dimension equals block size for key-value dimension (B_r = B_c = T)"
+      - "Wavefront-like reuse: synchronized CTA progress enabling L2 cache sharing"
+    operators_or_constructions:
+      - "Cyclic-to-sawtooth reordering: transforms uniform maximum reuse distance to reduced reuse distance for most accesses"
+      - "CuTile porting: low-level CUDA optimization transferred to high-level tile-based programming model"
+      - "L2 miss counting via hardware performance counters"
+    theorems_or_propositions:
+      - "CLAIM: Sawtooth order reduces reuse distance for most data accesses below data size, unlike cyclic order where all reuse distances equal data size"
+      - "RESULT: 67% reduction in L2 misses (~370M to ~120M sectors) on GB10"
+      - "RESULT: Up to 60% throughput increase (41 to 66 TFLOPS) on GB10 causal variant"
+      - "RESULT: ~13% throughput increase (61 to 69 TFLOPS) on GB10 non-causal variant"
+      - "OBSERVATION: L1 cache provides negligible benefit for streaming attention patterns"
+      - "OBSERVATION: L2 cache behavior follows deterministic model; hit rate correlates with active SM count"
+    proof_techniques:
+      - "Empirical validation via hardware counters on GB10"
+      - "Controlled CUDA experiments with designed CTA scheduling"
+      - "Cross-validation: CUDA findings replicated in CuTile environment"
+    algorithmic_artifacts:
+      - "Algorithm 1: Split-Q Fused Multihead Attention with Square Tiling"
+      - "Algorithm 4: Sawtooth alternating scan pattern"
+    modeling_assumptions:
+      - "Assumes persistent CTA scheduling with round-robin assignment"
+      - "L2 behavior model assumes largely synchronized CTA progress"
+      - "LIMITATION: Tile size must be smaller than shared memory capacity for optimization to apply"
+      - "LIMITATION: Large tile sizes (128) in tile-based programming models may not benefit"
+      - "Platform: NVIDIA GB10 (Grace Blackwell)"
+  SEED_4:
+    definitions:
+      - "Category Tuple: objects are tuples of natural numbers; morphisms encode layout coordinate transformations"
+      - "Category Nest: objects are nested tuple structures; morphisms give rise to layouts with hierarchical structure"
+      - "CuTe layout algebra: composition, logical product, logical division operations on layouts"
+      - "Tractable layouts: naturally occurring class of layouts characterizable via categorical construction"
+      - "Layout morphism: morphism in Tuple or Nest whose action defines a CuTe layout"
+    operators_or_constructions:
+      - "Composition of layout morphisms: corresponds to CuTe layout composition"
+      - "Logical product of morphisms: corresponds to CuTe logical product"
+      - "Logical division of morphisms: corresponds to CuTe logical division"
+      - "Categorical functor: relationship between Tuple and Nest categories"
+    theorems_or_propositions:
+      - "THEOREM: Operations on morphisms in Tuple and Nest are compatible with corresponding CuTe layout operations"
+      - "THEOREM: Complete characterization of which layouts arise from the categorical construction"
+      - "CLAIM: Categorical framework provides rigorous foundation for understanding CuTe layout algebra"
+    proof_techniques:
+      - "Category-theoretic: functorial proofs of operation compatibility"
+      - "Characterization theorem: exhaustive classification of tractable layouts"
+      - "Implementation validation: Python tests demonstrate alignment with CUTLASS behavior"
+    algorithmic_artifacts:
+      - "Python implementation of categorical constructions at github.com/ColfaxResearch/layout-categories"
+      - "Test suite validating alignment with CUTLASS"
+    modeling_assumptions:
+      - "Focuses on tractable layouts; may not cover all possible CuTe layouts"
+      - "Categorical framework is descriptive/foundational; does not directly optimize schedules or performance"
+      - "CUTLASS library behavior used as ground truth for validation"
+
+evidence_index:
+  ARCH_BW:
+    key_claims:
+      - claim: "B200 features 148 SMs across 8 GPCs with dual-die configuration connected via NV-HBI providing coherent single-device view"
+        support: "Section II/III of paper; B200 architectural specification"
+        blackwell_relevance: "Core architectural parameters for any formal Blackwell model"
+        confidence: "high"
+        notes: "208 billion transistors, 4 L2 partitions, 8 HBM3e stacks"
+      - claim: "TMEM is a dedicated on-chip memory per SM for tensor data movement, reducing reliance on SMEM and register files"
+        support: "Section on TMEM; Fig. 2 tensor core pipeline"
+        blackwell_relevance: "Defines new memory tier that must be modeled; affects data placement algebra"
+        confidence: "high"
+        notes: "~256 KB TMEM per SM [UNVERIFIED exact size from primary source]"
+      - claim: "5th-gen Tensor Cores use tcgen05 PTX instructions replacing wgmma; warp-level single-thread MMA dispatch"
+        support: "Fig. 2: Tensor Core instruction pipeline evolution; Section V-VI"
+        blackwell_relevance: "Fundamental instruction model change; affects scheduling constraints"
+        confidence: "high"
+        notes: "SASS mappings: DMMA, HMMA, QMMA, OMMA, IMMA"
+      - claim: "FP4/FP6 precision modes are new in Blackwell with no Hopper/H200 hardware datapaths"
+        support: "Section on mixed-precision evaluation"
+        blackwell_relevance: "Defines precision lattice for formal model; new datapath constraints"
+        confidence: "high"
+        notes: ""
+      - claim: "B200 achieves 1.56x mixed-precision throughput and 42% better energy efficiency vs H200"
+        support: "Systematic evaluation of dense/sparse GEMM, transformer workloads"
+        blackwell_relevance: "Calibration target for performance model"
+        confidence: "high"
+        notes: ""
+      - claim: "58% reduction in memory access latency in cache-misses, fundamentally changing optimal algorithm design"
+        support: "Memory analysis section"
+        blackwell_relevance: "Cache model parameters; affects layout and traffic optimization"
+        confidence: "high"
+        notes: ""
+      - claim: "L1/SMEM reduced to 128 KB per SM from Hopper 256 KB; L2 increased to ~65 MB monolithic"
+        support: "Memory hierarchy characterization"
+        blackwell_relevance: "Capacity constraints for tiling/layout optimization models"
+        confidence: "high"
+        notes: ""
+      - claim: "Revised thread and CTA scheduling model utilizing inter-SM communication and memory concurrency"
+        support: "Section I introduction"
+        blackwell_relevance: "Scheduling model inputs for SWP/WS formalization"
+        confidence: "medium"
+        notes: "Details of revised scheduling model not fully disclosed"
+    explicit_limitations_or_open_questions:
+      - "Critical microarchitectural info such as instruction latency under dependency, pipeline depth, cache interaction, and saturation remains unknown"
+      - "Microbenchmark code not yet publicly available (double-blind)"
+      - "TMEM allocation details partially documented"
+      - "Dense GEMM throughput on Blackwell measured to lag Hopper by up to 4x, suggesting compiler maturity plays significant role [from secondary analysis]"
+  OPT_PIPE:
+    key_claims:
+      - claim: "SWP and WS can and should be solved simultaneously as a joint optimization problem via constraint solvers"
+        support: "Core thesis and formulation of the paper"
+        blackwell_relevance: "Direct formalization of scheduling problem for Blackwell TC pipeline"
+        confidence: "high"
+        notes: ""
+      - claim: "Twill produces provably optimal schedules for singly-nested loops without additional control flow"
+        support: "Solver completeness over feasible schedule space"
+        blackwell_relevance: "Provides verified-optimal scheduling baseline for Blackwell kernels"
+        confidence: "high"
+        notes: ""
+      - claim: "Twill rediscovers expert-designed Flash Attention schedules for both Hopper and Blackwell"
+        support: "Experimental evaluation section"
+        blackwell_relevance: "Validates that solver approach matches human expertise on Blackwell"
+        confidence: "high"
+        notes: ""
+      - claim: "Hopper and Blackwell SMs have four execution contexts that can host active warps"
+        support: "Background section on modern GPU SMs"
+        blackwell_relevance: "Hard constraint for formal scheduling model"
+        confidence: "high"
+        notes: ""
+      - claim: "Different GPU architectures require different optimal schedules; Twill handles this by altering machine-specific cost constraints"
+        support: "Architecture portability discussion"
+        blackwell_relevance: "Model parametrization strategy for Blackwell"
+        confidence: "high"
+        notes: ""
+      - claim: "A year transpired between Hopper release and Flash Attention 3 development; Twill aims to eliminate such delays"
+        support: "Motivation section"
+        blackwell_relevance: "Motivates automated approach for Blackwell schedule derivation"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Restricted to singly-nested loops without additional control flow"
+      - "Many critical optimizations orthogonal to Twill (memory layout, register allocation, code generation) must be performed correctly"
+      - "Triton found to make incorrect code generation decisions during evaluation"
+      - "Cost normalization between heterogeneous operations is non-trivial; framed as ZLP"
+      - "Evaluated on CUDA 13.0; CUDA 13.1 Tile IR not yet integrated"
+  NV_BLOG_TILE:
+    key_claims:
+      - claim: "CUDA Tile IR is a new virtual ISA enabling native tile-based GPU programming, introduced in CUDA 13.1"
+        support: "Blog post and GitHub repo documentation"
+        blackwell_relevance: "Defines the target IR for Blackwell tile-based kernels under CUDA >13"
+        confidence: "high"
+        notes: ""
+      - claim: "CUDA Tile supports only Blackwell GPUs (compute capability 10.x and 12.x) in CUDA 13.1"
+        support: "Blog post explicit statement; GitHub README"
+        blackwell_relevance: "Hard architectural constraint; Blackwell-exclusive"
+        confidence: "high"
+        notes: ""
+      - claim: "num_ctas=2 is critical for dense dot-related workloads enabling 2CTA mode MMA on Blackwell"
+        support: "GitHub performance tuning documentation"
+        blackwell_relevance: "Essential scheduling parameter for Blackwell MMA formal model"
+        confidence: "high"
+        notes: ""
+      - claim: "Tile IR uses unordered memory model by default; memory tokens required for explicit ordering"
+        support: "GitHub README memory model section"
+        blackwell_relevance: "Formal memory model constraint; affects correctness proofs"
+        confidence: "high"
+        notes: ""
+      - claim: "Tensor-of-pointer load/store APIs show poor performance; TMA APIs recommended instead"
+        support: "Blog and GitHub known limitations"
+        blackwell_relevance: "Data movement constraint for formal model; TMA as preferred primitive"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Not all Triton operations implemented in Tile IR backend yet"
+      - "Small GEMM performance currently poor (future CUDA release fix)"
+      - "num_warps not exposed in CUDA Tile IR 13.1"
+      - "Register spilling for XXXNorm kernels with large reduction dimensions"
+      - "Memory aliasing between global memory operations may produce incorrect results without memory tokens"
+      - "SplitK/streamK workloads require lock logic in global memory for deterministic reduction"
+      - "C++ support planned for future releases (cuTile Python only in 13.1)"
+  NV_workloads:
+    key_claims:
+      - claim: "Two-axis taxonomy classifies processors by (1) depth of compute in memory hierarchy and (2) location of heterogeneity"
+        support: "Section III and Fig. 4"
+        blackwell_relevance: "Provides modeling framework for classifying Blackwell architectural features"
+        confidence: "high"
+        notes: ""
+      - claim: "NVIDIA B100 GPU classified as leaf-only architecture (compute at L1 leaves only)"
+        support: "Fig. 4 examples and Section III"
+        blackwell_relevance: "Baseline classification for Blackwell; TMEM may challenge pure leaf-only designation"
+        confidence: "high"
+        notes: "INFERENCE: B200 TMEM could be viewed as introducing hierarchical compute elements"
+      - claim: "GPU with tensor core exemplifies intra-node heterogeneous architecture"
+        support: "Fig. 4c example"
+        blackwell_relevance: "Models Blackwell SM as containing heterogeneous sub-accelerators (CUDA cores + tensor cores)"
+        confidence: "high"
+        notes: ""
+      - claim: "Mixed-reuse workloads consist of tensor operators with diverse shapes and arithmetic intensities"
+        support: "Abstract and Section I"
+        blackwell_relevance: "Characterizes workload diversity that Blackwell model must handle"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Taxonomy is structural; does not provide detailed performance models"
+      - "Blackwell dual-die NV-HBI not explicitly classified in taxonomy"
+      - "INFERENCE: Blackwell decompression engine and TMEM add complexity beyond simple leaf-only + intra-node heterogeneous classification"
+  SEED_1:
+    key_claims:
+      - claim: "Tensor layouts modeled as linear maps over F_2 (binary matrices on address bits)"
+        support: "Core formalism definition"
+        blackwell_relevance: "Foundational layout representation usable in Blackwell tile/layout formal model"
+        confidence: "high"
+        notes: ""
+      - claim: "Generic layout-to-layout conversions eliminate quadratic explosion in existing solutions"
+        support: "Complexity analysis vs prior systems"
+        blackwell_relevance: "Scalability property essential for Blackwell multi-precision layout management"
+        confidence: "high"
+        notes: ""
+      - claim: "Integration with Triton demonstrates effectiveness for operator and kernel optimization"
+        support: "Experimental evaluation"
+        blackwell_relevance: "Triton is the primary frontend for CUDA Tile IR; layout formalism directly applicable"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Linearity restriction: only layouts representable as F_2 matrices; non-linear patterns (some swizzles) may require extension"
+      - "Triton-specific; direct CUDA Tile IR integration not demonstrated"
+      - "Does not address scheduling, pipelining, or cache behavior"
+  SEED_2:
+    key_claims:
+      - claim: "ISL integer set relations provide unified representation for both CuTe stride-based and Triton binary-vector-space layouts"
+        support: "Core contribution and Algorithm 1"
+        blackwell_relevance: "Unifies the two major layout systems used in Blackwell kernel development"
+        confidence: "high"
+        notes: ""
+      - claim: "CuTe layouts encode as quasi-affine integer set relations including swizzle bit-level manipulations"
+        support: "Formal conversion algorithm"
+        blackwell_relevance: "Enables formal verification of CuTe layouts used in CUTLASS/Blackwell"
+        confidence: "high"
+        notes: ""
+      - claim: "Tiling transformations are quasi-affine and representable in ISL framework"
+        support: "Theoretical analysis"
+        blackwell_relevance: "Tiling is fundamental to Blackwell tile-based programming model"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Scope limited to layout representation; scheduling not addressed"
+      - "Cross-system optimization strategies are future work"
+      - "ISL computation may have complexity implications for very large layout spaces"
+  SEED_3:
+    key_claims:
+      - claim: "L2 cache behavior on GB10 follows deterministic model; hit rate correlates with active SM count"
+        support: "Hardware counter analysis"
+        blackwell_relevance: "Direct Blackwell (Grace Blackwell GB10) L2 cache characterization"
+        confidence: "high"
+        notes: ""
+      - claim: "Sawtooth alternating scan reduces L2 misses by 67% and increases throughput up to 60% on GB10"
+        support: "Experimental evaluation on GB10"
+        blackwell_relevance: "Validated cache optimization technique for Blackwell Flash Attention"
+        confidence: "high"
+        notes: ""
+      - claim: "L1 cache provides negligible benefit for streaming attention patterns on GB10"
+        support: "Hardware counter analysis"
+        blackwell_relevance: "Simplifies formal cache model for attention workloads on Blackwell"
+        confidence: "high"
+        notes: ""
+      - claim: "CuTile optimizations translate from low-level CUDA analysis to high-level tile programming model"
+        support: "CuTile porting and evaluation"
+        blackwell_relevance: "Validates that formal cache models apply across abstraction levels on Blackwell"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Tile size constraint: optimization requires tile size smaller than shared memory capacity"
+      - "Large tile sizes (128) in tile-based programming models may not benefit from sawtooth reordering"
+      - "Analysis limited to Flash Attention workload on GB10; generalization to other kernels not demonstrated"
+      - "Assumes persistent CTA with round-robin scheduling; other scheduling policies not studied"
+  SEED_4:
+    key_claims:
+      - claim: "Categories Tuple and Nest provide rigorous categorical foundation for CuTe layout algebra"
+        support: "Core construction and proofs"
+        blackwell_relevance: "CuTe/CUTLASS layouts underpin Blackwell kernel data management; categorical foundation enables formal reasoning"
+        confidence: "high"
+        notes: ""
+      - claim: "Categorical operations (composition, logical product, logical division) proven compatible with CuTe layout operations"
+        support: "Formal proofs in paper"
+        blackwell_relevance: "Enables verified layout transformations in Blackwell kernel compilation"
+        confidence: "high"
+        notes: ""
+      - claim: "Complete characterization of which layouts arise from the categorical construction"
+        support: "Characterization theorem"
+        blackwell_relevance: "Defines the formal boundary of tractable layouts for Blackwell optimization"
+        confidence: "high"
+        notes: ""
+    explicit_limitations_or_open_questions:
+      - "Focuses on tractable (naturally occurring) layouts; exotic layouts may fall outside characterization"
+      - "Foundational/descriptive; does not directly optimize performance"
+      - "Relationship to F_2 linear layouts (SEED_1) and ISL relations (SEED_2) not formally established"
+
+cross_source_synthesis:
+  agreements:
+    - "ARCH_BW and OPT_PIPE agree that Blackwell SMs have fundamentally different tensor core dispatch (warp-level tcgen05) requiring new scheduling strategies"
+    - "NV_BLOG_TILE and SEED_3 agree that CUDA Tile IR / CuTile is the target programming model for Blackwell, and that low-level optimizations transfer to tile-level abstractions"
+    - "SEED_1, SEED_2, and SEED_4 all address tensor layout formalization with complementary mathematical frameworks (F_2 linear algebra, ISL integer set relations, category theory)"
+    - "OPT_PIPE and NV_BLOG_TILE agree that CUDA 13.x is the target toolchain; OPT_PIPE uses 13.0, NV_BLOG_TILE requires 13.1 for Tile IR"
+    - "ARCH_BW and SEED_3 agree on reduced L1 capacity (128 KB) for Blackwell and increased importance of L2 cache behavior"
+    - "NV_BLOG_TILE and OPT_PIPE agree that TMA is the preferred data movement mechanism over legacy pointer-based patterns"
+    - "NV_workloads taxonomy and ARCH_BW characterization agree that Blackwell is a leaf-only + intra-node heterogeneous architecture (general-purpose cores + tensor cores)"
+  tensions_or_contradictions:
+    - "ARCH_BW reports dense GEMM throughput lagging Hopper by up to 4x, while overall mixed-precision throughput is 1.56x higher; INFERENCE: compiler maturity vs hardware capability gap, consistent with OPT_PIPE observation that Triton makes incorrect code generation decisions"
+    - "NV_BLOG_TILE states num_warps not exposed in CUDA Tile IR 13.1, while OPT_PIPE formulation relies on warp-level scheduling parameters; INFERENCE: tension between tile-level abstraction and fine-grained scheduling control"
+    - "SEED_1 uses F_2 linearity restriction while SEED_2 and SEED_4 handle broader quasi-affine/categorical layouts; INFERENCE: F_2 model is a strict subset; non-linear swizzles handled by SEED_2 ISL approach but not by SEED_1"
+    - "SEED_3 finds L1 negligible for streaming attention on GB10, while ARCH_BW characterizes L1 latency improvements; INFERENCE: workload-dependent; L1 matters for non-streaming patterns"
+    - "NV_workloads classifies B100 as leaf-only, but ARCH_BW describes TMEM as a dedicated tensor-data memory that could be interpreted as introducing near-compute buffering beyond simple leaf-only model; UNVERIFIED whether this constitutes hierarchical compute"
+  inferred_implications_marked_as_inference:
+    - "INFERENCE: The three layout formalisms (SEED_1 F_2, SEED_2 ISL, SEED_4 categorical) can be hierarchically organized: categorical (SEED_4) as semantic foundation, ISL (SEED_2) as analytical tool, F_2 (SEED_1) as efficient implementation for linear subset"
+    - "INFERENCE: A unified Blackwell formal model should combine OPT_PIPE constraint-based scheduling with SEED_2/SEED_4 layout algebra, parameterized by ARCH_BW microarchitectural constants, targeting NV_BLOG_TILE Tile IR as output"
+    - "INFERENCE: SEED_3 reuse-distance model for L2 cache can be formalized as a constraint in OPT_PIPE-style ILP, where tile iteration order becomes an optimization variable"
+    - "INFERENCE: The 2CTA MMA mode (NV_BLOG_TILE num_ctas=2) combined with OPT_PIPE warp specialization creates a compound scheduling constraint: 2 CTAs per SM with specialized warp roles within each CTA"
+    - "INFERENCE: NV_workloads intra-node heterogeneity model applied to Blackwell yields formal object: SM = (CUDA_cores, TC_5thgen, TMEM, SMEM, RF) with distinct operation latencies per sub-unit, forming the cost vector for OPT_PIPE constraint solver"
+    - "INFERENCE: Blackwell dense GEMM regression vs Hopper (ARCH_BW) likely stems from immature tcgen05 scheduling; OPT_PIPE Twill approach should be able to systematically improve this by finding optimal schedules"
+    - "INFERENCE: Memory token semantics in CUDA Tile IR (NV_BLOG_TILE) define a partial order on global memory operations that should be modeled as a formal constraint in any verification framework for Blackwell kernels"
+
+---
+Learn more:
+1. [Microbenchmarking NVIDIA’s Blackwell Architecture: An in-depth Architectural Analysis](https://arxiv.org/html/2512.02189v1)
+2. [Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs](https://arxiv.org/html/2512.18134v1)
+3. [Advancing GPU Programming with the CUDA Tile IR Backend for OpenAI Triton | NVIDIA Technical Blog](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/)
+4. [Harp: A Taxonomy for Heterogeneous and Hierarchical Processors for Mixed-reuse Workloads](https://arxiv.org/html/2502.13113)
+5. [GPUMC: A Stateless Model Checker for GPU Weak ...](https://arxiv.org/pdf/2505.20207)
+6. [Algorithmic Techniques for GPU Scheduling: A Comprehensive Survey\[v1\] | Preprints.org](https://www.preprints.org/manuscript/202505.0152)
+7. [JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021 1](https://arxiv.org/pdf/2601.20115)
+8. [\[2601.13826\] MirageNet:A Secure, Efficient, and Scalable On-Device Model Protection in Heterogeneous TEE and GPU System](https://arxiv.org/abs/2601.13826)
+9. [Tilus: A Tile-Level GPGPU Programming Language for Low-Precision Computation](https://arxiv.org/html/2504.12984v3)
+10. [A Two-Stage GPU Kernel Tuner Combining Semantic Refactoring and Search-Based Optimization](https://arxiv.org/html/2601.12698)
+11. [SynPerf: A Hybrid Analytical-ML Framework for GPU Performance Prediction](https://arxiv.org/html/2601.14910)
+12. [\[2505.23819\] Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using $\\mathbb{F}\_2$](https://arxiv.org/abs/2505.23819)
+13. [\[2601.05972\] Categorical Foundations for CuTe Layouts](https://arxiv.org/abs/2601.05972)
+14. [\[2601.16032\] Sawtooth Wavefront Reordering: Enhanced CuTile FlashAttention on NVIDIA GB10](https://arxiv.org/abs/2601.16032)
+15. [Microbenchmarking NVIDIA's Blackwell Architecture](https://www.arxiv.org/pdf/2512.02189)
+16. [\[2512.18134\] Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs](https://arxiv.org/abs/2512.18134)
+17. [NVIDIA CUDA 13.1 Powers Next-Gen GPU Programming with NVIDIA CUDA Tile and Performance Gains | NVIDIA Technical Blog](https://developer.nvidia.com/blog/nvidia-cuda-13-1-powers-next-gen-gpu-programming-with-nvidia-cuda-tile-and-performance-gains/)
+18. [\[2502.13113\] HARP: A Taxonomy for Heterogeneous and Hierarchical Processors for Mixed-reuse Workloads](https://arxiv.org/abs/2502.13113)
+19. [\[2505.20207\] GPUMC: A Stateless Model Checker for GPU Weak Memory Concurrency](https://arxiv.org/abs/2505.20207)
+20. [Algorithmic Techniques for GPU Scheduling: A Comprehensive Survey](https://www.mdpi.com/1999-4893/18/7/385)
+21. [Analyzing Modern NVIDIA GPU cores Rodrigo Huerta](https://arxiv.org/pdf/2503.20481)
+22. [Private LLM Inference on Consumer Blackwell GPUs:](https://arxiv.org/pdf/2601.09527)
+23. [Modeling Layout Abstractions Using Integer Set Relations](https://arxiv.org/pdf/2511.10374)
+24. [\[2209.02882v1\] Sgap: Towards Efficient Sparse Tensor Algebra Compilation for GPU](https://arxiv.org/abs/2209.02882v1)
+25. [Sawtooth Wavefront Reordering](https://arxiv.org/html/2601.16032)
+26. [A Performance Model for GPUs with Caches | IEEE Journals & Magazine | IEEE Xplore](https://ieeexplore.ieee.org/abstract/document/6844867/)
+27. [GPTZero Blog | Preserving what's human](https://gptzero.me/news/neurips/)
+28. [Categorical Foundations for CuTe Layouts Jack Carlisle Jay Shah Reuben Stern](https://www.arxiv.org/pdf/2601.05972)
+29. [\[2512.02189\] Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth Architectural Analysis](https://arxiv.org/abs/2512.02189)
+30. [Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs](https://www.arxiv.org/pdf/2512.18134)
+31. [Focus on Your Algorithm—NVIDIA CUDA Tile Handles the Hardware | NVIDIA Technical Blog](https://developer.nvidia.com/blog/focus-on-your-algorithm-nvidia-cuda-tile-handles-the-hardware/)
+32. [\[2502.16631\] CRIUgpu: Transparent Checkpointing of GPU-Accelerated Workloads](https://arxiv.org/abs/2502.16631)
+33. [\[2511.04758\] ScheduleStream: Temporal Planning with Samplers for GPU-Accelerated Multi-Arm Task and Motion Planning & Scheduling](https://arxiv.org/abs/2511.04758)
+34. [Arxiv](https://arxiv.org/pdf/1202.4347)
+35. [$$\\textsf{GPUMC}$$ : A Stateless Model Checker for GPU Weak Memory Concurrency | Springer Nature Link](https://link.springer.com/chapter/10.1007/978-3-031-98682-6_17)
+36. [Performant Unified GPU Kernels for Portable Singular Value Computation Across Hardware and Precision](https://arxiv.org/html/2508.06339)
+37. [\[2601.12698\] A Two-Stage GPU Kernel Tuner Combining Semantic Refactoring and Search-Based Optimization](https://arxiv.org/abs/2601.12698)
+38. [A Performance Model for GPUs with Caches](https://www.osti.gov/servlets/purl/1333005)
+39. [Conference Paper Title\* \*Note: Sub-titles are not captured in Xplore and should not be used Identify applicable funding agency here. If none, delete this.](https://arxiv.org/html/2505.06165)
+40. [\[2601.05242\] GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization](https://arxiv.org/abs/2601.05242)
+41. [Sawtooth Wavefront Reordering Enhanced CuTile FlashAttention on NVIDIA GB10](https://arxiv.org/pdf/2601.16032)
+42. [Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth Architectural Analysis | alphaXiv](https://www.alphaxiv.org/overview/2512.02189v1)
+43. [PEAK: A Performance Engineering AI-Assistant for GPU](https://arxiv.org/pdf/2512.19018)
+44. [Introducing Triton: Open-source GPU programming for neural networks | OpenAI](https://openai.com/index/triton/)
+45. [\[2502.11129\] Combining GPU and CPU for accelerating evolutionary computing workloads](https://arxiv.org/abs/2502.11129)
+46. [\[2505.00232\] Scaling On-Device GPU Inference for Large Generative Models](https://arxiv.org/abs/2505.00232)
+47. [Algorithmic Techniques for GPU Scheduling](https://www.preprints.org/frontend/manuscript/68ac92c3f41ee3b03471a4f15a606d37/download_pub)
+48. [\[2601.14476\] GPU-accelerated simulated annealing based on p-bits with real-world device-variability modeling](https://arxiv.org/abs/2601.14476)
+49. [Computer Science](https://www.arxiv.org/list/cs/new?skip=200&show=2000)
+50. [GPU concurrency Weak behaviours and programming assumptions Jade Alglave1,2](https://johnwickerson.github.io/papers/gpuconcurrency.pdf)
+51. [Tilus: A Virtual Machine for Arbitrary Low-Precision GPGPU Computation in LLM Serving](https://arxiv.org/html/2504.12984v2)
+52. [\[2209.02882\] Sgap: Towards Efficient Sparse Tensor Algebra Compilation for GPU](https://arxiv.org/abs/2209.02882)
+53. [A performance model for GPUs with caches (Journal Article) | OSTI.GOV](https://www.osti.gov/biblio/1333005)
+54. [NVIDIA GB10 Grace Blackwell Architecture](https://www.emergentmind.com/topics/nvidia-gb10-grace-blackwell)
+55. [(PDF) Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth Architectural Analysis](https://www.researchgate.net/publication/398269857_Microbenchmarking_NVIDIA's_Blackwell_Architecture_An_in-depth_Architectural_Analysis)
+56. [\[2512.24840\] Scalable Stellar Parameter Inference Using Python-based LASP: From CPU Optimization to GPU Acceleration](https://arxiv.org/abs/2512.24840)
+57. [NVIDIA CUDA Tile IR Backend for OpenAI Triton: A Bridge to Next-Generation GPU Programming](https://www.ainvest.com/news/nvidia-cuda-tile-ir-backend-openai-triton-bridge-generation-gpu-programming-2601/)
+58. [Combining GPU and CPU for accelerating evolutionary computing workloads](https://arxiv.org/html/2502.11129)
+59. [SpecOffload: Unlocking Latent GPU Capacity for LLM Inference on Resource-Constrained Devices](https://arxiv.org/html/2505.10259v2)
+60. [\[2512.11269v1\] A Scalable Multi-GPU Framework for Encrypted Large-Model Inference](https://arxiv.org/abs/2512.11269v1)
+61. [\[2511.17594\] AutoSAGE: Input-Aware CUDA Scheduling for Sparse GNN Aggregation (SpMM/SDDMM) and CSR Attention](https://arxiv.org/abs/2511.17594)
+62. [TopKGAT: A Top-K Objective-Driven Architecture for Recommendation](https://arxiv.org/html/2601.18432v1)
+63. [\[2601.18692\] A Pragmatic VLA Foundation Model](https://arxiv.org/abs/2601.18692)
+64. [HipKittens: Fast and Furious AMD Kernels](https://arxiv.org/html/2511.08083v1)
+65. [A Tensor Compiler for Processing-In-Memory Architectures](https://arxiv.org/html/2511.15503)
+66. [Preprint: Toward Robust and Efficient ML-Based GPU Caching for Modern Inference](https://arxiv.org/html/2509.20979v1)
+67. [GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization](https://arxiv.org/html/2601.05242v1)
+68. [\[2601.21382\] Wavelength-selective nonlinear wavefront control in resonant thin-film lithium niobate metasurfaces](https://arxiv.org/abs/2601.21382)
+69. [NVIDIA Blackwell GPU Architecture](https://www.emergentmind.com/topics/nvidia-blackwell-gpus)
+70. [GPU-Accelerated Optimization Solver for Unit](https://www.arxiv.org/pdf/2512.06715)
+71. [NVIDIA Integrates CUDA Tile Backend for OpenAI Triton GPU Programming](https://bitcoinethereumnews.com/tech/nvidia-integrates-cuda-tile-backend-for-openai-triton-gpu-programming/)
+72. [\[2502.14691\] Parallelizing a modern GPU simulator](https://arxiv.org/abs/2502.14691)
+73. [\[2505.22982\] Structural Abstraction and Selective Refinement for Formal Verification](https://arxiv.org/abs/2505.22982)
+74. [A Survey of Real-time Scheduling on Accelerator-based Heterogeneous Architecture for Time Critical Applications](https://arxiv.org/html/2505.11970v1)
+75. [Evaluating Application Characteristics for GPU Portability Layer Selection](https://arxiv.org/html/2601.17526)
+76. [A Novel Computational Model for GPUs with Application to I/O Optimal Sorting Algorithms | IEEE Conference Publication | IEEE Xplore](https://ieeexplore.ieee.org/document/6969442/)
+77. [\[Literature Review\] GPUMC: A Stateless Model Checker for GPU Weak Memory Concurrency](https://www.themoonlight.io/en/review/gpumc-a-stateless-model-checker-for-gpu-weak-memory-concurrency)
+78. [Communication-Avoiding Linear Algebraic Kernel K-Means on GPUs](https://arxiv.org/html/2601.17136)
+79. [\[2601.04719\] GPU-Accelerated INT8 Quantization for KV Cache Compression in Large Language Models](https://arxiv.org/abs/2601.04719)
+80. [Machine Learning May 2025](https://www.arxiv.org/list/cs.LG/2025-05?skip=2575&show=2000)
+81. [\[2601.07372\] Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models](https://arxiv.org/abs/2601.07372)
+82. [\[2601.15670\] Geometric wavefront sets of genuine Iwahori-spherical representations](https://arxiv.org/abs/2601.15670)
+83. [Blackwell GPU Architecture](https://www.emergentmind.com/topics/blackwell-gpu-architecture)
+84. [Superpipeline: A Universal Approach for Reducing GPU Memory Usage in Large Models](https://arxiv.org/html/2410.08791v1)
+85. [Advancing GPU Programming with the CUDA Tile IR ...](https://forums.developer.nvidia.com/t/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/359188)
+86. [\[2502.18680\] Longitudinal Analysis of GPU Workloads on Perlmutter](https://arxiv.org/abs/2502.18680)
+87. [\[2505.22857\] NGPU-LM: GPU-Accelerated N-Gram Language Model for Context-Biasing in Greedy ASR Decoding](https://arxiv.org/abs/2505.22857)
+88. [An Online Fragmentation-Aware GPU Scheduler for Multi-Tenant MIG-based Clouds](https://arxiv.org/html/2511.18906)
+89. [SYNPERF: A Hybrid Analytical-ML Framework for GPU Performance Prediction](https://arxiv.org/pdf/2601.14910)
+90. [\[2601.21353\] SecIC3: Customizing IC3 for Hardware Security Verification](https://arxiv.org/abs/2601.21353)
+91. [Challenging GPU Dominance: When CPUs Outperform for On-Device LLM Inference](https://arxiv.org/html/2505.06461)
+92. [TileLink: Generating Efficient Compute-Communication Overlapping Kernels using Tile-Centric Primitives](https://arxiv.org/html/2503.20313v1)
+93. [GitHub - merrymercy/awesome-tensor-compilers: A list of awesome compiler projects and papers for tensor computation and deep learning.](https://github.com/merrymercy/awesome-tensor-compilers)
+94. [cache performance modeling: Topics by Science.gov](https://www.science.gov/topicpages/c/cache+performance+modeling)
+95. [Explore | alphaXiv](https://www.alphaxiv.org/)
+96. [Artificial Intelligence May 2025](https://arxiv.org/list/cs.AI/2025-05?skip=1075&show=25)
+97. [On Ray Reordering Techniques for Faster GPU Ray Tracing](https://arxiv.org/html/2506.11273v1)
+98. [V1.1 NVIDIA RTX BLACKWELL GPU ARCHITECTURE Built for Neural Rendering](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
+99. [\[2512.11112\] An LLVM-Based Optimization Pipeline for SPDZ](https://arxiv.org/abs/2512.11112)
+100. [NVIDIA Integrates CUDA Tile Backend for OpenAI Triton GPU Programming](https://blockchain.news/news/nvidia-cuda-tile-backend-openai-triton-gpu-programming)
+101. [Can Tensor Cores Benefit Memory-Bound Kernels? (No!)](https://arxiv.org/html/2502.16851v2)
+102. [\[2505.23486\] Autoformalization in the Era of Large Language Models: A Survey](https://arxiv.org/abs/2505.23486)
+103. [MemFine: Memory-Aware Fine-Grained Scheduling for MoE Training](https://arxiv.org/html/2511.21431)
+104. [\[2402.13499\] Benchmarking and Dissecting the Nvidia Hopper GPU Architecture](https://arxiv.org/abs/2402.13499)
+105. [\[2601.08833\] Revisiting Disaggregated Large Language Model Serving for Performance and Energy Implications](https://arxiv.org/abs/2601.08833)
+106. [LACONIC: Dense-Level Effectiveness for Scalable Sparse Retrieval via a Two-Phase Training Curriculum](https://arxiv.org/html/2601.01684)
+107. [GPU concurrency: weak behaviours and programming assumptions | Tyler Sorensen](https://users.soe.ucsc.edu/~tsorensen/publication/asplos15/)
+108. [\[2511.10374\] Modeling Layout Abstractions Using Integer Set Relations](https://arxiv.org/abs/2511.10374)
+109. [Act: Automatically Generating Compiler Backends from Tensor Accelerator ISA Descriptions](https://arxiv.org/html/2510.09932v1)
+110. [arXiv.org e-Print archive](https://arxiv.org/)
+111. [\[2505.21815v2\] Scientific Paper Retrieval with LLM-Guided Semantic-Based Ranking](https://arxiv.org/abs/2505.21815v2)
+112. [\[2601.09830\] Wavefront Engineering for Scintillation-Based Imaging](https://arxiv.org/abs/2601.09830)
+113. [Dissecting the NVIDIA Blackwell Architecture with Microbenchmarks](https://arxiv.org/html/2507.10789v2)
+114. [Theoretical Foundations of GPU-Native Compilation for Rapid Code Iteration](https://arxiv.org/html/2512.11200)
+115. [GitHub - triton-lang/Triton-to-tile-IR: incubator repo for CUDA-TileIR backend](https://github.com/triton-lang/Triton-to-tile-IR)
+116. [Demystifying Cost-Efficiency in LLM Serving over Heterogeneous GPUs](https://arxiv.org/html/2502.00722v1)
+117. [\[2505.15536\] DeepCEE: Efficient Cross-Region Model Distributed Training System under Heterogeneous GPUs and Networks](https://arxiv.org/abs/2505.15536)
+118. [GFS: A Preemption-aware Scheduling Framework for GPU Clusters with Predictive Spot Instance Management](https://arxiv.org/html/2509.11134v1)
+119. [GPU-Accelerated INT8 Quantization for KV Cache Compression in Large Language Models](https://arxiv.org/html/2601.04719v1)
+120. [\[2601.22919\] A Serverless Edge-Native Data Processing Architecture for Autonomous Driving Training](https://arxiv.org/abs/2601.22919)
+121. [Weak Memory Model Formalisms: Introduction and Survey](https://arxiv.org/pdf/2508.04115)
+122. [TileLang: A Composable Tiled Programming Model for AI Systems](https://arxiv.org/pdf/2504.17577)
+123. [Automatically Generating Compiler Backends from Tensor ...](https://act-compiler.github.io/assets/pdf/act-arxiv.pdf)
+124. [Computer Science May 2025](https://www.arxiv.org/list/cs/2025-05?skip=3575&show=2000)
+125. [Computer Vision and Pattern Recognition](https://www.arxiv.org/list/cs.CV/pastweek?skip=7&show=1000)
+126. [\[2601.17908\] Graphical Constructions of Wavefronts and Waist Parameters in Gaussian Beam Optics](https://arxiv.org/abs/2601.17908)
+127. [Blackwell (microarchitecture) - Wikipedia](https://en.wikipedia.org/wiki/Blackwell_(microarchitecture))
+128. [A Systematic Characterization of LLM Inference on GPUs](https://www.arxiv.org/pdf/2512.01644)
+129. [CUDA Tile | NVIDIA Developer](https://developer.nvidia.com/cuda/tile)
+130. [GPUArmor: A Hardware-Software Co-design for Efficient and](https://arxiv.org/pdf/2502.17780)
+131. [\[2505.10259\] SpecOffload: Unlocking Latent GPU Capacity for LLM Inference on Resource-Constrained Devices](https://arxiv.org/abs/2505.10259)
+132. [Hyperion: Hierarchical Scheduling for Parallel LLM Acceleration in Multi-tier Networks](https://arxiv.org/html/2511.14450)
+133. [\[2503.20481\] Analyzing Modern NVIDIA GPU cores](https://arxiv.org/abs/2503.20481)
+134. [2026 Challenges of the Knowledge Society. IT GPGPU COMPUTING BOGDAN OANCEA\*](https://arxiv.org/pdf/1408.6923)
+135. [(PDF) GPUMC: A Stateless Model Checker for GPU Weak Memory Concurrency](https://www.researchgate.net/publication/392132407_GPUMC_A_Stateless_Model_Checker_for_GPU_Weak_Memory_Concurrency)
+136. [\\name: A Multi-Agent System for GPU Kernel Performance Optimization](https://arxiv.org/html/2509.07506v1)
+137. [1 Introduction](https://arxiv.org/html/2601.19092)
+138. [\[2601.14910\] SynPerf: A Hybrid Analytical-ML Framework for GPU Performance Prediction](https://arxiv.org/abs/2601.14910)
+139. [Computation and Language](https://arxiv.org/list/cs.CL/recent)
+140. [\[2601.22401\] Semi-Autonomous Mathematics Discovery with Gemini: A Case Study on the Erdős Problems](https://arxiv.org/abs/2601.22401)
+141. [Geometric wavefront sets of genuine Iwahori-spherical representations](https://arxiv.org/html/2601.15670)

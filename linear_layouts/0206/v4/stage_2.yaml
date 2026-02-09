@@ -1,0 +1,611 @@
+context_pack_version: "S2.v1"
+generated_at_utc: "2026-02-05T14:00:18Z"
+project_profile:
+  objective: "Probe research gaps on NVIDIA Blackwell GPU architecture; output an academic LaTeX proposal."
+  stage: "S2_GAP_MAP_AND_LATEX_PLAN"
+  hard_constraints:
+    architecture: "NVIDIA Blackwell (Grace‑Blackwell included when relevant)"
+    cuda: "> 13.0 (e.g., 13.1+)"
+    ptx: "> 9.0 (strictly greater than 9.0)"
+    required_sources_each_run: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+  writing_constraints:
+    latex_style: "academic"
+    output_split: ">= 9 LaTeX parts (recommended); each LaTeX run emits exactly 1 part"
+    citation_policy: "no uncited non-trivial claims; mark UNVERIFIED if not in sources"
+  scope_boundaries:
+    include:
+      - "TMEM/Tensor Memory"
+      - "Tensor Core pipelines"
+      - "TMA/data movement"
+      - "compiler IR (Triton/TileIR/CuTile)"
+      - "scheduling (SWP/WS/CTA)"
+      - "layout abstractions"
+      - "system-level locality (Grace‑Blackwell) when evidenced"
+    exclude:
+      - "marketing-only claims without evidence"
+      - "non-Blackwell architectures except as comparison baselines"
+      - "unverifiable microarchitectural claims (must be marked UNVERIFIED if used as hypotheses)"
+golden_sources:
+  ARCH_BW:
+    url: "https://arxiv.org/html/2512.02189v1"
+    tier: "tier_1_insight"
+  OPT_PIPE:
+    url: "https://arxiv.org/html/2512.18134v1"
+    tier: "tier_1_insight"
+  NV_workloads:
+    url: "https://arxiv.org/html/2502.13113"
+    tier: "tier_1_insight"
+  NV_BLOG_TILE:
+    url: "https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/"
+    tier: "tier_1_insight"
+  SEED_1:
+    url: "https://arxiv.org/html/2505.23819v3"
+    tier: "tier_4_context"
+  SEED_2:
+    url: "https://arxiv.org/html/2511.10374v1"
+    tier: "tier_4_context"
+  SEED_3:
+    url: "https://arxiv.org/html/2601.16032v2"
+    tier: "tier_4_context"
+source_audit:
+  ARCH_BW:
+    used_for:
+      - "Blackwell B200 high-level architectural context (dual-die unification, SM/L2/HBM3e counts) to delimit what can/cannot be generalized to other Blackwell-family parts."
+      - "TMEM structure + empirical latency/bandwidth results + tile-size efficiency claims to ground TMEM-centric gap statements and modeling needs."
+      - "Blackwell data-movement paradigm shift (Hopper cp.async.bulk.tensor.2d + ldmatrix/wmma.load vs Blackwell tcgen05.cp/ld/st) to motivate compiler/IR and scheduling gaps."
+      - "PTX→SASS evidence for 5th-gen Tensor Core instructions (OMMA for FP4) and latency comparisons (tcgen05.mma vs wgmma) to anchor pipeline/scheduling discussions."
+      - "Software ecosystem limitations (CUDA 13.0 preliminary support; FP6 tooling gap) as constraints/tensions when targeting CUDA 13.1+."
+    anchors:
+      - "Section III-A Blackwell Architecture: B200 dual-die, 148 SMs, 4 L2 partitions, 8 HBM3e stacks; unified 192 GB HBM3e; NV-HBI; Figure 1."
+      - "Section III-A: tcgen05.mma described as single-thread instruction; per-thread MMA issuing; explicit TMEM management via tcgen PTX instruction set."
+      - "Section V-A Tensor Memory (TMEM): 256 KB per SM; 512 columns × 128 lanes; lane-column addressing; ~420-cycle end-to-end access (cache-miss); 16 TB/s read and 8 TB/s write per SM; additive bandwidth claim; tile-size efficiency statements; Hopper vs Blackwell pipeline contrast; tcgen05.cp/ld/st roles."
+      - "Table IV: tcgen05.mma PTX ↔ precision-specific SASS mapping; OMMA for FP4."
+      - "Table V: single-instruction latency comparison (wgmma vs tcgen05.mma)."
+      - "Section VIII Discussion: CUDA 13.0 preliminary TMEM/CTA support; FP6 hardware lacks software tooling."
+  OPT_PIPE:
+    used_for:
+      - "Evidence that Blackwell requires different SWP/WS strategies due to faster Tensor Cores and an increased set of required synchronization operations tied to Tensor Memory loads/stores."
+      - "Evidence of compiler lowering gaps (memory allocation, layout conversions, synchronization placement) motivating IR/allocator/verification research."
+      - "Blackwell-specific compilation failures: Triton inability to generate code due to Tensor Memory allocation strategies with aliasing; ptxas register allocation/spilling degrading performance."
+      - "Modeling of variable-latency operations as streaming ops and explicit mention of TMA loads of input tiles, grounding scheduling+data-movement co-optimization gaps."
+      - "Explicit tooling constraint in their setup: Triton supports only power-of-two tile sizes (motivating shape/tile generalization gaps)."
+    anchors:
+      - "Evaluation Platforms: H100 SXM5 80GB + B200 180GB; 'All experiments use CUDA 13.0'."
+      - "Experimental Setup: Triton made incorrect decisions (memory allocation, data layout conversions, synchronization placement); authors hand-compile Twill pipelines into CUDA C++."
+      - "Section 6.2.2 Blackwell: different SWP/WS due to faster TC + more required sync ops (Tensor Memory loads/stores); discussion of blocking synchronization when reading accumulators from Tensor Memory."
+      - "Section 6.3.2 Blackwell: Triton unable to generate code due to inability to construct Tensor Memory allocation strategies that contain aliasing; ptxas unable to register allocate without significant spilling."
+      - "Section 5.3 Variable Latency Optimizations: streaming ops; 'Many critical compute-bound kernels contain streaming variable-latency operations (like TMA loads of input tiles)'; tunable pipeline depths."
+      - "Power-of-two constraint statement: Triton only supports power-of-two tile sizes; Twill has no fundamental reason to require powers of two."
+  NV_workloads:
+    used_for:
+      - "Mixed-reuse workload motivation for why Blackwell optimization must handle heterogeneous operator mixes and phase behavior (e.g., prefill vs decode)."
+      - "Definition of mapping as loop transformations (tiling/permutation/parallelization), used to connect kernel-level choices (tile shapes/layouts/schedules) to a broader mapping vocabulary."
+      - "Harp taxonomy vocabulary for hierarchical/heterogeneous processors, including explicit GPU/tensor-core intra-node heterogeneity example tied to 'NVIDIA B-100'."
+      - "Workload list and transformer partition framing (Table II) to choose representative evaluation workloads and to justify attention-centric focus."
+      - "Sensitivity trends (bandwidth partitioning sensitivity; DRAM vs RF energy dominance; overlap opportunities) to motivate evaluation metrics and system-level implications."
+    anchors:
+      - "Section II-A Mapping: mapping as loop transformations (tiling, loop permutation, parallelization, etc.)."
+      - "Section II-B Mixed-reuse Workloads: definition and transformer examples; prefill/decode distinction."
+      - "Section IV-A Classification / Intra-node heterogeneous: example 'NVIDIA B-100 where the tensor-core operates on the same program counter as the SM'; related Table I row mentioning NVIDIA B100 GPUs + same program counter under a common FSM."
+      - "Section VI-B Workloads: Table II (BERT-large intra-cascade; Llama-2 and GPT3 inter-cascade with prefill/decode sequence lengths)."
+      - "Section VII-F Summary of Key Trends: encoder vs decoder trends; energy dominated by DRAM vs RF; sensitivity to bandwidth partitioning; overlap argument."
+      - "Evaluation framework context: Figure 5 (Timeloop-based framework inputs and mapping exploration)."
+  NV_BLOG_TILE:
+    used_for:
+      - "Toolchain gating for TileIR path under the project CUDA>13.0 constraint: CUDA 13.1+ and NVIDIA Blackwell GPUs; source-based build requirement."
+      - "Concrete operational procedure to enable TileIR backend (ENABLE_TILE=1) and artifact expectations (.tileIR cache instead of .cubin)."
+      - "Known limitations: unsupported operations in TileIR backend; early-stage constraints for coverage planning."
+      - "Performance pitfall: tensor-of-pointer patterns show suboptimal performance on TileIR backend with CUDA 13.1; mitigation via descriptor-driven TMA load/store using tl.make_tensor_descriptor and desc.load/store."
+      - "Conceptual framing: Triton-to-TileIR targets CUDA Tile IR instead of PTX; TileIR described as MLIR-based with spec-defined semantics."
+    anchors:
+      - "What is Triton-to-TileIR? Targets CUDA Tile IR instead of PTX; MLIR-based infrastructure; aims to preserve tile semantics."
+      - "How to use Triton-to-TileIR: source-based compilation only; prerequisites include CUDA 13.1 or higher and NVIDIA Blackwell GPUs."
+      - "Verify Tile IR compilation: export ENABLE_TILE=1; Triton caches .tileIR files (vs .cubin); cache typically in ~/.triton/cache (path itself may vary)."
+      - "Limitations: Unsupported operations (not all Triton ops implemented)."
+      - "Tensor-of-pointer degradation suboptimal performance on CUDA 13.1 TileIR backend; mitigation suggestion to adopt TMA load/store; code sketch using tl.make_tensor_descriptor(shape, strides, block_shape) and desc.load."
+  SEED_1:
+    used_for:
+      - "Formal layout abstraction: completeness of Triton distributed layouts as linear layouts (Theorem 4.9) to support layout reasoning in proposed compiler/verification pipeline."
+      - "Formalization of memory layouts as linear layouts (Theorem 4.13) and explicit mention that memory layouts can target shared memory and tensor memory, connecting layout theory to Blackwell memory tiers."
+      - "Evidence that legacy Triton layout handling can be buggy/insufficient (Table 5 correctness pass rate 46.6% for Triton baseline vs Triton-Linear passing all cases) to motivate verification/robustness emphasis."
+      - "Conversion/codegen algorithms (layout conversions, swizzling, shuffle generation) as a candidate substrate for reliable lowering decisions."
+      - "Explicit limitations: power-of-two shape restriction; flipping/slicing not expressible; affine layouts proposed as an extension; motivates shape-support gap."
+    anchors:
+      - "Section 4.3 Completeness: Theorem 4.9 (Every distributed layout is a linear layout); Definition 4.10 (Distributed Layout)."
+      - "Proposition 4.7: mma and wgmma input/output layouts are linear layouts."
+      - "Theorem 4.13: Every memory layout is a linear layout; Definition 4.14 (Memory Layout); text referencing memory layouts for shared memory and tensor memory."
+      - "Section 6 Evaluation: Table 5 reports Triton overall pass rate 46.6% out of 784 cases; Triton-Linear passes all."
+      - "Conclusions limitation statement: restriction to power-of-two shapes; mitigation via masking; flipping/slicing not expressible; affine layouts extension; future plan to integrate hardware measurements."
+  SEED_2:
+    used_for:
+      - "Unified layout modeling across CuTe and Triton linear layouts via integer set relations (ISL) to support cross-system layout verification and reasoning."
+      - "Explicit warning that CuTe composition with implicit layout promotion can lead to out-of-bound accesses; integer set relations can synthesize required predicates, grounding safety/verification gap."
+      - "Implementation evidence: isl-layout tool translating layouts/ops to integer set relations; supports CuTe ops (inverse/complement/composition)."
+      - "Expressiveness and complexity framing: integer set relations can represent mappings beyond existing systems; compile-time complexity discussion for practicality claims."
+      - "Conclusion explicitly positions work as foundational rather than runtime optimization; used to scope what is missing for performance-aware compilation."
+    anchors:
+      - "Introduction/Contributions: unified mathematical framework for CuTe layouts + swizzles and Triton linear layouts using integer set relations; explicitly foundational (not performance optimization)."
+      - "Section 2.1.2 Layout Operations: composition, inverse, complement."
+      - "Section 3.1 Coordinate and Index Spaces: integer-set definitions for coordinate/index spaces."
+      - "Composition semantics discussion: example where CuTe composed layout yields mappings beyond relational composition; risk of out-of-bound memory access; statement that integer set relations can automatically synthesize predicates."
+      - "Section 6 Implementation and Examples: isl-layout tool; Tables 1 and 2; supports CuTe ops and translations."
+      - "Expressiveness Beyond Existing Layout Systems; Complexity section (worst-case exponential but practical; rank/tiling dimension argument)."
+      - "Section 8 Conclusions: foundations focus; integration with polyhedral frameworks; not runtime performance optimization."
+  SEED_3:
+    used_for:
+      - "Grace‑Blackwell system-level locality evidence: GB10 platform context (48 SMs, 24 MiB L2) and methodology using counters + raw CUDA to isolate scheduling effects."
+      - "CTA scheduling strategy: persistent CTA scheduling (grid-stride loop) as a controlled mechanism for studying cache behavior; ties to scheduling gap."
+      - "Cache behavior evidence: L1 provides negligible benefit; L2 access dominated by L1Tex traffic; hardware-counter tables as evaluation-metric anchors."
+      - "L2 non-compulsory miss threshold evidence: divergence around sequence length ~80K where KV size ~20 MiB approaches L2 size 24 MiB."
+      - "Concrete scheduling transformation: Sawtooth KV access pattern (Algorithm 4) and measured L2 miss reductions/throughput gains; plus explicit CuTile limitation at tile size 128 (compiler splitting alters pattern)."
+    anchors:
+      - "Section 2.1 NVIDIA GB10: announced Jan 2025, available Oct 2025; Grace Blackwell; 48 SMs; L2 cache size 24 MiB."
+      - "Section 2.2 CTA Scheduling and Work Distribution: persistent CTA scheduling; Algorithm 2 (grid-stride loop)."
+      - "Section 3.1 Effect of L1 Caching: Table 1 and Table 2 counter evidence (negligible L1 hit count; L2 sectors largely from Tex)."
+      - "Section 3.2 Modeling L2 Sector Access: single-batch/single-head model; validation figures."
+      - "Section 3.3 L2 Non-Compulsory Miss Threshold: divergence at ~80K sequence length; KV ~20 MiB vs L2 24 MiB; Figure 5."
+      - "Section 4.1 Implementation: Algorithm 4 Sawtooth KV Access Pattern."
+      - "Section 4.3.2 Limitations: CuTile compiler may split tile size 128 that does not fit in L1Tex, altering access pattern."
+evidence_index:
+  ARCH_BW:
+    key_evidence_for_writing:
+      - "B200 architectural context: dual-die unified via NV-HBI; 148 SMs; 4 L2 cache partitions; 8 HBM3e stacks; unified 192 GB HBM3e (Section III-A; Figure 1)."
+      - "Compute granularity shift: tcgen05.mma described as single-thread instruction replacing warp-synchronous MMA (Section III-A)."
+      - "TMEM structure and performance: 256 KB per SM; 512×128 lane/column organization; lane-column addressing; ~420-cycle cache-miss access; 16 TB/s read and 8 TB/s write per SM; tile-size efficiency statements (Section V-A)."
+      - "Pipeline shift: Hopper cp.async.bulk.tensor.2d + ldmatrix/wmma.load contrasted with Blackwell tcgen05.cp/ld/st (Section V-A)."
+      - "ISA surface evidence: OMMA for FP4 in mapping table; latency comparisons for tcgen05.mma (Table IV, Table V)."
+    limitations_to_carry_into_plan:
+      - "CUDA 13.0 is described as preliminary for TMEM/CTA support; FP6 tooling gap (Section VIII)."
+      - "UNVERIFIED: PTX ISA version requirements for tcgen05/tcgen instructions and their precise hazard semantics."
+  OPT_PIPE:
+    key_evidence_for_writing:
+      - "Blackwell attention kernels require different SWP/WS due to faster TC and required synchronization around Tensor Memory loads/stores (Section 6.2.2 Blackwell)."
+      - "Triton lowering issues: incorrect memory allocation/layout conversions/sync placement; authors hand-compile into CUDA C++ (Experimental Setup)."
+      - "Compilation barriers on Blackwell backward: Triton cannot generate code due to Tensor Memory allocation aliasing; ptxas spilling observed in some strategies (Section 6.3.2 Blackwell)."
+      - "Variable-latency modeling: streaming ops; explicit example of TMA loads of input tiles; tunable depths (Section 5.3)."
+      - "Power-of-two constraint: Triton only supports power-of-two tile sizes in their context (power-of-two statement)."
+    limitations_to_carry_into_plan:
+      - "Their evaluation uses CUDA 13.0; replicating under CUDA 13.1+ may change behavior (UNVERIFIED)."
+      - "Twill limitations: singly-nested loops; tile size not auto-selected; solver times (tens of seconds to minutes) not targeted for interactive use."
+  NV_workloads:
+    key_evidence_for_writing:
+      - "Mixed-reuse framing: AI workloads are cascades of operators with varying reuse/arithmetic intensity; transformers as canonical example (Introduction; Section II-B)."
+      - "Mapping vocabulary: mapping as loop transformations (tiling/permutation/parallelization) (Section II-A)."
+      - "Harp taxonomy: classification of heterogeneous/hierarchical processors; intra-node heterogeneity example tied to NVIDIA B-100/B100 GPUs (Section IV-A)."
+      - "Representative workloads: Table II includes BERT-large and decoder models (Llama-2, GPT3) with intra-/inter-cascade partition framing (Section VI-B)."
+      - "Key trends: phase-dependent benefits (encoder vs decoder), bandwidth-partition sensitivity, DRAM vs RF energy dominance (Section VII-F)."
+    limitations_to_carry_into_plan:
+      - "Modeling study (Timeloop-based); Blackwell-specific TMEM/TMA semantics are not modeled (requires extension; UNVERIFIED)."
+  NV_BLOG_TILE:
+    key_evidence_for_writing:
+      - "Toolchain gate: Triton-to-TileIR requires CUDA 13.1+ and NVIDIA Blackwell GPUs; source-based build (How to use Triton-to-TileIR)."
+      - "Backend selection reality: TileIR targets CUDA Tile IR rather than PTX (What is Triton-to-TileIR?)."
+      - "Operational reproducibility hooks: ENABLE_TILE=1; .tileIR cache artifacts (Verify Tile IR compilation)."
+      - "Known limitations: unsupported operations; early-stage backend (Limitations)."
+      - "Performance pitfall + mitigation: tensor-of-pointer suboptimal on CUDA 13.1 TileIR backend; suggested rewrite using tl.make_tensor_descriptor + TMA load/store (Tensor-of-pointer section)."
+    limitations_to_carry_into_plan:
+      - "UNVERIFIED: exact list of unsupported operations (linked externally); performance impact is qualitative in this source."
+      - "Backend surface tension vs PTX-heavy microbenchmark approaches (must be resolved via explicit dual-path methodology)."
+  SEED_1:
+    key_evidence_for_writing:
+      - "Completeness: distributed layouts are linear layouts (Theorem 4.9) and formal distributed-layout definition (Definition 4.10)."
+      - "Memory layouts: every memory layout is a linear layout (Theorem 4.13) and formal definition (Definition 4.14)."
+      - "Correctness evidence: Triton baseline fails many matmul cases (46.6% pass rate) while Triton-Linear passes all (Table 5)."
+      - "Limitation: power-of-two shape restriction; flipping/slicing not expressible; affine layouts proposed; masking mitigation suggested (Conclusions statement)."
+    limitations_to_carry_into_plan:
+      - "Not Blackwell-specific; mapping to Blackwell TMEM/tcgen05 layouts requires additional evidence (UNVERIFIED)."
+  SEED_2:
+    key_evidence_for_writing:
+      - "Unified framework: model CuTe layouts/swizzles and Triton linear layouts using ISL integer set relations (Introduction/Contributions)."
+      - "Safety issue: CuTe implicit layout promotion in composition can lead to out-of-bound accesses; integer set relations can synthesize predicates (composition discussion)."
+      - "Implementation: isl-layout tool translating layouts/ops; supports CuTe ops (composition/inverse/complement) (Section 6)."
+      - "Expressiveness and complexity: richer mappings than existing systems; compile-time cost and practical dimension argument (Expressiveness, Complexity)."
+      - "Conclusion: foundational; not runtime performance optimization; suggests integration with polyhedral frameworks (Section 8)."
+    limitations_to_carry_into_plan:
+      - "Bridging from layout verification to performance-aware scheduling and instruction selection remains open (by the paper’s own scope)."
+  SEED_3:
+    key_evidence_for_writing:
+      - "Platform context: GB10 Grace Blackwell; 48 SMs; L2 cache size 24 MiB (Section 2.1)."
+      - "Scheduling methodology: persistent CTA scheduling for deterministic cache study; raw CUDA used to isolate scheduling from compiler effects; then ported to CuTile (Introduction; Section 2.2)."
+      - "Cache findings: L1 hit negligible; L2 sectors dominated by Tex; tabled counter evidence (Section 3.1)."
+      - "Threshold: divergence at ~80K sequence length when KV ~20 MiB approaches L2 24 MiB (Section 3.3; Figure 5)."
+      - "Transformation: Sawtooth KV access ordering; miss/throughput improvements; CuTile limitation at tile size 128 due to compiler splitting (Section 4; Section 4.3.2)."
+    limitations_to_carry_into_plan:
+      - "Hardware specificity: GB10 results may not transfer to B200 dual-die parts without measurement (UNVERIFIED)."
+cross_source_synthesis:
+  agreements:
+    - "Blackwell-era performance engineering is increasingly tile-centric and explicitly managed: ARCH_BW emphasizes TMEM + tcgen05 data movement; OPT_PIPE emphasizes increased synchronization around Tensor Memory and need for joint SWP/WS; NV_BLOG_TILE emphasizes descriptor-driven TMA APIs to avoid tensor-of-pointer overheads."
+    - "Compiler maturity gaps recur across levels: OPT_PIPE reports Triton makes incorrect lowering decisions (allocation/layout/sync); NV_BLOG_TILE documents early TileIR backend limitations/unsupported ops; SEED_1 and SEED_2 propose formal layout foundations that target correctness/verification of layout transformations."
+    - "Scheduling and locality are tightly coupled: OPT_PIPE’s SWP/WS strategies and sync costs interact with data movement, while SEED_3 shows CTA scheduling order can materially change L2 behavior and throughput on Grace‑Blackwell."
+    - "Shape restrictions show up repeatedly: OPT_PIPE notes power-of-two tile-size constraint in Triton; SEED_1 notes power-of-two shape restriction for linear layouts; these constraints can block exploration even when higher-level scheduling models could support richer shapes."
+  tensions_or_contradictions:
+    - "CUDA version tension: ARCH_BW and OPT_PIPE report CUDA 13.0 usage on Blackwell, but project hard constraint requires CUDA>13.0 and NV_BLOG_TILE gates TileIR to CUDA 13.1+; results may shift under newer toolchains (UNVERIFIED until re-measured)."
+    - "Backend surface tension: ARCH_BW relies on PTX-level control and PTX→SASS mapping; NV_BLOG_TILE positions TileIR as targeting CUDA Tile IR instead of PTX; a proposal must explicitly define a dual-path methodology or a bridging strategy."
+    - "Blackwell-family generality tension: ARCH_BW targets B200 dual-die HBM3e datacenter GPU, while SEED_3 targets GB10 Grace‑Blackwell (48 SMs, 24 MiB L2, unified memory); cache/scheduling observations may not transfer without validation."
+  inferred_implications_marked_as_inference:
+    - "INFERENCE: A core research gap is an end-to-end compilation pipeline that jointly optimizes (i) TMEM/tcgen05 allocation + synchronization, (ii) descriptor-driven TMA movement, (iii) solver-guided SWP/WS, and (iv) formally verified layout conversions, because each axis is evidenced separately but not integrated."
+    - "INFERENCE: CTA scheduling transformations (persistent CTA, wavefront reordering) should be treated as first-class compiler decisions for Blackwell attention kernels, not merely runtime launch heuristics, given their demonstrated L2 impact on Grace‑Blackwell."
+    - "INFERENCE: Resolving power-of-two constraints likely requires co-design across layout theory (SEED_1/SEED_2), compiler IR/backends (NV_BLOG_TILE, OPT_PIPE), and microarchitectural cost modeling (ARCH_BW), rather than isolated fixes."
+gap_map:
+  - gap_statement: "A validated performance model for TMEM-backed Blackwell kernels (capturing TMEM latency/bandwidth, tcgen05 data movement, and synchronization) is missing."
+    why_it_matters: "ARCH_BW reports TMEM’s distinct latency/bandwidth regime and tile-size sensitivity, implying that traditional GPU memory models may mispredict performance once intermediate tiles live in TMEM. OPT_PIPE’s solver-based scheduling depends on cost relationships and synchronization structure, which become Blackwell-specific when Tensor Memory loads/stores and blocking sync are introduced. NV_workloads motivates that mixed-reuse cascades (prefill vs decode) amplify the cost of wrong modeling assumptions when operators interact."
+    evidence_links: ["ARCH_BW", "OPT_PIPE", "NV_workloads"]
+    what_is_missing:
+      - "A parametric model that predicts kernel throughput as a function of TMEM tile shape, tcgen05.cp/ld/st mix, and synchronization frequency (calibrated to Blackwell measurements)."
+      - "A principled way to incorporate TMEM and TMA variable-latency behaviors into scheduling cost normalization (beyond ad-hoc constants)."
+      - "Validation methodology that separates B200-specific effects from Grace‑Blackwell (GB10) effects (UNVERIFIED transferability without measurement)."
+    candidate_research_questions:
+      - "RQ1: Which micro-parameters (tile size, tcgen05.cp depth, ld/st mix, sync placement) dominate TMEM-backed throughput across attention-like kernels?"
+      - "RQ2: Can a ratio-based cost model (as in solver scheduling) remain predictive when TMEM and TMA operations overlap with compute and have high dynamic range?"
+      - "RQ3: How does optimal tiling differ between compute-bound (Tensor Core saturated) and bandwidth-bound (TMEM/TMA constrained) regimes on Blackwell?"
+    candidate_methodology:
+      - "Reproduce and extend TMEM microbenchmarks on Blackwell (B200; include GB10 only when relevant) using CUDA 13.1+; enforce PTX ISA version > 9.0 for PTX-based microbenches (UNVERIFIED until toolchain confirms supported PTX version)."
+      - "Sweep tile shapes around reported efficiency points (e.g., <32×32, 64×64, >128×128) and measure latency/bandwidth/stall behavior; use PTX→SASS disassembly to ensure the intended tcgen05 sequences are generated."
+      - "Fit an analytical model that treats TMEM as a distinct on-chip bandwidth tier, with explicit terms for blocking synchronization and pipeline depth saturation; calibrate on microbench data."
+      - "Integrate the calibrated model into a solver-guided scheduler for attention-like kernels (forward and backward variants), using cost ratios rather than absolute cycles when appropriate."
+      - "Cross-validate model predictions across operator cascades motivated by mixed-reuse framing (encoder vs decoder phases), reporting when prediction fails and why."
+    evaluation_metrics:
+      - "Prediction error of throughput (e.g., MAPE) on held-out kernels/tiles."
+      - "Achieved kernel throughput (TFLOPS) and effective bandwidth at TMEM/global interfaces."
+      - "Sensitivity curves vs tile size and pipeline depth parameters."
+      - "Schedule generation time (solver time) vs achieved speedup."
+      - "Incidence of compiler-induced artifacts (register spills, unexpected instruction substitution)."
+    risks_and_mitigations:
+      - "Risk: Toolchain drift between CUDA 13.0 (used in some sources) and CUDA 13.1+ changes instruction selection; mitigation: report versions, keep dual baselines, and treat discrepancies as first-class results."
+      - "Risk: Limited access to multiple Blackwell-family devices; mitigation: prioritize B200 for TMEM-centric claims and GB10 for locality claims; explicitly mark cross-device generalizations UNVERIFIED."
+      - "Risk: Microbenchmark confounds (hidden caching/heuristics); mitigation: use dependency-chain designs and validate PTX→SASS mapping as in ARCH_BW’s methodology."
+  - gap_statement: "The minimal-correct synchronization and hazard rules for tcgen05/TMEM data movement and accumulator access on Blackwell are not formalized in an open, testable specification."
+    why_it_matters: "ARCH_BW describes a new instruction sequence surface (tcgen05.cp/ld/st) and exit software-managed TMEM, implying that correctness/performance hinge on correct ordering and synchronization. OPT_PIPE reports that Blackwell schedules require additional synchronization operations and that reading accumulators from Tensor Memory can require blocking synchronization, making sync placement a schedule-critical decision. SEED_1’s framing of memory layouts (including tensor memory) highlights that layout and memory-tier semantics must align with safe, well-defined access rules."
+    evidenceinks: ["ARCH_BW", "OPT_PIPE", "SEED_1"]
+    what_is_missing:
+      - "An experimentally validated operational semantics describing ordering constraints, hazards, and the minimal required synchronization around tcgen05.cp/ld/st and accumulator movement."
+      - "A mapping from high-level IR synchronization constructs to low-level barrier/fence sequences that is demonstrably correct on Blackwell."
+      - "UNVERIFIED: PTX ISA-level documentation for tcgen05 hazard semantics and the exact PTX ISA version gating these instructions."
+    candidate_research_questions:
+      - "RQ1: What is the minimal synchronization set that ensures correctness for representative TMEM producer–consumer patterns (load→mma→store→reuse)?"
+      - "RQ2: Which synchronization placements are performance-critical, and can they be predicted from dependence graphs + TMEM lifetime constraints?"
+      - "RQ3: How do per-thread tcgen05.mma issuing and TMEM access interact with warp/CTA scheduling (e.g., where blocking occurs) in prac   candidate_methodology:
+      - "Design a suite of controlled Blackwell microkernels that isolate one TMEM hazard pattern at a time (e.g., overlapping tcgen05.cp with compute; reading accumulators from TMEM on different warps) using CUDA 13.1+ and PTX ISA > 9.0 for PTX-based variants (UNVERIFIED until confirmed)."
+      - "Use PTX→SASS disassembly to confirm instruction sequences and to document any compiler-inserted synchronization."
+      - "Build a dependence-graph-based checker that correlates obserd incorrectness/perf cliffs with omitted or moved synchronization, producing candidate rules."
+      - "Validate derived rules on at least two kernel families (GEMM-like and attention-like) and report when rules do not generalize."
+    evaluation_metrics:
+      - "Correctness (bitwise or numerically stable equivalence) under stress (random seeds, edge shapes)."
+      - "Performance impact of each synchronization rule (delta TFLOPS, delta latency)."
+      - "Observed stall reasons and blocking points (where measurable via counters or timing)."
+      - "Rule coverage: fraction of tested patterns explained by derived semantics."
+    risks_and_mitigations:
+      - "Risk: Misattributing compiler heuristics to hardware semantics; mitigation: cross-check with multiple compilation strategies (hand-written PTX vs CUDA C++ where possible) and always report PTX→SASS evidence."
+      - "Risk: Safety/correctness tests can be fragile for floating-point; mitigation: include integer/bit-pattern tests where feasible and defe numeric tolerances explicitly."
+  - gap_statement: "Current compiler stacks lack robust automated TMEM allocation strategies that can express aliasing while respecting register pressure and synchronization constraints for complex kernels."
+    why_it_matters: "OPT_PIPE reports Triton cannot generate Blackwell backward attention due to inability to construct Tensor Memory allocation strategies that contain aliasing, directly evidencing an allocator gap. ARCH_BW frames TMEM as explicitly software-managed via tcgen PTX instructions, implying that allocation is a first-class performance/correctness knob rather than an incidental backend detail. NV_BLOG_TILE suggests the TileIR backend is still early (unsupported ops), increasing the likelihood that allocation strategies are a decisive differentiator between hand-tuned and compiler-generated Blackwell kernels."
+    evidence_links: ["OPT_PIPE", "ARCH_BW", "NV_BLOG_TILE"]
+    what_is_missing:
+      - "An explicit TMEM allocation model and algorithm that supports controlled aliasing/lifetime overlap and can be integrated into a compiler pipeline."
+      - "A joint treatment of TMEM allocation with register budget and spill avoidance (given OPT_PIPE’s ptxas spilling observations)."
+      - "A correctness-preserving interface between allocation decisions and synchronization placement."
+    candidate_research_questions:
+      - "RQ1: What aliasing patterns are necessary (and safe) for high-performance Blackwell attention kernels that stage/reuse accumulators in TMEM?"     - "RQ2: Can TMEM allocation be formulated as a constraint problem jointly with SWP/WS schedules, similar in spirit to OPT_PIPE’s scheduling formulation?"
+      - "RQ3: How do TMEM allocation strategies trade off against register pressure and shared memory staging (e.g., when to stage to SMEM as in described FA4 strategies)?"
+    candidate_methodology:
+      - "Implement a prototype TMEM allocator as a standalone pass that takes a dependence graph + TMEM lifetime annotations and emits an allocation pl with optional controlled aliasing; validate on microkernels first."
+      - "Integrate the allocator into two compilation paths: (i) a PTX-based path for maximal control and (ii) a TileIR-based path when supported; for each, use CUDA 13.1+ and ensure PTX ISA > 9.0 for the PTX path (UNVERIFIED until verified)."
+      - "Stress-test against OPT_PIPE-style backward attention structures and document when/why aliasing is required to compile or to fit resource budgets."
+      - "Measure spill behavior and performance across allocator variants; use disassembly to confirm whether allocation choices influence instruction selection."
+    evaluation_metrics:
+      - "Compilation success rate on representative kernels (including backward variants)."
+      - "Register count, spill count, and achieved occupancy."
+      - "Kernel throughput/latency vs baselines (hand-compiled where applicable)."
+      - "Allocator runtime and determinism (reproducibility of allocations)."
+    risks_and_mitigations:
+      - "Risk: Allocation decisions are entangled with undocumented hardware constraints; mitigation: constrain claims to empirical evidence and mark any inferred constraints UNVERIFIED until independently validated."
+      - "Risk: TileIR backend limitations block integration; mitigation: keep PTX-based reference implementation and treat TileIR integration as an incremental milestone."
+  - gap_statement: "There is no systematic, Blackwell-focused methodology to compare Triton PTX backend and Triton-to-TileIR backend code generation (coverage, correctness, performance) under CUDA 13.1+ constraints."
+    why_it_matters: "NV_BLOG_TILE explicitly positions Triton-to-TileIR as targeting CUDA Tile IR instead of PTX and documents early-stage limitations, making backend choice a research variable rather than a mere engineering detail. ARCH_BW’s Blackwell characterization relies on PTX-level microbenchmarking and PTX→SASS mapping, suggesting that a PTX-centric methodology yields different observability than TileIR. OPT_PIPE reports Tritodegen issues and hand-compilation, implying that backend maturity can dominate achieved performance and even compilability."
+    evidence_links: ["NV_BLOG_TILE", "ARCH_BW", "OPT_PIPE"]
+    what_is_missing:
+      - "A benchmark suite and protocol that compiles the same kernels through (a) PTX backend and (b) TileIR backend, reporting coverage gaps and performance deltas on Blackwell."
+      - "A reproducible artifact-tracking method that aligns TileIR artifacts (.tileIR) with downstream machine code behavior (UNVERIFIED mapping details without additional primary docs)."
+      - "A decision rubric for when to prefer TileIR vs PTX for TMEM/TMA-heavy kernels in the CUDA 13.1+ era."
+    candidate_research_questions:
+      - "RQ1: Which kernel patterns (e.g., tensor-of-pointer, reductions, layout conversions) are currently unsupported or degraded in TileIR, and what are the performance/correctness consequences?"
+      - "RQ2: How often do PTX and TileIR backends produce measurably different synchronization placement or data-movement structure on Blackwell?"
+      - "RQ3: Can a dual-path compilation strategy (TileIR for portability + PTX for control) be made reproducible and comparable for research evaluation?"
+    candidate_methodology:
+      - "Set up Triton-to-TileIR per NV_BLOG_TILE (CUDA 13.1+, Blackwell GPU, source build); use ENABLE_TILE=1 to generate .tileIR artifacts and baseline PTX backend builds for the same kernels."
+      - "For PTX backend runs, enforce PTX ISA version > 9.0 (UNVERIFIED until toolchain confirms supported PTX version) and capture PTX→SASS mapping evidence."
+      - "Construct a tiered kernel suite: (i) microkernels (loads/stores/layout ops), (ii) GEMM-like, and (iii) attention-like kernels inspired by OPT_PIPE; record unsupported-op failures explicitly."
+      - "Benchmark correctness and performance under controlled settings; where TileIR is slower due to known issues (tensor-of-pointer), test the recommended TMA descriptor rewrites as separate variants."
+    evaluation_metrics:
+      "Backend coverage: fraction of kernels compiling successfully; categorized failure reasons."
+      - "Performance: throughput/latency deltas (TileIR vs PTX) on Blackwell."
+      - "Correctness: output equivalence across backends under identical inputs."
+      - "Artifact reproducibility: ability to reproduce identical codegen given pinned toolchain and build inputs (hashing intermediate artifacts)."
+    risks_and_mitigations:
+      - "Risk: TileIR feature set changes rapidly across CUDA releases; mitigation: pin CUDA/Triton commits, archive .tileIR artifacts, and explicitly version results."
+      - "Risk: PTX-based observability does not directly map to TileIR semantics; mitigation: define comparisons at the level of measured behavior + disassembly when available, and mark semantic inferences UNVERIFIED."
+  - gap_statement: "Automatic detection and rewriting of Triton tensor-of-pointer access patterns into descriptor-based TMA loads/stores (with provable layout equivalence and bounds safety) is missing."
+    why_it_matters: "NV_BLOG_TILE reports that tensor-of-pointer patterns are suboptimal on the TileIR backend with CUDA 13.1 and recommends rewriting to TMA descriptors using shape/strides/block_shape. OPT_PIPE frames TMA loads of input tiles as streaming variable-latency operations whose structure matters for scheduling. SEED_2 shows that composed layout transformations can cause out-of-bound accesses and that integer set relations can synthesize predicates, suggesting a route to formally safe descriptor construction; SEED_1 provides layout conversion foundations to reason about equivalence."
+    evidence_links: ["NV_BLOG_TILE", "OPT_PIPE", "SEED_2", "SEED_1"]
+    what_is_missing:
+      - "A compiler pass that proves when a tensor-of-pointer pattern is representable as a descriptor (contiguous tile with well-defined shape/strides/block_shape) and performs the rewrite automatically."
+      - "A formal equivalence and safety check ensuring the descriptor-based access matches the original pointer arithmetic and is bounds-safe (predicate synthesis where needed)."
+      - "A scheduling-aware integration that accounts for TMA’s variable latency when deciding pipeline depths and warp roles."
+    candidate_research_questions:
+      - "RQ1: What static conditions guarantee that a tensor-of-pointer construction can be replaced by a TMA descriptor without changing semantics?"
+      - "RQ2: Can ISL-based reasoning synthesize minimal bounds predicates for descriptor loads in the presence of composed layouts/swizzles?"
+    - "RQ3: How does descriptor adoption change schedule optimality (SWP/WS) when TMA loads are treated as streaming operations?"
+    candidate_methodology:
+      - "Implement a pattern recognizer in Triton IR that identifies tensor-of-pointer constructions with affine index forms and extracts shape/strides/block_shape candidates."
+      - "Use integer set relations (SEED_2) and/or linear layouts (SEED_1) to validate equivalence between pointer arithmetic and descriptor semantics, generating OOB predicates when the domain is partial."
+      - "Generate two kernel variants per pattern: original tensor-of-pointer vs descriptor-based TMA loads/stores; compile with TileIR backend (CUDA 13.1+) and also compile PTX backend reference (PTX ISA > 9.0 for PTX path; UNVERIFIED until checked)."
+      - "Integrate with scheduling experiments by tagging descriptor loads as streaming variable-latency ops (as in OPT_PIPE) and evaluating pipeline depth tuning."
+    evaluation_metrics:
+      - "Correctness equivalence across variants (with explicit OOB masking/predicates)."
+      - "Performance delta (TileIR backend) on impacted workloads (throughput/latency)."
+      - "Compilation stability and backend portability (number of ops supported after rewrite)."
+      - "Static-analysis precision/recall: fraction of patterns correctly rewritten vs rejected."
+    risks_and_mitigations:
+      - "Risk: Descriptor semantics and performance are backend-specific and not fully specified in the blog; mitigation: constrain claims to measured outcomes and mark semantic assumptions UNVERIFIED unless supported by primary docs."
+      - "Risk: Overly conservative predicate synthesis harms performance; mitigation: measure predicate overhead separately and explore hoisting/strength reduction."
+  - gap_statement: "A Blackwell-calibrated joint SWP+WS scheduling model that explicitly accounts for TMEM synchronization costs and variable-latency streaming operations is not yet integrated into an end-to-end compiler."
+    why_it_matters: "OPT_PIPE provides direct Blackwell evidence that additional synchronization around Tensor Memory changes optimal SWP/WS, and that schedules can fail due to register allocation/spilling. ARCH_BW shows that TMEM and tcgen05 alter the data-movement pipeline and tile-size efficiency regime, implying that scheduling must reason about new overlap opportunities and bottlenecks. NV_BLOG_TILE’s push toward TileIR + descriptor-driven TMA suggests that scheduling must also co-design with compiler IR that preserves tile semantics."
+    evence_links: ["OPT_PIPE", "ARCH_BW", "NV_BLOG_TILE"]
+    what_is_missing:
+      - "A unified dependence-graph model that includes TMEM load/store and synchronization nodes with calibrated costs on Blackwell."
+      - "An integration layer that takes solver schedules and produces correct low-level code (allocation/layout/sync) without hand-compilation."
+      - "A calibration procedure for variable-latency streaming ops (e.g., TMA loads) that remains robust across kernels."
+    candidate_research_questions:
+      - "RQ1: What cost features are sufficient for a solver to pick Blackwell-optimal SWP/WS strategies when TMEM sync is present?"
+      - "RQ2: Can the solver’s schedule be made compilable by construction by adding allocator/register constraints early (rather than discovering spilling after codegen)?"
+      - "RQ3: How should pipeline depths for streaming ops be tuned jointly with warp assignment and TMEM allocation?"
+    candidate_methodology:
+      - "Augment a Twill-like schedule representation with plicit TMEM/TMA ops and synchronization edges; calibrate operation cost ratios using ARCH_BW-style microbench measurements."
+      - "Generate code through two backends: (i) CUDA C++ reference lowering for correctness and (ii) TileIR backend where supported; require CUDA 13.1+; PTX ISA > 9.0 for PTX-based microbench references (UNVERIFIED until toolchain check)."
+      - "Evaluate on forward and backward attention kernels; explicitly report where compilation fails due to aliasing/spills and iterate constraints accordingly."
+      - "Treat TMA loads as streaming ops with tunable depths (as in OPT_PIPE) and perform a small controlled autotuning sweep to validate sensitivity."
+    evaluation_metrics:
+      - "Achieved performance vs known baselines (e.g., best available implementations in the experimental setup)."
+      - "Solver time vs achieved speedup; schedule robustness across input sizes."
+      - "Register usage/spilling incidence and correlation with schedule decisions."
+      - "Correctness under multiple shapes/sequence lengths."
+    risks_and_mitigations:
+      - "Risk: Calibrated costs may not transfer across CUDA versions; mitigation: separate 'model calibration' from 'model validation' splits and re-calibrate under CUDA 13.1+."
+      - "Risk: End-to-end integration is engineering-heavy; mitigation: define intermediate milestones (schedule-only analysis; codegen for restricted kernel subset)."
+  - gap_statement: "CTA traversal-order optimizations evidenced on Grace‑Blackwell GB10 lack a transfer mod and integration strategy for other Blackwell parts such as B200 dual-die GPUs."
+    why_it_matters: "SEED_3 demonstrates that persistent CTA scheduling and sawtooth wavefront reordering can reduce L2 misses and increase throughput on GB10, and identifies a concrete L2 capacity threshold regime (~80K sequence length where KV approaches 24 MiB). ARCH_BW describes B200 as dual-die with four L2 cache partitions and a different memory system, implying that locality dynamics may differ and should not be assumed. NV_workloads suggests performance/energy sensitivity to bandwidth partitioning and phase behavior, implying CTA-locality optimizations may interact with mixed-reuse operator mixes."
+    evidence_links: ["SEED_3", "ARCH_BW", "NV_workloads"]
+    what_is_missing:
+      - "A device-parameterized model that predicts when CTA ordering changes L2 reuse and when it is dominated by other bottlenecks (e.g., TMEM/Tensor Core saturation)."
+      - "A methodology to generalize sawtooth-like scheduling beyond the studied GB10 configuration and to integrate it with tile programming frameworks (CuTile/TileIR)."
+      - "Cross-device validation on at least one B200-class Blackwell GPU to avoid overfitting to GB10 (UNVERIFIED without hardware access)."
+    candidate_research_questions:
+      - "RQ1: What cache-capacity/working-set conditions trigger non-compulsory L2 misses for attention kernels on different Blackwell parts (GB10 vs B200)?"
+      - "RQ2: How does persistent CTA scheduling interact with warp specialization and TMEM usage (e.g., does it amplify or reduce synchronization costs)?"
+      - "RQ3: Can wavefront reordering be expressed as a compiler transformation in tile-centric IRs without breaking access-pattern assumptions (e.g., CuTile splitting behavior)?"
+    candidate_methodology:
+      - "Re-implement cyclic vs sawtooth CTA scheduling in raw CUDA to isolate scheduling effects (as in SEED_3), collecting L2 counters and throughput on GB10; replicate on B200 if available."
+      - "Port the same transformation to a tile programming model (CuTile or TileIR-based Triton) and check for compiler-induced access pattern changes; explicitly test tile size regimes including the known CuTile tile size 128 limitation."
+      - "Model the reuse distance / working set vs L2 capacity and validate against counter data; treat B200 vs GB10 differences as parameters rather than assumed constants."
+      - "Tie results to workload-phase regimes (prefill vs decode) using NV_workloads-style mixed-reuse framing, reporting which phase benefits most."
+    evaluation_metrics:
+      - "L2 miss count, L2 hit rate, and sectors from Tex (where available) under controlled SM counts."
+      - "Kernel throughput (TFLOPS) and end-to-end attention latency vs sequence length."
+      - "Robustness across batch/head parameters and masking modes (causal vs non-causal)."
+      - "Degree of compiler-induced transformation (e.g., tile splitting) affecting intended schedule."
+    risks_and_mitigations:
+      - "Risk: Results are hardware-specific (GB10 vs B200); mitigation: parameterize models and explicitly label generalizations UNVERIFIED without B200 replication."
+      - "Risk: High-level frameworks may rewrite schedules (tile splitting); mitigation: maintain raw CUDA reference and treat framework deviations as a measured limitation, not an error."
+  - gap_statement: "There is no unified, automated verification pipeline that proves layout transformations used in Blackwell tile programming are safe (no OOB) and semantically equivalent across IR levels."
+    why_it_matters: "OPT_PIPE reports Triton can make incorrect layout conversion and synchronization placement decisions, indicating that correctness and performance regressions can stem from layout handling. SEED_1 provides a formal completeness foundation and codegen algorithms for layout conversions but is not tied to Blackwell-specific backends. SEED_2 demonstrates that composed layout operations (especially with implicit promotion) can cause out-of-bound accesses and that integer set relations can synthesize predicates, suggesting a concrete path to safety. NV_BLOG_TILE’s descriptor-based TMA approach requires correct shapes/strides/block_shape, which are effectively layout specifications that must be verified."
+    evidence_links: ["SEED_1", "SEED_2", "OPT_PIPE", "NV_BLOG_TILE"]
+    what_is_missing:
+      - "A translation layer that extracts layout intent from Triton/TileIR/CuTile programs and converts it into a verifiable mathematical representation (linear layouts and/or integer set relations)."
+    - "Automated synthesis of OOB predicates and equivalence checks for composed layouts and descriptor-based accesses."
+      - "A workflow that connects verification results back to compiler decisions (e.g., rejecting unsafe layout compositions or inserting minimal predicates)."
+    candidate_research_questions:
+      - "RQ1: Which classes of layout transformations in Blackwell tile programming are most error-prone (conversion, swizzle, composition) and can be covered by linear layouts vs ISL relations?"
+      - "RQ2: Can integer set relations be used to automatically synthesize minimal OOB predicates for real kernels without unacceptable performance overhead?"
+      - "RQ3: How can verified layouts guide compiler passes (e.g., descriptor formation, vectorization, bank-conflict-minimizing swizzles) in a backend-agnostic way?"
+    candidate_methodology:
+      - "Build a tool that ingests a kernel’s layout metadata (shapes/strides/tile shapes, swizzles, composed layouts) from compiler IR dumps and converts themnto (i) SEED_1-style linear layout objects and (ii) SEED_2-style integer set relations."
+      - "Implement equivalence checking between two layout representations (e.g., pointer arithmetic vs descriptor mapping) and predicate synthesis for safe domains."
+      - "Integrate the checker into a compilation test harness: reject or repair unsafe layouts; record discovered issues and link them to compiler pass decisions."
+      - "Evaluate on a corpus including descriptor-rewritten kernels (NV_BLOG_TILE) and attention-kernel pipelines where layout conversions are known to matter (OPT_PIPE)."
+    evaluation_metrics:
+      - "Correctness: number of detected OOB risks and confirmed bugs (or avoided miscompilations) in the corpus."
+      - "Verification cost: compile-time overhead of layout analysis and predicate synthesis."
+      - "Performance impact of inserted predicates or altered layouts."
+      - "Coverage: fraction of real-kernel layout operations successfully modeled."
+    risks_and_mitigations:
+      - "Risk: Verification may be too slow or too conservative; mitigation: stage analysis (fast approximate check + optional deep check) and report false positives/negatives."
+      - "Risk: IR extraction is fragile across compiler versions; mitigation: target stable IR points (e.g., explicit descriptor parameters; emitted layout objects) and version-pin."
+  - gap_statement: "Power-of-two restrictions across current tooling impede exploration of potentially better Blackwell schedules for real workloads with irregular shapes."
+    why_it_matters: "OPT_PIPE explicitly notes Triton only supports power-of-two tile sizes, constraining the schedule/design space even when the scheduler itself has no fundamental need for this restriction. SEED_1 states linear layouts have a power-of-two shape restriction and suggests masking larger tensors and extending to affine layouts for operations like flipping/slicing. NV_workloads emphasizes diverse tensor shapes and mixed-reuse cascades, which can surface non-power-of-two and irregular boundary conditions in practical workloads; SEED_2’s integer set relations can represent richer domains, suggesting a possible escape hatch."
+    evidence_links: ["OPT_PIPE", "SEED_1", "SEED_2", "NV_workloads"]
+    what_is_missing:
+      - "A compilation strategy that supports non-power-of-two tiles/shapes while maintaining predictable performance (e.g., via masking, affine layouts, or ISL-derived predicates)."
+      - "A reconciliation layer between theory (affine/ISL representations) and practical backes (TileIR/PTX) that can generate efficient code for irregular shapes."
+      - "A systematic evaluation of how much performance is left on the table by current power-of-two constraints on Blackwell."
+    candidate_research_questions:
+      - "RQ1: When do non-power-of-two tiles/shapes materially improve performance or resource fit (register/TMEM/SMEM) on Blackwell attention kernels?"
+      - "RQ2: Can affine layouts (SEED_1) or integer set relations (SEED_2) provide a principled representation for irregular tiles that compilers can lower efficiently?"
+      - "RQ3: What is the best boundary-handling strategy (masking, predication, tail tiles) under tile-centric backends (TileIR/TMA descriptors)?"
+    candidate_methodology:
+      - "Prototype non-power-of-two support using two approaches: (i) power-of-two 'super-tiles' with masking (SEED_1 suggested mitigation) and (ii) ISL-derived domain predicates for irregular tiles (SEED_2)."
+      - "Integrate boundary-safe predicates into descriptor-based TMA loads where possible (NV_BLOG_TILE), and compare against tensor-of-pointer baselines."
+      - "Evaluate schedule feasibility and performance on attention and mixed-reuse kernels under CUDA 13.1+; maintain PTX backend reference kernels using PTX ISA > 9.0 (UNVERIFIED until toolchain check) to keep a controlled baseline."
+    evaluation_metrics:
+      - "Performance vs best power-of-two baseline (throughput/latency)."
+      - "Overhead of masking/predicates (instruction count, branch divergence, extra memory traffic)."
+      - "Compilation success rate and code-size impact."
+      - "Correctness at boundary conditions (tail tiles, odd sizes)."
+    risks_and_mitigations:
+      - "Risk: Non-power-of-two support increases overhead and loses performance; mitigation: measure overhead separately and identify regimes where benefits outweigh costs."
+      - "Risk: Backend limitations prevent lowering irregular tiles; mitigation: keep both PTX and TileIR paths and clearly document what each can/cannot express."
+  - gap_statement: "System-level mapping and partitioning frameworks for mixed-reuse workloads do not yet incorporate Blackwell-specific mechanisms (TMEM, tcgen05 data movement, TileIR/TMA behaviors, and CTA-locality effects) as first-class model primitives."
+    why_it_matters: "NV_workloads argues that mixed-reuse cascades and phase behavior drive performance/energy trends and that mapping decisions (tiling/permutation/parallelization) matter under constraints. ARCH_BW introduces TMEM and a revised tensor pipeline via tcgen05, which changes the effective memory hierarchy and may shift the mapping cost trade-offs. OPT_PIPE shows that scheduling for attention on Blackwell is altered by TMEM synchronization and variable-latency TMA loads. SEED_3 demonstrates that CTA scheduling/locality effects can dominate L2 behavior at large sequence lengths on Grace‑Blackwell, suggesting that system-level models should include locality-aware scheduling knobs."
+    evidence_links: ["NV_workloads", "ARCH_BW", "OPT_PIPE", "SEED_3"]
+    what__missing:
+      - "A mapping/modeling framework that includes TMEM as an explicit on-chip storage tier with measured parameters and that accounts for tcgen05-driven data movement."
+      - "A representation of scheduling knobs (SWP/WS + CTA traversal order) and their interaction with cache/TMEM effects in end-to-end cost models."
+      - "Calibration/validation methodology tying model predictions to measured Blackwell kernels under CUDA 13.1+."
+    candidate_research_questions:
+      - "RQ1: How do Blackwell-specific memory tiers (TMEM vs SMEM vs L2) change optimal tiling/mapping decisions for mixed-reuse cascades?"
+      - "RQ2: Can system-level mapping models predict when locality optimizations (CTA ordering) outweigh compute pipeline optimizations (Tensor Core saturation) in attention phases?"
+      - "RQ3: Which minimal set of Blackwell parameters (TMEM bandwidth/latency, L2 size/partitioning, sync costs) is sufficient to predict phase-dependent bottlenecks?"
+    candidate_methodology:
+      - "Extend a Harp/Timeloop-style modeling pipeline by adding Blackwell primitives: TMEM tier with ARCH_BW-derived parameters; tcgen05-driven movement; variable-latency TMA loads as streaming ops (OPT_PIPE)."
+      - "Calibrate model parameters using Blackwell microbenchmarks and counters, including locality experiments inspired by SEED_3 (persistent CTA, sawtooth vs cyclic)."
+      - "Validate on transformer operator subsets (attention forward/backward, prefill/decode-inspired regimes) using CUDA 13.1+; keep PTX ISA > 9.0 PTX microbench references (UNVERIFIED until toolchain check)."
+    evaluation_metrics:
+      - "Model prediction error for latency/throughput across phases (prefill vs decode) and sequence lengths."
+      - "Correct identification of bottleneck regimes (compute-bound vs TMEM/TMA-bound vs L2-locality-bound)."
+      - "Sensitivity analysis accuracy (bandwidth partitioning/locality knobs) relative to measured trends."
+    risks_and_mitigations:
+      - "Risk: Modeling abstractions omit critical Blackwell details; mitigation: explicitly list omitted mechanisms and treat model mismatch as a result guiding refinement."
+      - "Risk: Calibration requires hardware access and stable counters; mitigation: prioritize reproducible microbenchmarks and archive counter collection scripts/versions."
+latex_plan:
+  part_1:
+    section: "preamble/title/abstract"
+    purpose: "Set the thesis: Blackwell introduces TMEM + tcgen05 and pushes tile-centric compilation (TileIR/TMA), but the ecosystem lacks integrated models and compiler support; state contributions and constraints."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Abstract sentence referencing TMEM + tcgen05 pipeline shift and empirical characterization."
+      OPT_PIPE: "Abstract sentence referencing Blackwell SWP/WS + sync complexity and Triton lowering gaps."
+      NV_workloads: "Motivation sentence referencing mixed-reuse cascades and phase behavior."
+      NV_BLOG_TILE: "Toolchain sentence referencing CUDA 13.1+ TileIR backend and TMA descriptor guidance."
+      SEED_1: "Claim motivating formal layout foundations for robust codegen."
+      SEED_2: "Claim motivating ISL-based layout verification/predicate synthesis."
+      SEED_3: "Claim motivating CTA scheduling/locality impact on Grace‑Blackwell."
+    completion_criteria:
+      - "Abstract includes a single multi-citation covering all seven sources (can be split across 2–3 snces)."
+      - "Preamble defines the CUDA>13.0 and PTX>9.0 target as project constraints; any PTX-version specifics beyond this are marked UNVERIFIED."
+  part_2:
+    section: "introduction/motivation"
+    purpose: "Motivate why Blackwell changes (TMEM + per-thread MMA + tile-centric toolchains) create new research gaps spanning microarchitecture, compilers, scheduling, layouts, and locality."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Introduce B200 context and why TMEM alters kernel design; cite TMEM structure/perf and pipeline shift."
+      OPT_PIPE: "Introduce evidence that Blackwell needs different SWP/WS due to TMEM sync; cite Triton lowering issues."
+      NV_workloads: "Frame mixed-reuse and mapping vocabulary; motivate prefill vs decode relevance."
+      NV_BLOG_TILE: "Introduce CUDA Tile IR backend and why TileIR vs PTX surface tension matters for research."
+      SEED_1: "Motivate need for robust layout conversions (correctness evidence) before Blackwell-specific optimizations."
+      SEED_2: "Motivate safety/verification needs (OOB risk in layout composition) for complex tilings/descriptors."
+      SEED_3: "Motivate that scheduling at CTA level impacts cache locality on Grace‑Blackwell, beyond pure compute optimization."
+    completion_criteria:
+      - "Ends with a bullet list of contributions aligned to the gap_map themes."
+      - "Explicitly states whats not claimed (e.g., microarchitectural details beyond cited evidence; mark UNVERIFIED hypotheses)."
+  part_3:
+    section: "background/terminology"
+    purpose: "Define key terms and mechanisms used later: TMEM/tcgen05, TMA/descriptors, TileIR vs PTX, SWP/WS, CTA scheduling/locality, layout abstractions (linear layouts, CuTe ops, ISL relations), and mixed-reuse mapping."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Define TMEM and tcgen05.{cp,ld,st,mma}; include Table IV/V references for instruction surface and latency evidence."
+      OPT_PIPE: "Define SWP and WS in the context of Tensor Core GPUs; define variable-latency streaming ops and Blackwell sync implications."
+      NV_workloads: "Define mixed-reuse workloads and mapping as loop transformations; introduce Harp taxonomy term usage."
+      NV_BLOG_TILE: "Define CUDA Tile, TileIR, Triton-to-TileIR prerequisites and artifacts; define tensor-of-pointer vs descriptor TMA access."
+      SEED_1: "Define linear layouts and completeness; introduce distributed vs memory layouts; mention power-of-two limitation."
+      SEED_2: "Define integer set relations/ISL; define composition/inverse/complement; explain predicate synthesis for safety."
+      SEED_3: "Define persistent CTA scheduling and sawtooth wavefront reordering; define L2 non-compulsory misses and threshold concept with GB10 context."
+    completion_criteria:
+      - "Includes a short glossary mapping terms across sources (e.g., 'tile', 'layout', 'descriptor')."
+      - "Labels any backend/ISA details not explicitly in sources as UNVERIFIED."
+  part_4:
+    section: "related work"
+    purpose: "Position the proposal relative to Blackwell characterization, scheduling systems, tile-centric compiler infrastructures, layout-theory work, and cache/locality studies."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Cite as Blackwell TMEM/tcgen05 empirical characterization baseline."
+      OPT_PIPE: "Cite as solver-based SWP/WS and Blackwell attention scheduling evidence."
+      NV_workloads: "Cite as system-level mixed-reuse taxonomy and mapping framework context."
+      NV_BLOG_TILE: "Cite as vendor-backed TileIR backend and TMA descriptor guidance + limitations."
+      SEED_1: "Cite as linear layout theory + Triton robustness improvements."
+      SEED_2: "Cite as ISL-based unification and safety reasoning for layout abstractions."
+      SEED_3: "Cite as Grace‑Blackwell cache/locality and CTA scheduling transformation evidence."
+    completion_criteria:
+      - "Explicitly separates 'what is solved' vs 'what remains open' per cited work."
+  part_5:
+    section: "deep synthesis -> gap argument + capability→evidence→open-question table"
+    purpose: "Synthesize across sources to argue for integrated research: compile-time representations apture TMEM/TMA/layout/scheduling/locality; present a table mapping capabilities to evidence and open questions."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    planned_table: "Capability → Evidence (source+anchor) → Observable symptom → Open question → Proposed approach"
+    citation_placements:
+      ARCH_BW: "Evidence rows for TMEM structure/perf and tcgen05 pipeline; PTX→SASS mapping tables."
+PIPE: "Evidence rows for Blackwell SWP/WS differences, TMEM sync costs, aliasing/spilling issues."
+      NV_workloads: "Evidence rows for mixed-reuse cascades, mapping vocabulary, and phase sensitivity."
+      NV_BLOG_TILE: "Evidence rows for TileIR backend constraints and tensor-of-pointer degradation + TMA rewrite."
+      SEED_1: "Evidence rows for completeness and correctness robustness; power-of-two limitation."
+      SEED_2: "Evidence rows for OOB risk in composed layouts and predicate synthesis; isl-layout tooling."
+      SEED_3: "Evidence rows for persistent CTA scheduling, L2 threshold regime, sawtooth reordering and CuTile limitation."
+    completion_criteria:
+      - "Table includes at least one row that explicitly connects three or more sources (e.g., TMEM + scheduling + descriptor data movement)."
+  part_6:
+    section: "gaps -> RQs/hypotheses/contributions"
+    purpose: "Translate the gap_map into a coherent set of research questions, falsifiable hypotheses, and concrete contributions (algorithms, tools, models)."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Use to justify TMEM-centric hypotheses (tile-size sensitivity, bandwidth tier) and tcgen05 observability claims."
+      OPT_PIPE: "Use to justify scheduling-centric hypotheses and compiler-lowering gap claims (aliasing/spills)."
+      NV_workloads: "Use to justify system-level hypotheses about phase dependence and mapping sensitivity."
+      NV_BLOG_TILE: "Use to justify IR/backend hypotheses (TileIR vs PTX) and descriptor-rewrite contribution."
+      SEED_1: "Use to justify layout-theory-based contributions (verified conversions, affine extension need)."
+      SEED_2: "Use to justify verification contributions (predicate synthesis, unified modeling)."
+      SEED_3: "Use to justify CTA-locality contributions (wavefront reordering generalization)."
+    completion_criteria:
+      - "Lists 3–6 contributions, ch explicitly linked to at least two sources and one gap."
+      - "Every hypothesis includes a clear success/failure criterion and notes what would be marked UNVERIFIED without additional primary docs."
+  part_7:
+    section: "methodology"
+    purpose: "Describe the end-to-end experimental and tooling methodology: microbenching, compiler prototyping (PTX and TileIR), scheduling/solver integration, layout verification, and locality experiments—under CUDA 13.1+ and PTX>9.0 constraints."
+    required_citati_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Microbenchmark design principles and PTX→SASS validation; TMEM measurement targets."
+      OPT_PIPE: "Scheduling model structure (dependence graphs, SWP/WS), streaming ops concept, and known compiler failure modes."
+      NV_workloads: "Workload selection rationale (mixed-reuse cascades; prefill/decode regimes) and mapping vocabulary."
+      NBLOG_TILE: "Toolchain setup for TileIR backend (CUDA 13.1+, ENABLE_TILE) and descriptor-based TMA rewrite methodology."
+      SEED_1: "Layout conversion algorithms and constraints; use as basis for layout-aware lowering."
+      SEED_2: "ISL relation modeling, predicate synthesis, and isl-layout-like tooling approach."
+      SEED_3: "Counter-based locality study method (ncu metrics) and persistent CTA scheduling experimental controls."
+    completion_criteria:
+      - "Explicitly states how the project satisfies CUDA>13.0 (use CUDA 13.1+) and PTX>9.0 (enforce PTX ISA version for PTX-path kernels; UNVERIFIED until toolchain confirms exact supported PTX version)."
+      - "Defines dual-path compilation strategy when needed (PTX backend reference + TileIR backend experimental path)."
+  part_8:
+    section: "evaluation + reproducibility + threats + risks/mitigations"
+    purpose: "Define evaluation protocols and metrics across gaps; specify reproducibility artifacts; enumerate threats to validity and mitigate them."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Benchmark targets/metrics aligned to TMEM measurements and PTX→SASS mapping reproducibility."
+      OPT_PIPE: "Comparison baselines and scheduling metrics (solver time, schedule optimality within model), and known failure modes (spills, aliasing)."
+      NV_workloads: "Phase-based workload splits and mapping sensitivityetrics (bandwidth partition/locality knobs)."
+      NV_BLOG_TILE: "TileIR reproducibility artifacts (.tileIR caches) and known limitation handling (unsupported ops, tensor-of-pointer degradation)."
+      SEED_1: "Correctness testing emphasis and layout limitations; motivate coverage of edge shapes."
+      SEED_2: "Safety verification evaluation (predicate synthesis correctness; false positives/negatives)."
+      SEED_3: "Cache/locality metrics (L2 misses/hit rates; thresholds) and CuTile tile splitting threat."
+    completion_criteria:
+      - "Includes a reproducibility checklist: hardware, CUDA version, compiler commits, flags, cache artifacts, and scripts."
+      - "Threats section explicitly distinguishes B200 vs GB10 generality and marks cross-device claims UNVERIFIED without validation."
+  part_9:
+    section: "timeline + conclusion + bibliography + end document"
+    purpose: "Provide a concrete timeline (milestones), summarize expected contributions and fallback paths, and close the document with a complete bibliography."
+    required_citation_minimum_per_source: 1
+    must_cite: ["ARCH_BW", "OPT_PIPE", "NV_workloads", "NV_BLOG_TILE", "SEED_1", "SEED_2", "SEED_3"]
+    citation_placements:
+      ARCH_BW: "Timeline milestone tied to TMEM/tcgen05 microbench replication under CUDA 13.1+."
+      OPT_PIPE: "Milestone tied to SWP/WS + TMEM sync modeling and end-to-end compilation without hand-compilation."
+      NV_workloads: "Milestone tied to mixed-reuse evaluation suite definition (prefill/decode regimes)."
+      NV_BLOG_TILE: "Milestone tied to TileIR backend evaluation + descriptor rewrite automation."
+      SEED_1: "Milestone tied to linear-layout-based conversion/verification prototype and extension plan for affine layouts."
+      SEED_2: "Milestone tied to ISL-based predicate synthesis integration and layout safety audit."
+      SEED_3: "Milestone tied to CTA-locality transformation study across Blackwell devices (as available)."
+    completion_criteria:
+      - "Timeline has 3–5 phases with deliverableand go/no-go criteria."
+      - "Bibliography includes all seven golden sources and the text includes citations to each in this part."

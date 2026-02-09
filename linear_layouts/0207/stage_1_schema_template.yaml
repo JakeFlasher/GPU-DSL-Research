@@ -1,0 +1,70 @@
+### Stage S1 output schema (YAML only)
+Top-level keys MUST be exactly:
+- context_pack_version: "S1.v2"
+- generated_at_utc: string
+- project_profile
+- golden_sources
+- source_audit
+- formalism_index
+- evidence_index
+- cross_source_synthesis
+
+Where:
+
+project_profile:
+  objective: "Develop a theory-first formal model to evaluate and solve Blackwell GPU architecture problems under CUDA>13 and PTX>9; output a 9-part academic LaTeX proposal."
+  hard_constraints:
+    architecture: "NVIDIA Blackwell (Grace-Blackwell allowed when relevant)"
+    cuda: "> 13.0 (prefer 13.1+)"
+    ptx: "> 9.0 (strict)"
+    required_sources_each_run: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  writing_constraints:
+    latex_style: "academic, math-first"
+    output_split: ">= 9 LaTeX parts; each LaTeX run emits exactly 1 part"
+    citation_policy: "no uncited non-trivial claims; mark UNVERIFIED if not in sources"
+  scope_boundaries:
+    include: ["formal semantics/models", "layout algebra", "integer relations", "constraint optimization (SMT/ILP)", "cache/traffic modeling", "TMEM/TMA/tile IR as modeled objects", "scheduling (SWP/WS/CTA)"]
+    exclude: ["marketing-only claims without evidence", "non-Blackwell architectures except as explicit comparison or modeling baseline"]
+
+golden_sources:
+  ARCH_BW: {url: "...", tier: "tier_1_insight"}
+  OPT_PIPE: {url: "...", tier: "tier_1_insight"}
+  NV_BLOG_TILE: {url: "...", tier: "tier_1_insight"}
+  NV_workloads: {url: "...", tier: "tier_2_modeling_context"}
+  SEED_1: {url: "...", tier: "tier_4_context"}
+  SEED_2: {url: "...", tier: "tier_4_context"}
+  SEED_3: {url: "...", tier: "tier_4_context"}
+
+source_audit:
+  ARCH_BW: {used_for: "...", anchors: ["sec/fig/table identifiers or section titles"]}
+  OPT_PIPE: {used_for: "...", anchors: ["..."]}
+  NV_BLOG_TILE: {used_for: "...", anchors: ["..."]}
+  NV_workloads: {used_for: "...", anchors: ["..."]}
+  SEED_1: {used_for: "...", anchors: ["..."]}
+  SEED_2: {used_for: "...", anchors: ["..."]}
+  SEED_3: {used_for: "...", anchors: ["..."]}
+
+formalism_index:
+  # For each source: list the formal objects it introduces/uses.
+  # Each entry must separate: DEFINITIONS vs ALGORITHMS vs CONSTRAINTS vs THEOREMS/PROOFS.
+  SEED_1:
+    definitions: ["..."]
+    operators_or_constructions: ["..."]
+    theorems_or_propositions: ["..."]
+    proof_techniques: ["..."]
+    algorithmic_artifacts: ["..."]
+    modeling_assumptions: ["..."]
+  # ... repeat for all sources.
+
+evidence_index:
+  # For each source: key claims + explicit limitations/open questions.
+  # Mark any inference explicitly as INFERENCE; mark uncertainty as UNVERIFIED.
+  ARCH_BW:
+    key_claims: [{claim:"...", support:"...", blackwell_relevance:"...", confidence:"high|medium|low", notes:"..."}]
+    explicit_limitations_or_open_questions: ["..."]
+  # ... repeat for all sources.
+
+cross_source_synthesis:
+  agreements: ["..."]
+  tensions_or_contradictions: ["..."]
+  inferred_implications_marked_as_inference: ["..."]

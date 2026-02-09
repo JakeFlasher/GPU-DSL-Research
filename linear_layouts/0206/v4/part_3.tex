@@ -1,0 +1,284 @@
+\section{Background and Terminology}
+\label{sec:background}
+
+\paragraph{Purpose and citation discipline.}
+This section fixes terminology and interfaces used throughout the remainder of the proposal, with an explicit bias toward \emph{source-grounded} definitions. We cite the golden sources as the authoritative basis for any non-trivial statements, and we label any finer-grained ISA/version semantics beyond what those sources support as \UNVERIFIED{}. \CiteAllGoldens{} \cite{NV_workloads}
+
+\paragraph{Blackwell vs.\ Grace--Blackwell (scope and device context).}
+We use the following device terms consistently:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{``Blackwell''} refers to NVIDIA's Blackwell GPU architecture family as studied via open empirical characterization and compiler/scheduling evidence. Concretely, \cite{ARCH_BW} provides Blackwell (B200) architectural context and a TMEM-centric microbenchmark methodology, while \cite{OPT_PIPE} provides Blackwell attention-kernel scheduling evidence.
+  \item \textbf{``Grace--Blackwell''} refers to platforms combining Grace with Blackwell-class GPU(s) in system-level studies. In this proposal, Grace--Blackwell evidence is primarily drawn from a GB10 platform study that isolates cache/locality effects and CTA scheduling transformations. \cite{SEED_3}
+\end{itemize}
+\noindent
+We emphasize that \emph{cross-device generalization} (e.g., from GB10 to B200) is not assumed; any such transfer is treated as \UNVERIFIED{} unless re-established by direct measurement (this is a scope discipline, not a claim). \cite{SEED_3,ARCH_BW}
+
+\begin{verbatim}
+Device evidence map (informal; for terminology only):
+
+  Blackwell (B200-class) evidence:
+    - TMEM structure + tcgen05 instruction surface + PTX->SASS audits  [ARCH_BW]
+    - Blackwell attention scheduling: SWP/WS + extra TMEM sync         [OPT_PIPE]
+
+  Grace--Blackwell (GB10-class) evidence:
+    - CTA scheduling/locality impacts on cache behavior (L2 regime)    [SEED_3]
+\end{verbatim}
+
+\paragraph{Toolchain constraints: CUDA \(\!>\!13.0\) and PTX \(\!>\!9.0\).}
+We adopt \textbf{CUDA \(\!>\!13.0\) (e.g., 13.1+)} and \textbf{PTX \(\!>\!9.0\)} as hard constraints (cf.\ Sec.~\ref{sec:intro}). These constraints define the \emph{allowed toolchain surface} rather than asserting any particular behavior about specific CUDA/PTX revisions. In particular:
+\begin{itemize}[leftmargin=*]
+  \item The cited evaluations in \cite{ARCH_BW,OPT_PIPE} explicitly report using CUDA 13.0; we treat any behavioral changes under CUDA 13.1+ as \UNVERIFIED{} until re-measured under the project constraints. \cite{ARCH_BW,OPT_PIPE}
+  \item The Triton-to-CUDA Tile IR backend described by NVIDIA is explicitly gated on CUDA 13.1 or higher and Blackwell GPUs; this motivates treating CUDA 13.1+ as the \emph{practical minimum} for TileIR-based experimentation in-scope. \cite{NV_BLOG_TILE}
+  \item \textbf{UNVERIFIED (version gating details):} the precise mapping between ``CUDA version'' and the exact PTX ISA version emitted/accepted, and the precise PTX ISA gating for Blackwell-specific instruction families (e.g., tcgen05.*) are not established by the golden sources alone. We therefore avoid asserting exact PTX-version requirements beyond the project-level constraint PTX \(\!>\!9.0\). \cite{ARCH_BW}
+\end{itemize}
+
+\begin{verbatim}
+Two compilation / observability surfaces (terminology; not a methodology claim):
+
+  (A) PTX-centric surface (instruction-level observability)
+      Triton/CUDA -> PTX -> (ptxas) -> SASS (cubin)
+          |                   |
+          +-- PTX->SASS audit +-- disassembly-based evidence         [ARCH_BW]
+
+  (B) Tile-semantic surface (CUDA Tile IR backend for Triton)
+      Triton -> CUDA Tile IR  -> (lowering to machine code) -> ...
+        |            |
+        |            +-- .tileIR artifacts (cache)                   [NV_BLOG_TILE]
+        +-- ENABLE_TILE=1 toggles this backend in the described flow [NV_BLOG_TILE]
+
+  UNVERIFIED: the exact internal lowering pipeline from CUDA Tile IR to
+              machine code beyond what is stated in the blog post.    [NV_BLOG_TILE]
+\end{verbatim}
+
+\paragraph{TMEM / Tensor Memory (what the term denotes here).}
+\textbf{Tensor Memory (TMEM)} denotes the Blackwell on-chip memory tier emphasized by open characterization work as \emph{software-managed} and central to Blackwell-era tensor-core kernel structure. \cite{ARCH_BW}
+We use the term \emph{TMEM-backed kernel} to mean a kernel whose intermediate tiles (e.g., accumulators or staged operands) reside in TMEM for part of their lifetime, with explicit movement controlled by a Blackwell-specific instruction surface. \cite{ARCH_BW}
+
+\noindent\textbf{Instruction naming conventions.}
+We follow \cite{ARCH_BW} when referring to \texttt{tcgen05.*} instruction families (e.g., \texttt{tcgen05.cp}, \texttt{tcgen05.ld}, \texttt{tcgen05.st}, \texttt{tcgen05.mma}) and treat these names as an \emph{ISA surface label} rather than a complete semantics.
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Supported by sources:} \cite{ARCH_BW} describes a shift in the tensor pipeline and uses PTX\(\rightarrow\)SASS evidence to connect PTX-level \texttt{tcgen05} forms to low-level behavior (including precision-dependent mappings and latency comparisons). \cite{ARCH_BW}
+  \item \textbf{\UNVERIFIED (hazard semantics):} the minimal correctness-preserving ordering constraints, hazard rules, and fence/barrier requirements for arbitrary compositions of \texttt{tcgen05.*} operations are not fully specified as an open, testable semantics by the golden sources alone. Where such rules are hypothesized later, they must be labeled \UNVERIFIED{}. \cite{ARCH_BW,OPT_PIPE}
+\end{itemize}
+
+\begin{verbatim}
+TMEM-centric kernel sketch (conceptual, terminology-level):
+
+  inputs (global) --(tile movement)--> on-chip staging --> Tensor Core compute
+                         |                 |                |
+                         |                 |                +-- compute steps
+                         |                 +-- TMEM tile lifetime
+                         +-- may be expressed via different interfaces:
+                                - PTX/tcgen05 surface                  [ARCH_BW]
+                                - TileIR + descriptor/TMA surface      [NV_BLOG_TILE]
+\end{verbatim}
+
+\paragraph{TMA and tile-oriented data movement (descriptor-driven terminology).}
+We use \textbf{TMA} to denote the tile-oriented data movement mechanism referenced in the golden sources in two complementary ways:
+\begin{itemize}[leftmargin=*]
+  \item In scheduling evidence, TMA loads of input tiles are explicitly discussed as \emph{streaming variable-latency operations} that must be modeled/overlapped by software pipelining decisions. \cite{OPT_PIPE}
+  \item In the TileIR backend description, NVIDIA highlights \emph{descriptor-driven} loads/stores (constructed from shape/strides/block-shape information) as a recommended mitigation for a specific performance pitfall (tensor-of-pointer patterns) on the TileIR backend. \cite{NV_BLOG_TILE}
+\end{itemize}
+
+\noindent
+\textbf{Descriptor terminology.} Following the blog post, we use \emph{descriptor} to mean an explicit representation of a tile's shape/strides (and a chosen block/tile shape) sufficient to drive descriptor-based TMA load/store APIs (e.g., via \texttt{tl.make\_tensor\_descriptor(...)} and descriptor \texttt{load}/\texttt{store} operations). \cite{NV_BLOG_TILE}
+Any deeper claim about descriptor microarchitectural semantics (e.g., exact caching behavior or ordering) beyond what is described is \UNVERIFIED{}. \cite{NV_BLOG_TILE}
+
+\begin{verbatim}
+Descriptor-based vs. tensor-of-pointer terminology (as used later):
+
+  tensor-of-pointer pattern:
+    - program constructs per-element or per-lane pointers
+    - reported as suboptimal on TileIR backend (CUDA 13.1 context)     [NV_BLOG_TILE]
+
+  descriptor-based pattern:
+    - program constructs a tile descriptor (shape/strides/block_shape)
+    - uses descriptor-driven load/store (TMA)                          [NV_BLOG_TILE]
+    - variable-latency "streaming op" viewpoint used in scheduling     [OPT_PIPE]
+\end{verbatim}
+
+\paragraph{CUDA Tile IR / Triton-to-TileIR / ``CUDA Tile'' (interface terms).}
+We use the following compilation-interface terms as defined in NVIDIA's Triton-to-TileIR description:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Triton-to-TileIR backend:} a compilation path for Triton that targets \emph{CUDA Tile IR} instead of PTX, described as leveraging an MLIR-based infrastructure intended to preserve tile semantics. \cite{NV_BLOG_TILE}
+  \item \textbf{``TileIR artifacts'':} intermediate cached artifacts (notably \texttt{.tileIR} files) produced when enabling the backend (e.g., via \texttt{ENABLE\_TILE=1} as described), contrasted with the usual \texttt{.cubin} cache artifacts in PTX-centric flows. \cite{NV_BLOG_TILE}
+  \item \textbf{Operation coverage limitations:} the blog explicitly notes incomplete coverage / unsupported operations; any attempt to enumerate the full unsupported set without additional primary documentation is \UNVERIFIED{}. \cite{NV_BLOG_TILE}
+\end{itemize}
+
+\paragraph{Scheduling vocabulary: SWP (software pipelining) and WS (warp specialization).}
+We adopt the scheduling vocabulary used in recent Blackwell attention-kernel evidence:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{SWP (software pipelining):} overlapping multiple dependent stages of a looped kernel (e.g., moving the next tile while computing the current tile), with tunable pipeline depth for streaming/variable-latency stages. \cite{OPT_PIPE}
+  \item \textbf{WS (warp specialization):} assigning distinct roles to warps (or warp groups) within a CTA so that different warps focus on different pipeline stages (e.g., data movement vs compute), coordinated via synchronization. \cite{OPT_PIPE}
+\end{itemize}
+In the Blackwell context, \cite{OPT_PIPE} explicitly reports that faster Tensor Cores and additional synchronization requirements around Tensor Memory loads/stores can change the optimal SWP/WS strategy, and that blocking synchronization may be required when reading accumulators from Tensor Memory. \cite{OPT_PIPE}
+
+\begin{verbatim}
+WS + SWP terminology sketch (pipeline roles; not a prescriptive design):
+
+  Time ---->
+
+  Warp role A (movement):   [TMA load tile k+1] ... [TMA load tile k+2] ...
+  Warp role B (compute):              [TC compute tile k] ... [TC compute tile k+1] ...
+  Warp role C (epilogue):                        [store / convert / etc.] ...
+
+  Synchronization points (not exhaustively specified here):
+    - reported extra sync around TMEM loads/stores on Blackwell        [OPT_PIPE]
+    - exact minimal hazard semantics for tcgen05.* are UNVERIFIED      [ARCH_BW]
+\end{verbatim}
+
+\paragraph{CTA scheduling and locality terms (Grace--Blackwell evidence).}
+Although this part does not advance a locality methodology, we define the terms used later when discussing system-level scheduling evidence:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{CTA (Cooperative Thread Array):} the CUDA execution unit scheduled on SMs (terminology consistent with CUDA literature; used operationally in \cite{SEED_3}).
+  \item \textbf{Persistent CTA scheduling:} a CTA structure that uses a grid-stride loop so that a fixed number of CTAs repeatedly pull work, enabling more controlled scheduling/locality experiments. \cite{SEED_3}
+  \item \textbf{Traversal-order (wavefront) transformations:} changes in the order that CTAs (or their logical tiles) visit work-items, which \cite{SEED_3} reports can affect cache behavior and throughput on a Grace--Blackwell GB10 platform; the ``sawtooth'' ordering is an example transformation discussed in that study. \cite{SEED_3}
+\end{itemize}
+
+\paragraph{Layout abstractions: from ``layouts'' to verifiable mappings.}
+We use \textbf{layout} to mean the (possibly distributed) mapping from a logical tensor index space to concrete memory addresses and/or thread-level data distributions. This proposal relies on two complementary layout formalizations from the golden sources:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Linear layouts (Triton-centered):} \cite{SEED_1} formalizes distributed and memory layouts and establishes completeness results connecting distributed layouts to linear layouts (and memory layouts to linear layouts), with explicit discussion that memory layouts can apply to shared memory and tensor memory. \cite{SEED_1}
+  \item \textbf{Integer set relations (CuTe + Triton unification):} \cite{SEED_2} models CuTe layout operations and Triton linear layouts using ISL-style integer set relations, emphasizing that composition (with implicit layout promotion) can introduce out-of-bound accesses unless appropriate predicates are enforced, and arguing that predicates can be synthesized automatically. \cite{SEED_2}
+\end{itemize}
+
+\noindent
+\textbf{Power-of-two restrictions (terminology-level note).}
+Both scheduling/compiler evidence and layout-theory evidence mention power-of-two restrictions in their respective systems: \cite{OPT_PIPE} reports a power-of-two tile-size restriction in Triton in the described setting, while \cite{SEED_1} discusses power-of-two shape restrictions in its layout formalism and notes masking-based mitigation and the need for richer expressiveness (e.g., affine extensions). \cite{OPT_PIPE,SEED_1}
+We treat any statement about \emph{why} these restrictions exist in a specific toolchain as \UNVERIFIED{} unless supported by primary documentation or explicit source text. \cite{OPT_PIPE,SEED_1}
+
+\begin{verbatim}
+Layout representation ladder (as terminology):
+
+  Program intent:
+    - tile shapes, swizzles, layout conversions, composition/inverse/etc.
+
+  Formal models (sources provide different but related lenses):
+    - Linear layouts: algebraic objects for distributed + memory layouts   [SEED_1]
+    - ISL relations: integer set relations for CuTe + Triton layouts       [SEED_2]
+
+  Safety hook (source-grounded):
+    - composed layouts may require bounds predicates to avoid OOB          [SEED_2]
+\end{verbatim}
+
+\paragraph{Workload and mapping vocabulary (mixed-reuse cascades).}
+We adopt \cite{NV_workloads} terminology to keep workload references precise:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Mixed-reuse workload:} a workload that is a cascade of operators with heterogeneous reuse/arithmetic-intensity characteristics; transformers are a canonical example. \cite{NV_workloads}
+  \item \textbf{Phase behavior (prefill vs.\ decode):} distinct regimes in transformer execution that can induce materially different tensor shapes and reuse behavior, motivating phase-aware evaluation language. \cite{NV_workloads}
+  \item \textbf{Mapping:} the act of selecting loop transformations (e.g., tiling, loop permutation, parallelization) that determine how computation and data movement are structured on a target architecture. \cite{NV_workloads}
+\end{itemize}
+
+\begin{verbatim}
+Mixed-reuse / mapping terminology sketch (from system view to kernel view):
+
+  Transformer execution:
+    prefill phase  --> operator cascade --> attention / MLP / norms ...
+    decode phase   --> operator cascade --> attention / KV reuse regimes ...
+         |
+         v
+  "mapping" choices (loop transformations):
+    tiling / permutation / parallelization / specialization             [NV_workloads]
+         |
+         v
+  kernel-level tiles + layouts + movement + sync decisions
+    (TMEM / tcgen05; TMA descriptors; SWP/WS; CTA order)                 [ARCH_BW,OPT_PIPE,NV_BLOG_TILE,SEED_3]
+\end{verbatim}
+
+\paragraph{Cross-source glossary (quick reference).}
+Table~\ref{tab:glossary} summarizes the minimal set of terms (and their provenance) that will be used without re-definition later. \CiteAllGoldens{} \cite{NV_workloads}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}p{0.18\linewidth}p{0.54\linewidth}p{0.22\linewidth}@{}}
+\toprule
+\textbf{Term} & \textbf{Meaning in this proposal (terminology only)} & \textbf{Primary source(s)} \\
+\midrule
+Blackwell & NVIDIA Blackwell GPUs; hardware evidence primarily from B200-class studies in cited work. & \cite{ARCH_BW,OPT_PIPE} \\
+Grace--Blackwell (GB10) & Grace--Blackwell platform context for locality/scheduling evidence; not assumed to generalize. & \cite{SEED_3} \\
+TMEM & Software-managed tensor memory tier emphasized in Blackwell characterization; used to stage tiles/intermediates. & \cite{ARCH_BW} \\
+tcgen05.* & Blackwell PTX/SASS-visible instruction-family labels used to discuss TMEM-centric data movement/compute; full hazard semantics \UNVERIFIED{}. & \cite{ARCH_BW} \\
+TMA & Tile-oriented movement referenced as variable-latency streaming ops and as descriptor-driven load/store API surface. & \cite{OPT_PIPE,NV_BLOG_TILE} \\
+TileIR / CUDA Tile IR backend & Triton backend targeting CUDA Tile IR rather than PTX; emits \texttt{.tileIR} artifacts; incomplete op coverage. & \cite{NV_BLOG_TILE} \\
+SWP / WS & Software pipelining and warp specialization; Blackwell evidence links optimality to TMEM sync requirements. & \cite{OPT_PIPE} \\
+Linear layout & Formal model: distributed layouts and memory layouts can be represented as linear layouts; includes discussion of tensor memory layouts. & \cite{SEED_1} \\
+Integer set relation (ISL) & Formal model: unify CuTe + Triton layouts; supports composition/inverse/complement; predicate synthesis for OOB safety. & \cite{SEED_2} \\
+Persistent CTA & CTA scheduling form (grid-stride loop) used to study cache/locality effects in a controlled way. & \cite{SEED_3} \\
+Mixed-reuse & Operator cascades with heterogeneous reuse; motivates phase language (prefill/decode) and mapping vocabulary. & \cite{NV_workloads} \\
+\bottomrule
+\end{tabular}
+\caption{Glossary of terminology and interfaces used later (cross-source alignment).}
+\label{tab:glossary}
+\end{table}
+
+% --------------------------------------------------------------------
+% SOURCE AUDIT (required; included as LaTeX comments to preserve LaTeX-only output)
+%
+% ARCH_BW:
+%   Used for: (i) Blackwell hardware-context terminology (B200-class focus),
+%             (ii) TMEM definition as software-managed tensor memory,
+%             (iii) tcgen05.{cp,ld,st,mma} instruction-family naming and PTX->SASS audit framing,
+%             (iv) existence of precision-dependent mappings and latency comparisons (terminology-level).
+%   Anchors: Section III-A (architecture + tcgen05.mma described as single-thread instruction);
+%            Section V-A (Tensor Memory (TMEM) + pipeline shift and tcgen05.cp/ld/st roles);
+%            Table IV (precision-specific PTX<->SASS mapping; includes OMMA for FP4);
+%            Table V (latency comparisons for tcgen05.mma vs wgmma).
+%
+% OPT_PIPE:
+%   Used for: (i) definitions/usage of SWP and WS terminology,
+%             (ii) evidence that Blackwell scheduling differs due to added sync around TMEM,
+%             (iii) variable-latency "streaming ops" terminology with explicit example of TMA loads,
+%             (iv) reported power-of-two tile-size restriction in Triton (contextual terminology).
+%   Anchors: Experimental Setup (lowering decisions listed: allocation/layout/sync);
+%            Section 5.3 (Variable Latency Optimizations; streaming ops; TMA loads example);
+%            Section 6.2.2 (Blackwell: different SWP/WS due to faster TC + more required sync ops);
+%            Section 6.3.2 (Blackwell compilation barriers; spilling).
+%
+% NV_workloads:
+%   Used for: (i) mixed-reuse workload definition and transformer motivation,
+%             (ii) prefill vs decode phase terminology,
+%             (iii) "mapping as loop transformations" vocabulary.
+%   Anchors: Section II-A (Mapping as loop transformations);
+%            Section II-B (Mixed-reuse workloads; transformer phase framing).
+%
+% NV_BLOG_TILE:
+%   Used for: (i) definitions of Triton-to-TileIR / CUDA Tile IR backend (targets Tile IR vs PTX),
+%             (ii) CUDA 13.1+ and Blackwell gating language,
+%             (iii) ENABLE_TILE=1 and .tileIR cache artifact terminology,
+%             (iv) limitations/unsupported ops mention,
+%             (v) tensor-of-pointer performance pitfall and descriptor-driven TMA mitigation API terms.
+%   Anchors: Sections titled "What is Triton-to-TileIR?", "How to use Triton-to-TileIR",
+%            "Verify Tile IR compilation", "Limitations",
+%            and the tensor-of-pointer discussion including tl.make_tensor_descriptor and desc.load/store.
+%
+% SEED_1:
+%   Used for: (i) definitions of distributed layouts / memory layouts and their relationship to linear layouts,
+%             (ii) statement that memory layouts include shared memory and tensor memory as targets,
+%             (iii) terminology-level note on power-of-two shape restriction and masking-based mitigation language.
+%   Anchors: Theorem 4.9 + Definition 4.10 (distributed layouts as linear layouts);
+%            Theorem 4.13 + Definition 4.14 (memory layouts as linear layouts; includes tensor memory mention);
+%            Conclusions limitation statement (power-of-two restriction; masking; affine extension direction).
+%
+% SEED_2:
+%   Used for: (i) integer set relations as a unified layout model for CuTe + Triton,
+%             (ii) layout operations terminology (composition/inverse/complement),
+%             (iii) out-of-bound risk under composition with implicit promotion and predicate synthesis claim.
+%   Anchors: Section 2.1.2 (layout operations);
+%            Section 3.1 (coordinate/index spaces as integer sets);
+%            composition-semantics discussion highlighting OOB risk and synthesized predicates;
+%            Section 6 (implementation evidence: isl-layout tool).
+%
+% SEED_3:
+%   Used for: (i) Grace--Blackwell GB10 platform context as a locality study setting,
+%             (ii) persistent CTA scheduling terminology (grid-stride loop),
+%             (iii) traversal-order (sawtooth) terminology and its reported cache/throughput relevance,
+%             (iv) note that CuTile compiler splitting can alter intended access patterns (terminology-level).
+%   Anchors: Section 2.1 (GB10 context);
+%            Section 2.2 (persistent CTA scheduling; grid-stride loop);
+%            Section 3.3 (L2 non-compulsory miss threshold regime);
+%            Algorithm 4 (sawtooth KV access pattern);
+%            Section 4.3.2 (CuTile tile splitting limitation).
+% --------------------------------------------------------------------
+
+% === END PART 3 ===

@@ -1,0 +1,76 @@
+
+### Stage S2 output schema (YAML only)
+Top-level keys MUST be exactly:
+- context_pack_version: "S2.v2"
+- generated_at_utc
+- project_profile
+- golden_sources
+- source_audit
+- formalism_index
+- evidence_index
+- cross_source_synthesis
+- model_blueprint
+- gap_map
+- latex_plan
+
+model_blueprint:
+  # The deliverable of the new runbook: a theory-first model spec.
+  model_name: "..."
+  core_question: "..."
+  mathematical_objects:
+    - object: "..."
+      type: "set|vector_space|relation|graph|constraint_system|category|semiring|..."
+      maps_to_gpu_concept: "..."
+      defined_using_sources: ["SEED_1: ...", "SEED_2: ...", "OPT_PIPE: ...", "ARCH_BW: ..."]
+      notes: "UNVERIFIED if needed"
+  semantics_layer:
+    - layer: "layout_semantics"
+      representation: "e.g., linear maps over F2 + relation embedding"
+      invariants: ["..."]
+    - layer: "data_movement_semantics"
+      representation: "e.g., relations for addressability/descriptorization"
+      invariants: ["..."]
+    - layer: "scheduling_semantics"
+      representation: "e.g., SMT/ILP constraints for SWP/WS + sync"
+      invariants: ["..."]
+    - layer: "cache_traffic_semantics"
+      representation: "e.g., analytic sector-access model"
+      invariants: ["..."]
+  objective_functions:
+    - "e.g., minimize initiation interval subject to sync/memory constraints"
+    - "e.g., minimize predicted L2 sector misses subject to correctness"
+  proof_obligations:
+    - obligation: "semantic preservation of layout transformations"
+      planned_technique: "e.g., relation composition equivalence proof"
+      anchored_sources: ["SEED_1", "SEED_2"]
+    - obligation: "soundness of schedule feasibility constraints"
+      planned_technique: "e.g., SMT model + liveness reasoning"
+      anchored_sources: ["OPT_PIPE"]
+  calibration_and_validation_plan:
+    - parameter: "..."
+      how_to_measure: "PTX microbench / counters / controlled experiment"
+      anchored_sources: ["ARCH_BW", "SEED_3"]
+    - falsifiable_predictions: ["..."]
+  scope_guardrails:
+    - "No new microarchitectural facts without evidence; label UNVERIFIED."
+    - "No heuristic-only proposals; must be derivable from the model or clearly labeled baseline."
+
+gap_map:
+  # 6–12 gaps total, phrased as “missing formalization / missing proof / missing unification / missing calibrated model”
+  - gap_id: "G1"
+    gap_statement: "..."
+    why_it_matters: "..."
+    evidence_links: ["SEED_1: ...", "ARCH_BW: ..."]
+    what_is_missing: "formal definition / invariant / proof / calibrated parameter / solver encoding"
+    candidate_research_questions: ["RQ1: ...", "RQ2: ..."]
+    candidate_formalization: ["e.g., define mapping as ...", "encode as relation ...", "SMT constraints ..."]
+    candidate_methodology: ["..."]
+    evaluation_metrics: ["..."]
+    risks_and_mitigations: ["..."]
+
+latex_plan:
+  # Each part MUST cite ALL 8 sources at least once.
+  part_1: {sections:["problem framing + formal preliminaries (F2, ISL relations, SMT/ILP, cache models, Blackwell CUDA/PTX constraints)"], must_cite:[...]}
+  part_2: {sections:["Unified model blueprint (definitions + semantics layers + commutative diagrams/tables)"], must_cite:[...]}
+  part_3: {sections:["Methods: solver encoding + relational/layout tooling + calibration microbench plan"], must_cite:[...]}
+  part_4: {sections:["Evaluation + reproducibility + threats + risks"], must_cite:[...]}

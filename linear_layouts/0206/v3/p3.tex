@@ -1,0 +1,334 @@
+% ----------------------------------------------------------------------
+% === PART 3 ===
+\section{Part III --- Concrete research plan under CUDA \(>13.0\) and PTX \(>9.0\)}
+This part turns the Part~I--II gap signals into a concrete, toolchain-disciplined research plan. The non-negotiable constraints are: (i) \Blackwell{}-only scope (Grace--\Blackwell{} included when relevant), (ii) CUDA \(>13.0\) (targeting CUDA \(13.1+\) explicitly), and (iii) PTX \(>9.0\) (strictly greater than \(9.0\)). Where the golden sources do not explicitly establish versioned feature availability (notably PTX ISA requirements for \texttt{tcgen05.*}, \TMEM{} access, and synchronization sequences), claims are treated as \emph{UNVERIFIED} and converted into explicit verification steps \cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}.
+
+\subsection{Research questions (RQ1--RQ8)}
+\begin{enumerate}[leftmargin=*,itemsep=0.45em,label=\textbf{RQ\arabic*:}]
+  \item \textbf{(TMEM/\texttt{tcgen05} cost model at the target toolchain)}\\
+  Under CUDA \(13.1+\), can we build a \Blackwell{}-valid, compiler-consumable cost model for \TMEM{} and \texttt{tcgen05.\{cp,ld,st,mma\}} (including synchronization overhead) that is accurate enough to guide automatic schedule selection for attention-/GEMM-like kernels? \cite{ARCH_BW,OPT_PIPE}
+
+  \item \textbf{(Synchronization taxonomy + measured costs)}\\
+  What is the measured cost distribution (median/tails) of the \Blackwell{}-relevant synchronization patterns that arise when consuming accelerator results and interacting with \TMEM{}, and how sensitive are those costs to placement in an in-order issue model? \cite{OPT_PIPE,ARCH_BW}
+
+  \item \textbf{(Execution model reconciliation)}\\
+  What compiler-usable execution model reconciles the \texttt{tcgen05.mma} ``single-thread issuance'' framing with the cooperative multi-warp organization and blocking synchronization realities needed for peak kernel throughput, and which parts of that model can be empirically validated from PTX/SASS and profiling? \cite{ARCH_BW,OPT_PIPE}
+
+  \item \textbf{(TMEM allocation and aliasing-safe lifetime management)}\\
+  Can we design and prototype a \TMEM{} allocation/lifetime abstraction that (a) enables compilation of \Blackwell{} kernels that require controlled aliasing patterns, and (b) provides a verification hook to prevent unintended overlap/OOB, without excessive compile-time overhead? \cite{ARCH_BW,OPT_PIPE,SEED_2}
+
+  \item \textbf{(TileIR workflow robustness: rewrites + fallback)}\\
+  For Triton-to-\TileIR{} under CUDA \(13.1+\), can we systematically detect performance-degrading ``tensor-of-pointer'' patterns and rewrite them into descriptor/\TMA{}-based loads/stores when legal, while (i) proving or checking bounds safety and (ii) falling back gracefully when \TileIR{} op coverage is incomplete? \cite{NV_BLOG_TILE,SEED_1,SEED_2}
+
+  \item \textbf{(Schedule synthesis + realizable lowering path)}\\
+  Can we integrate a Twill-style joint \SWP{}+\WS{} schedule search (or a simplified successor) with a lowering path that remains realizable under CUDA \(13.1+\) (including register constraints, \TMEM{} interactions, and correct synchronization), and how often do ``optimal'' schedules become infeasible due to lowering/allocator realities? \cite{OPT_PIPE,ARCH_BW,NV_BLOG_TILE}
+
+  \item \textbf{(Inter-CTA traversal order as a first-class schedule dimension)}\\
+  Can inter-CTA traversal order transformations (e.g., sawtooth wavefront reordering) be expressed as an optimizable schedule parameter that composes with intra-CTA \SWP{}+\WS{}, and do the observed locality benefits generalize beyond GB10 to other \Blackwell{} SKUs (UNVERIFIED until tested)? \cite{SEED_3,OPT_PIPE,NV_BLOG_TILE}
+
+  \item \textbf{(DE-integrated pipelines as a stretch target)}\\
+  When \textsc{DE} is present, what overlap strategies (buffering depth, warp roles, sync placement) maximize end-to-end throughput for ``decompress \(\rightarrow\) tile move \(\rightarrow\) Tensor Core compute'' pipelines on \Blackwell{}, and can the resulting behavior be incorporated into the same scheduling/cost framework? \cite{ARCH_BW,OPT_PIPE}
+\end{enumerate}
+
+\subsection{Methodology}
+\paragraph{M0: Toolchain gating and ``UNVERIFIED'' resolution plan.}
+Before collecting any performance data, we perform two hard gates:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{CUDA gate (targeting CUDA \(13.1+\)).}
+  Because CUDA Tile / CUDA \TileIR{} is described as introduced in CUDA \(13.1\) and Triton-to-\TileIR{} is described as requiring CUDA \(13.1+\) and \Blackwell{} GPUs \cite{NV_BLOG_TILE}, the primary experimental environment is CUDA \(13.1+\). (OPT\_PIPE’s \Blackwell{} evidence is reported under CUDA \(13.0\), so persistence of its observations under CUDA \(13.1+\) is \emph{UNVERIFIED} until re-measured \cite{OPT_PIPE}.)
+  \item \textbf{PTX gate (enforcing PTX \(>9.0\)).}
+  The golden sources motivate \texttt{tcgen05.*}/\TMEM{} but do not state the minimum PTX ISA version required for each instruction family \cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}. Therefore, we will \emph{verify} emitted PTX by:
+  \begin{enumerate}[leftmargin=*,itemsep=0.25em]
+    \item compiling a minimal kernel to PTX and checking the \texttt{.version} header;
+    \item failing fast if \texttt{.version} is \(\le 9.0\) (hard blocker), and documenting the toolchain upgrade path.
+  \end{enumerate}
+\end{itemize}
+
+All later claims about ``CUDA \(13.1+\) behavior'' or ``PTX \(>9.0\) availability'' are treated as \emph{UNVERIFIED} until these gates pass and we archive the exact toolchain versions and emitted artifacts.
+
+\paragraph{M1: PTX microbenchmarks (TMEM/\texttt{tcgen05} primitives, sync, and \textsc{DE}).}
+ARCH\_BW explicitly motivates PTX-level microbenchmarking to isolate Blackwell-specific behaviors and to document PTX-to-SASS translation \cite{ARCH_BW}. We adopt the same spirit but tailor the suite to the Part~III questions:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Instruction presence validation (no silent substitution).}
+  For each microbenchmark kernel we will archive:
+  (i) emitted PTX, (ii) final cubin, and (iii) SASS disassembly to confirm whether intended \texttt{tcgen05.*} and synchronization sequences appear (and to detect compiler substitutions), following ARCH\_BW’s emphasis on translation validation \cite{ARCH_BW}. Any benchmark where instruction selection is ambiguous is labeled \emph{UNVERIFIED} and excluded from modeling.
+  \item \textbf{Latency microbenchmarks (dependent chains).}
+  To reduce confounding reordering/ILP, we use dependent chains and minimal live state. The goal is not a single scalar latency, but a \emph{parameterized} measurement across:
+  \begin{enumerate}[leftmargin=*,itemsep=0.25em]
+    \item tile shapes/strides (where expressible),
+    \item dependence depth (to expose pipeline effects),
+    \item contention regimes (isolated vs concurrent execution).
+  \end{enumerate}
+  This directly targets RQ1--RQ3 and RQ2’s sync costs \cite{ARCH_BW,OPT_PIPE}.
+  \item \textbf{Synchronization cost catalog (distributions, not point estimates).}
+  OPT\_PIPE highlights that blocking synchronization interrupts in-order issue and that \Blackwell{} requires additional synchronization around \TMEM{} interactions \cite{OPT_PIPE}. Therefore we measure \emph{distributions} (median/P95/P99) over many trials, with pinned clocks where possible, and we stratify by placement context (e.g., immediately after accelerator issue vs delayed) to quantify sensitivity.
+  \item \textbf{Variable-latency tile movement (TMA) characterization for scheduling.}
+  OPT\_PIPE emphasizes that \TMA{} latency has a high dynamic range and that naive bounds lead to under/overlap failures \cite{OPT_PIPE}. We therefore measure TMA latency distributions under controlled interference (e.g., bandwidth pressure) and encode those as stochastic or robust constraints in later schedule search.
+  \item \textbf{\textsc{DE} as a pipeline stage (stretch, but measurable).}
+  ARCH\_BW characterizes the \textsc{DE} and motivates it as throughput-relevant \cite{ARCH_BW}. If APIs permit, we implement microbenchmarks that (i) isolate \textsc{DE} throughput/latency and (ii) couple \textsc{DE}\(\rightarrow\)movement\(\rightarrow\)compute to quantify overlap constraints (RQ8). Where APIs are unclear, we explicitly mark interface assumptions \emph{UNVERIFIED} and restrict to the measurement modalities demonstrated in ARCH\_BW.
+\end{itemize}
+
+\paragraph{M2: CUDA \(13.1+\) pipeline experiments: Triton-to-\TileIR{} vs PTX backend.}
+NV\_BLOG\_TILE provides a concrete workflow target: Triton-to-\TileIR{} is described as source-build-only, requiring CUDA \(13.1+\) and \Blackwell{} GPUs, and it provides a compilation verification mechanism (enabling Tile IR and observing \texttt{.tileIR} cache artifacts) \cite{NV_BLOG_TILE}. Our experiments operationalize this into a controlled backend comparison:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Backend matrix.}
+  For each kernel in a curated corpus (matmul microkernels, attention-like loops, representative reductions/elementwise fusion), we run both:
+  \begin{enumerate}[leftmargin=*,itemsep=0.25em]
+    \item Triton \(\rightarrow\) PTX (baseline path), and
+    \item Triton \(\rightarrow\) \TileIR{} (ENABLE\_TILE workflow verification).
+  \end{enumerate}
+  We record: compile success, generated artifacts, runtime, and key profiler counters.
+  \item \textbf{Limitations-driven corpus design.}
+  NV\_BLOG\_TILE states that \TileIR{} op coverage is incomplete and that certain patterns may be unsupported \cite{NV_BLOG_TILE}. We therefore include kernels designed to exercise boundary cases and we explicitly count ``unsupported'' failures as a first-class outcome.
+  \item \textbf{Tensor-of-pointer mitigation experiments.}
+  NV\_BLOG\_TILE reports suboptimal performance for the ``tensor-of-pointer'' pattern on CUDA \(13.1\) \TileIR{} and recommends using tensor descriptors (shape/strides/block\_shape) with \TMA{} load/store APIs \cite{NV_BLOG_TILE}. We will:
+  \begin{enumerate}[leftmargin=*,itemsep=0.25em]
+    \item build detectors for tensor-of-pointer construction patterns,
+    \item attempt legality checks for descriptor replacement (RQ5),
+    \item apply rewrites where legal and fall back otherwise,
+    \item quantify speedups/regressions and coverage changes.
+  \end{enumerate}
+\end{itemize}
+
+\paragraph{M3: Scheduling experiments: \SWP{}+\WS{} search, feasibility, and lowering.}
+OPT\_PIPE provides (i) the argument that \SWP{} and \WS{} are coupled, (ii) a constraint-based formulation in Twill, and (iii) evidence that many failures are due to lowering decisions such as memory allocation, layout conversion, and synchronization placement \cite{OPT_PIPE}. However, those results are reported under CUDA \(13.0\), so replication under CUDA \(13.1+\) is required \cite{OPT_PIPE,NV_BLOG_TILE}. Our plan:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Schedule space definition.}
+  We define a schedule parameterization that includes:
+  (i) initiation interval/prologue-epilogue structure (\SWP{}),
+  (ii) warp-role partitioning (\WS{}),
+  (iii) explicit synchronization placement decisions around variable-latency operations and \TMEM{} interactions, as motivated by OPT\_PIPE \cite{OPT_PIPE}.
+  \item \textbf{Cost inputs from measurement, not speculation.}
+  Measured microbenchmark results (M1) instantiate the costs for:
+  \texttt{tcgen05.*}, \TMEM{} access, sync sequences, and TMA latency distributions, matching ARCH\_BW’s ``measure then model'' approach and OPT\_PIPE’s need for stable costs \cite{ARCH_BW,OPT_PIPE}.
+  \item \textbf{Feasibility as an evaluation axis.}
+  Following OPT\_PIPE’s evidence that ``optimal'' schedules may be impossible to lower (spills, allocator failure, incorrect sync) \cite{OPT_PIPE}, we treat the output of schedule selection as a hypothesis that must pass:
+  (i) compilation without catastrophic spilling,
+  (ii) correctness tests,
+  (iii) performance stability across runs.
+  \item \textbf{Lowering routes.}
+  For each schedule candidate, we attempt:
+  \begin{enumerate}[leftmargin=*,itemsep=0.25em]
+    \item a controlled CUDA baseline implementation (hand-lowered, for ground truth feasibility, mirroring OPT\_PIPE’s ``hand-compile'' strategy \cite{OPT_PIPE}), and
+    \item a tile-centric route (Triton-to-\TileIR{}) when op support permits \cite{NV_BLOG_TILE}.
+  \end{enumerate}
+  Any claims that \TileIR{} can natively encode all \TMEM{}/\texttt{tcgen05.*} lowering details remain \emph{UNVERIFIED} absent explicit evidence \cite{NV_BLOG_TILE,ARCH_BW}.
+\end{itemize}
+
+\paragraph{M4: CTA scheduling and locality experiments (sawtooth and beyond).}
+SEED\_3 demonstrates that inter-CTA traversal order can materially change L2 miss behavior and throughput on GB10 (Grace--\Blackwell{}) and validates sawtooth wavefront reordering in both CUDA and CuTile, while documenting a limitation where tile splitting can change access patterns \cite{SEED_3}. Our experiments:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Reproduce under the target toolchain.}
+  Re-run the cyclic vs sawtooth traversal comparison under CUDA \(13.1+\) on GB10, measuring the same class of cache metrics (Nsight Compute-based) used in SEED\_3 \cite{SEED_3}.
+  \item \textbf{Generalization checks (UNVERIFIED until measured).}
+  Where B200-class \Blackwell{} hardware is available, port the same traversal-order variants and measure whether miss reductions and throughput improvements persist. Any transfer from GB10 to B200 remains \emph{UNVERIFIED} until this step is performed \cite{SEED_3,ARCH_BW}.
+  \item \textbf{Compose traversal order with intra-CTA schedules.}
+  For a fixed intra-CTA kernel schedule (from M3), vary only the CTA traversal order to quantify the interaction. This addresses the ``missing composition'' gap between OPT\_PIPE’s intra-CTA focus and SEED\_3’s inter-CTA optimization \cite{OPT_PIPE,SEED_3}.
+  \item \textbf{Tile-splitting sensitivity.}
+  Explicitly test regimes where the tile-centric compiler may split tiles (SEED\_3 limitation) and treat any observed splitting as a distinct experimental condition rather than noise \cite{SEED_3}.
+\end{itemize}
+
+\paragraph{M5: Layout modeling and verification experiments (linear layouts \(\rightarrow\) integer-set safety \(\rightarrow\) descriptors).}
+TileIR’s descriptor/TMA mitigation requires correct shape/stride/block\_shape parameters \cite{NV_BLOG_TILE}. SEED\_1 motivates linear layouts as a robust layout propagation/conversion infrastructure, with explicit limitations (e.g., power-of-two shape restrictions and masking) \cite{SEED_1}. SEED\_2 motivates integer set relations to unify layout modeling and to synthesize bounds predicates to prevent OOB hazards from naive composition \cite{SEED_2}. We combine these into a verification-oriented pipeline:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Layout metadata propagation.}
+  Implement (or reuse, if available) a linear-layout representation for Triton-relevant layout transforms and compute descriptor parameters (\texttt{shape}, \texttt{strides}, \texttt{block\_shape}) from that representation, directly supporting NV\_BLOG\_TILE’s suggested rewrite \cite{SEED_1,NV_BLOG_TILE}.
+  \item \textbf{Safety checks via integer set relations.}
+  For each candidate descriptor rewrite, translate the layout mapping into an integer set relation and check:
+  (i) in-bounds coverage, (ii) absence of unintended holes, and (iii) required predicate/mask synthesis for edges and non-power-of-two shapes (addressing SEED\_1 limitations using masking and SEED\_2’s predicate synthesis framing) \cite{SEED_1,SEED_2}.
+  \item \textbf{Integration point: descriptor rewrite legality.}
+  The rewrite system only applies descriptor-based movement when the safety check passes; otherwise it falls back to the pointer-based load/store path and records a counterexample for analysis \cite{NV_BLOG_TILE,SEED_2}.
+  \item \textbf{TMEM mapping boundary (explicitly UNVERIFIED).}
+  ARCH\_BW provides a concrete structural description of \TMEM{} and emphasizes that \TMEM{} requires distinct movement instructions \cite{ARCH_BW}. However, a formally checkable end-to-end mapping from these layout formalisms to \TMEM{}-compatible placement and \texttt{tcgen05.*} sequences is not established within the golden sources; therefore, any such mapping is treated as \emph{UNVERIFIED} and, in this plan, scoped as a follow-on once descriptor correctness is validated \cite{ARCH_BW,SEED_1,SEED_2}.
+\end{itemize}
+
+\subsection{Evaluation plan}
+\subsubsection{Metrics}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Performance (kernel-level).}
+  Wall-clock runtime, throughput (e.g., effective TFLOP/s for GEMM/attention-like kernels), and stability across repeated trials.
+  \item \textbf{Overlap and stalls.}
+  Profiler-derived stall breakdowns (sync vs memory vs compute) and evidence of pipeline overlap, motivated by OPT\_PIPE’s emphasis on blocking sync and variable latency \cite{OPT_PIPE}.
+  \item \textbf{Cost-model fidelity (RQ1/RQ2).}
+  Prediction error of modeled vs measured cycle counts and achieved throughput for microkernels (MAPE and worst-case error), using ARCH\_BW-style microbenchmark grounding \cite{ARCH_BW}.
+  \item \textbf{Compiler robustness (RQ4--RQ6).}
+  Compilation success rate, spill occurrence/severity, and functional coverage for the kernel corpus, directly addressing OPT\_PIPE’s and NV\_BLOG\_TILE’s documented brittleness/limitations \cite{OPT_PIPE,NV_BLOG_TILE}.
+  \item \textbf{Correctness and safety.}
+  Differential testing against reference implementations, explicit bounds/predicate validation for rewritten descriptors (SEED\_2 hazard framing), and randomized shape/stride tests including masked edges (SEED\_1 limitation framing) \cite{SEED_1,SEED_2}.
+  \item \textbf{Locality (RQ7).}
+  L2-sector metrics / non-compulsory miss proxies and throughput deltas for cyclic vs sawtooth traversal, as in SEED\_3 \cite{SEED_3}.
+\end{itemize}
+
+\subsubsection{Hardware/software setup assumptions (and what remains UNVERIFIED)}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Hardware.}
+  At least one \Blackwell{}-family GPU is required. GB10 is acceptable for locality-centric experiments; B200-class hardware is required to validate B200-specific hypotheses (generalization from GB10 is \emph{UNVERIFIED} until tested) \cite{SEED_3,ARCH_BW}.
+  \item \textbf{Software/toolchain.}
+  CUDA \(13.1+\) is assumed for Triton-to-\TileIR{} experiments and is required by NV\_BLOG\_TILE’s described workflow \cite{NV_BLOG_TILE}. The ability to enforce PTX \(>9.0\) is \emph{UNVERIFIED} until the M0 PTX gate is executed.
+  \item \textbf{Backends.}
+  Triton-to-\TileIR{} is expected to be source-build-only and early-stage with limitations, as stated by NV\_BLOG\_TILE \cite{NV_BLOG_TILE}. We therefore plan for per-kernel backend switching and explicit fallback pathways.
+\end{itemize}
+
+\subsubsection{Reproducibility checklist}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Archive toolchain identifiers: CUDA toolkit version, driver version, \texttt{nvcc} and \texttt{ptxas} versions, and (if used) Triton-to-\TileIR{} commit hash and build flags \cite{NV_BLOG_TILE}.
+  \item Archive emitted artifacts per kernel: PTX (\texttt{.version} header), cubin, SASS disassembly; include a ``PTX \(>9.0\) check'' log (hard gate).
+  \item Fix/record runtime environment: clocks/power limits where possible, CPU affinity, warm-up policy, and number of trials; report medians and tail percentiles for variable-latency primitives (OPT\_PIPE motivation) \cite{OPT_PIPE}.
+  \item Provide a kernel corpus manifest (names, shapes, strides, masking regimes) and random seeds for property-based tests (descriptor rewrites and layout predicates) \cite{SEED_1,SEED_2,NV_BLOG_TILE}.
+  \item Include profiler command lines and metric sets; for locality experiments, record the exact Nsight Compute counters used to reproduce SEED\_3-style L2 sector analyses \cite{SEED_3}.
+\end{itemize}
+
+\subsection{Threats to validity, risks, and mitigations}
+\begin{itemize}[leftmargin=*,itemsep=0.4em]
+  \item \textbf{Toolchain drift (CUDA \(13.1+\) patch sensitivity).}
+  NV\_BLOG\_TILE frames \TileIR{} as actively evolving, and OPT\_PIPE’s evidence is under CUDA \(13.0\) \cite{NV_BLOG_TILE,OPT_PIPE}. \emph{Mitigation:} version-pin toolchains; rerun a small ``canary'' benchmark set for every toolchain change; report deltas explicitly.
+
+  \item \textbf{PTX \(>9.0\) feasibility risk (hard blocker).}
+  The golden sources do not assert which PTX ISA version is emitted/required for the relevant \Blackwell{} features \cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}. \emph{Mitigation:} enforce the M0 PTX gate early (week~1); if unsatisfied, halt and document an upgrade path rather than proceeding with non-compliant artifacts.
+
+  \item \textbf{Microbenchmark confounding by compiler transformations.}
+  ARCH\_BW emphasizes the need to validate PTX-to-SASS translation when drawing microarchitectural conclusions \cite{ARCH_BW}. \emph{Mitigation:} dependent chains; inline-assembly barriers where applicable; validate SASS; exclude ambiguous cases.
+
+  \item \textbf{Variable-latency primitives produce unstable schedules.}
+  OPT\_PIPE stresses TMA’s high dynamic-range latency and the fragility of sync placement \cite{OPT_PIPE}. \emph{Mitigation:} measure distributions; incorporate robust/stochastic constraints; evaluate schedule stability (variance across trials) as a metric.
+
+  \item \textbf{TileIR backend incompleteness / unsupported operations.}
+  NV\_BLOG\_TILE explicitly notes incomplete op coverage and recommends mitigation strategies for specific patterns \cite{NV_BLOG_TILE}. \emph{Mitigation:} staged fallback to PTX backend; characterize coverage quantitatively; design the rewrite system to be legality-checked and conservative.
+
+  \item \textbf{Layout verification compile-time blow-up.}
+  SEED\_2 discusses complexity considerations for integer set relation operations \cite{SEED_2}. \emph{Mitigation:} restrict ranks/transform depth; cache relations; apply verification selectively (only for rewritten descriptors); measure compile-time overhead explicitly.
+
+  \item \textbf{Cross-SKU generalization (GB10 \(\rightarrow\) B200) is uncertain.}
+  SEED\_3 is GB10-specific; ARCH\_BW provides B200-centric evidence \cite{SEED_3,ARCH_BW}. \emph{Mitigation:} treat cross-device claims as \emph{UNVERIFIED} until replicated; report device-specific parameterizations and avoid overgeneralizing.
+
+  \item \textbf{Compiler tile splitting invalidates locality assumptions.}
+  SEED\_3 reports that CuTile may split large tiles and alter access patterns \cite{SEED_3}. \emph{Mitigation:} detect splits via compilation artifacts/IR inspection; treat ``split vs not split'' as separate experimental conditions.
+\end{itemize}
+
+\subsection{Timeline (12-week plan) and justification}
+A 12-week plan is selected (rather than a semester-scale plan) because the work decomposes into independently testable artifacts (toolchain gates, microbench suite, rewrite+verification pass, locality harness), each with clear go/no-go criteria. Full end-to-end integration of verified layouts into \TMEM{} placement and \texttt{tcgen05.*} lowering is explicitly treated as \emph{stretch} due to missing end-to-end evidence in the golden sources \cite{ARCH_BW,SEED_1,SEED_2}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{p{0.14\linewidth} p{0.80\linewidth}}
+\toprule
+\textbf{Weeks} & \textbf{Milestones and deliverables} \\
+\midrule
+1--2 &
+\textbf{Gating and harness.}
+Install/validate CUDA \(13.1+\); build Triton-to-\TileIR{} from source and verify ENABLE\_TILE workflow \cite{NV_BLOG_TILE}. Execute the PTX \(>9.0\) gate and archive toolchain metadata. Establish baseline CUDA and Triton kernels for measurement. \\
+\addlinespace
+3--4 &
+\textbf{Microbench v1 (TMEM/\texttt{tcgen05}).}
+Implement PTX-level microbench kernels for \TMEM{}-related movement and \texttt{tcgen05.*} instruction families where accessible; validate PTX-to-SASS mappings and measurement sanity following ARCH\_BW’s methodology stance \cite{ARCH_BW}. \\
+\addlinespace
+5--6 &
+\textbf{Sync + variable latency modeling.}
+Add synchronization microbenchmarks and measure distributions; characterize TMA latency variability for robust scheduling inputs \cite{OPT_PIPE}. Fit an initial cost model and evaluate prediction error on microkernels. (Optional: add \textsc{DE} microbench if interface is available \cite{ARCH_BW}.) \\
+\addlinespace
+7--8 &
+\textbf{TileIR corpus + rewrite prototype.}
+Construct a kernel corpus covering supported/unsupported and tensor-of-pointer-heavy patterns; quantify baseline \TileIR{} vs PTX performance/coverage \cite{NV_BLOG_TILE}. Implement a conservative tensor-of-pointer \(\rightarrow\) descriptor/\TMA{} rewrite prototype with basic legality checks. \\
+\addlinespace
+9--10 &
+\textbf{Verification integration (layouts).}
+Integrate linear-layout metadata propagation (SEED\_1) and integer-set-based safety checks/predicate synthesis (SEED\_2) into the rewrite legality pipeline; evaluate correctness across randomized shapes/strides and masked edges \cite{SEED_1,SEED_2}. Measure compile-time overhead and cache effectiveness. \\
+\addlinespace
+11 &
+\textbf{Locality and traversal-order experiments.}
+Reproduce cyclic vs sawtooth traversal results under CUDA \(13.1+\) on GB10; measure L2 sector metrics and throughput deltas and test sensitivity to tile splitting \cite{SEED_3}. Attempt cross-SKU replication where B200 access exists (otherwise mark \emph{UNVERIFIED}). \\
+\addlinespace
+12 &
+\textbf{Consolidation + report.}
+Run end-to-end evaluations: schedule variants (\SWP{}+\WS{}) with measured cost inputs (OPT\_PIPE framing) and rewritten descriptor kernels (NV\_BLOG\_TILE guidance), plus locality variants (SEED\_3) \cite{OPT_PIPE,NV_BLOG_TILE,SEED_3}. Package artifacts and reproducibility checklist; finalize written results. \\
+\bottomrule
+\end{tabular}
+\caption{12-week execution plan with explicit gates, artifacts, and scope boundaries.}
+\label{tab:timeline}
+\end{table}
+
+\section{Conclusion}
+This Part~III plan operationalizes a \Blackwell{}-only research agenda that treats tile movement, synchronization, and layout correctness as coupled constraints rather than separable ``optimization passes.'' The plan is anchored in: (i) ARCH\_BW’s PTX-microbenchmark methodology and \TMEM{}/\texttt{tcgen05} pivot \cite{ARCH_BW}, (ii) OPT\_PIPE’s evidence that \SWP{}+\WS{} schedules are inseparable from feasibility under blocking sync and variable latency \cite{OPT_PIPE}, (iii) NV\_BLOG\_TILE’s CUDA \(13.1+\) \TileIR{} workflow and its explicit limitations/mitigation guidance \cite{NV_BLOG_TILE}, (iv) SEED\_1 and SEED\_2’s arguments that robust layout abstractions and formal safety checks are necessary to prevent brittle codegen and OOB hazards \cite{SEED_1,SEED_2}, and (v) SEED\_3’s demonstration that traversal order is a first-order lever for cache locality on Grace--\Blackwell{} \cite{SEED_3}. The central methodological commitment is to convert every unstable claim (notably PTX ISA and toolchain-sensitive behavior) into an explicit gate or revalidation step, ensuring that conclusions remain valid under the project’s CUDA \(13.1+\) and PTX \(>9.0\) constraints \cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}.
+
+\begin{thebibliography}{99}
+
+\bibitem{ARCH_BW}
+Aaron Jarmusch and Sunita Chandrasekaran.
+\newblock \emph{Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth Architectural Analysis}.
+\newblock arXiv preprint, 2025.
+\newblock \url{https://arxiv.org/html/2512.02189v1}
+
+\bibitem{OPT_PIPE}
+Rupanshu Soi, Rohan Yadav, Fredrik Kjolstad, Alex Aiken, Maryam Mehri Dehnavi, Michael Garland, and Michael Bauer.
+\newblock \emph{Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs}.
+\newblock arXiv preprint, 2025.
+\newblock \url{https://arxiv.org/html/2512.18134v1}
+
+\bibitem{NV_BLOG_TILE}
+Jie Xin and Jonathan Bentz.
+\newblock \emph{Advancing GPU Programming with the CUDA Tile IR Backend for OpenAI Triton}.
+\newblock NVIDIA Technical Blog, 2026.
+\newblock \url{https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/}
+
+\bibitem{SEED_1}
+Keren Zhou, Mario Lezcano, Adam Goucher, Akhmed Rakhmati, Jeff Niu, Justin Lebar, Pawel Szczerbuk, Peter Bell, Phil Tillet, Thomas Raoux, and Zahi Moudallal.
+\newblock \emph{Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using \(\mathbb{F}_2\)}.
+\newblock arXiv preprint (also published at ASPLOS~2026), 2026.
+\newblock \url{https://arxiv.org/html/2505.23819v3}
+
+\bibitem{SEED_2}
+Somashekaracharya G. Bhaskaracharya, Aravind Acharya, Bastian Hagedorn, and Vinod Grover.
+\newblock \emph{Modeling Layout Abstractions Using Integer Set Relations}.
+\newblock arXiv preprint, 2025.
+\newblock \url{https://arxiv.org/html/2511.10374v1}
+
+\bibitem{SEED_3}
+Yifan Zhu, Yekai Pan, and Chen Ding.
+\newblock \emph{Sawtooth Wavefront Reordering: Enhanced CuTile FlashAttention on NVIDIA GB10}.
+\newblock arXiv preprint, 2026.
+\newblock \url{https://arxiv.org/html/2601.16032v2}
+
+\end{thebibliography}
+
+% ----------------------------------------------------------------------
+% source_audit (MANDATORY; comment-only to preserve LaTeX-only output)
+%
+% ARCH_BW:
+%   used_for: Part III uses ARCH_BW to justify PTX-level microbenchmarking with PTX-to-SASS validation, and to motivate measuring TMEM/tcgen05 and DE as schedulable performance surfaces (inputs to cost modeling and schedule feasibility work).
+%   anchors: "IV PTX-Microbenchmark Methodology"; "IV-A1 Tensor Memory (TMEM)"; "IV-A2 Decompression Engine Characterization"; "V-A Tensor Memory (TMEM)"; "V-B Decompression Engine (DE)"; "VI-A Fifth-Generation Tensor Cores"; "VIII Discussion" (software ecosystem note).
+%
+% OPT_PIPE:
+%   used_for: Part III uses OPT_PIPE to motivate joint SWP+WS schedule search, the need to model variable-latency TMA, and blocking synchronization costs; it also motivates treating compilation/lowering feasibility (allocation, layout conversion, sync placement, spilling) as first-class evaluation outcomes and revalidating CUDA 13.0 observations under CUDA 13.1+.
+%   anchors: "3.2 Code Generation Challenges" (variable latency; blocking sync interrupts issue); "3.3 Warp Specialization"; "4 Joint Optimization Problem"; "5.3 Variable Latency Optimizations"; "6.1 Methodology / Evaluation Platforms" (CUDA 13.0); "6.2.2 Blackwell"; "6.3.2 Blackwell" (compiler/toolchain failures).
+%
+% NV_BLOG_TILE:
+%   used_for: Part III uses NV_BLOG_TILE to define the CUDA 13.1+ Triton-to-TileIR workflow constraints, ENABLE_TILE verification, known limitations (unsupported ops), and the tensor-of-pointer degradation with the descriptor/TMA mitigation; it motivates rewrite+fallback experiments and version pinning due to rapid evolution.
+%   anchors: Post date "Jan 30, 2026"; "Verify Tile IR compilation" (ENABLE_TILE and cache artifacts); "Unsupported operations"; "Tensor-of-pointer degradation suboptimal performance"; descriptor example using shape/strides/block_shape and TMA load/store API; "Learn more about Triton-to-TileIR".
+%
+% SEED_1:
+%   used_for: Part III uses SEED_1 as the layout propagation/conversion foundation for generating correct descriptor parameters, and to motivate randomized testing over non-power-of-two shapes with masking as a required reality for descriptor legality.
+%   anchors: "4 Linear Layouts"; "4.3 Completeness"; "4.4 Closure Under Triton Operations"; "5.4 Optimal Codegen for Layout Conversions"; limitation discussion (power-of-two restriction and masking).
+%
+% SEED_2:
+%   used_for: Part III uses SEED_2 to justify integer set relations as a unifying representation for layout legality checks and predicate/mask synthesis to avoid OOB hazards from layout composition; it also informs compile-time risk/mitigation (caching, restricted ranks) due to complexity concerns.
+%   anchors: "2.1 CuTe Layout"; "2.1.2 Layout Operations"; OOB hazard discussion (composition without proper bounds); "6 Implementation and Examples" (isl/ISLpy tooling mention); "Complexity".
+%
+% SEED_3:
+%   used_for: Part III uses SEED_3 to define and evaluate inter-CTA traversal-order (sawtooth) as a first-class locality optimization dimension, including measurement with Nsight Compute metrics and sensitivity to tile-splitting limitations; it also motivates GB10->B200 generalization as UNVERIFIED until tested.
+%   anchors: "2.1 GPU Memory Hierarchy" (Nsight Compute CLI mention); "3.3 L2 Non-Compulsory Miss Threshold"; "4 Sawtooth Wavefront Reordering"; "4.2 CUDA Results"; "4.3 Validation on CuTile"; "4.3.2 Limitations" (tile splitting).
+% ----------------------------------------------------------------------
+% web_metadata_checks_for_bibliography: ([arxiv.org](https://arxiv.org/abs/2512.02189))
+%
+% === END PART 3 ===
+\end{document}
+
+---
+Learn more:
+1. [\[2512.02189\] Microbenchmarking NVIDIA's Blackwell Architecture: An in-depth Architectural Analysis](https://arxiv.org/abs/2512.02189)

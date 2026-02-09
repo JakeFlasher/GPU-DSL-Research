@@ -1,0 +1,192 @@
+% ----------------------------------------------------------------------
+% === PART 2 ===
+
+\section{Scheduling on \Blackwell{}: \SWP{}+\WS{} under \TMEM{}, \TMA{}, and blocking synchronization}
+This section synthesizes why \Blackwell{} changes the \emph{shape} of the scheduling problem, why conventional sequential-IR lowering is strained, and what the \SWP{}+\WS{} (Twill-style) line of work implies---and does \emph{not} yet imply---for a CUDA \(>13.0\), PTX \(>9.0\) research agenda.
+
+\subsection{\Blackwell{} expands the schedule state space: tcgen05, \TMEM{}, and \textsc{DE}}
+\paragraph{From warp-synchronous MMA to single-thread \texttt{tcgen05.mma} + \TMEM{} residency.}
+The \Blackwell{} microarchitecture study frames a major pivot: \texttt{tcgen05.mma} is described as a \emph{single-thread} instruction, with each thread independently issuing MMA operations, sourcing operands from SMEM and \TMEM{} \cite{ARCH_BW}. The same work characterizes \TMEM{} as a dedicated on-chip tier for Tensor Core operations, with explicit software management and a distinct access pathway: traditional instructions (e.g., \texttt{cp.async}, \texttt{ld.shared}, \texttt{ldmatrix}, \texttt{wmma.load}) are reported to not interface with \TMEM{}, requiring \texttt{tcgen05.\{cp,ld,st\}} sequences \cite{ARCH_BW}. Concretely, \TMEM{} is described as a 256KB per-SM structure arranged as a 2D array (512 columns by 128 lanes of 32-bit cells), with empirical latency and bandwidth characterization (e.g., 420-cycle end-to-end access in a cache-miss scenario; 16~TB/s read and 8~TB/s write bandwidth per SM, additive with L1/SMEM bandwidth) \cite{ARCH_BW}.
+
+\paragraph{Decompression Engine (\textsc{DE}) as an additional fixed-function performance surface.}
+Beyond \TMEM{}, the same source emphasizes a hardware Decompression Engine and reports format-specific throughput/latency measurements (Table~I) to motivate that \textsc{DE} is not merely a storage feature but a schedulable, throughput-relevant subsystem \cite{ARCH_BW}. For scheduling research, the key \emph{architectural delta} is that \Blackwell{} kernels may need to reason about decompression, tile movement, and Tensor Core compute as a coupled pipeline rather than a single ``load/compute/store'' abstraction \cite{ARCH_BW}.
+
+\paragraph{Gap signal (architectural-to-scheduling).}
+Taken together, these \Blackwell{} deltas imply that an ``instruction schedule'' is no longer just a register/SMEM problem: it necessarily includes (i) \TMEM{} residency and movement via \texttt{tcgen05.*}, (ii) synchronization costs when consuming accelerator results, and (iii) potentially \textsc{DE}-to-compute overlap constraints \cite{ARCH_BW,OPT_PIPE}. The resulting scheduling state space is larger and more structured than prior SIMT-centric mental models.
+
+\subsection{Why sequential IR lowering fails: cooperative warps, variable latency, and blocking sync}
+\paragraph{Cooperative warps vs.\ sequential IR.}
+The \SWP{}+\WS{} scheduling work explicitly argues that many modulo schedules on Hopper/\Blackwell{} cannot be realized as a single-threaded SIMT program: (1) large GEMMs require multiple warps to \emph{cooperatively} issue Tensor Core work, while common compiler infrastructures rely on sequential IRs (LLVM/PTX) that are ill-suited to cooperative-warp code generation \cite{OPT_PIPE}; (2) modulo scheduling increases working-set pressure, colliding with register limits and spill costs \cite{OPT_PIPE}. This already suggests a tension with the \Blackwell{} instruction-level narrative: even if \texttt{tcgen05.mma} is single-thread issued \cite{ARCH_BW}, the \emph{kernel-level} throughput story remains governed by cooperative execution and multi-warp orchestration \cite{OPT_PIPE}. Reconciling these views into a compiler-usable execution model remains \emph{UNVERIFIED} as a unified semantics within the golden sources.
+
+\paragraph{Variable-latency tile movement (\TMA{}) breaks static placement of synchronization.}
+\TMA{} is used as the canonical variable-latency primitive: its latency has a ``high dynamic range'' (more than an order-of-magnitude between fastest and slowest outcomes for the same transfer), making naive upper-bound costs imprecise and making synchronization placement fragile (overestimate $\rightarrow$ underutilize; underestimate $\rightarrow$ stalls) \cite{OPT_PIPE}. This matters directly for \Blackwell{} because \TMEM{} introduces additional asynchronous interfaces and synchronization points around reading/writing accelerator-visible state \cite{ARCH_BW,OPT_PIPE}.
+
+\paragraph{Blocking synchronization interrupts in-order issue.}
+A central observation is that Hopper/\Blackwell{} fixed-function units expose asynchronous interfaces where consuming results requires explicit \emph{blocking} synchronization; because GPU threads issue in-order, blocking synchronization can interrupt concurrent issue of otherwise independent operations on the same warp (illustrated by their Figure~2 example with a GEMM wait interrupting an EXP) \cite{OPT_PIPE}. On \Blackwell{}, this blocking behavior becomes more prominent because general computation on certain Tensor Core accumulators requires explicit movement out of \TMEM{} (into the register file), which the scheduling work describes as requiring blocking synchronization in practice \cite{OPT_PIPE}.
+
+\paragraph{Gap signal (codegen feasibility as a scheduling constraint).}
+This perspective reframes scheduling as a \emph{feasibility} problem: a high-level schedule must be realizable under cooperative-warp issuance, register capacity, and synchronization semantics---properties that sequential IR lowering often cannot enforce or express cleanly \cite{OPT_PIPE}. For \Blackwell{}, this interacts with \TMEM{}-resident accumulators and new instruction sequences, expanding the set of correctness- and performance-critical synchronization decisions \cite{ARCH_BW,OPT_PIPE}.
+
+\subsection{Joint \SWP{}+\WS{} as constraints: what Twill demonstrates (and what it does not)}
+\paragraph{What Twill demonstrates: \SWP{} and \WS{} are coupled.}
+The Twill work provides a concrete formulation: \SWP{} and \WS{} are treated as a unified constraint satisfaction / optimization problem solved with SMT, rather than two independent steps \cite{OPT_PIPE}. The motivation is structural: \WS{} is not a ``free'' add-on; it introduces communication/synchronization trade-offs, but it is also the mechanism that enables code generation to (i) allocate cooperative Tensor Core work across warps, (ii) spread working sets across more threads/warps to access more registers, (iii) isolate variable-latency operations onto dedicated warps, and (iv) keep progress when some warps block on synchronization \cite{OPT_PIPE}. This creates a direct link between machine properties (e.g., in-order issue, blocking sync, variable-latency TMA) and the best realizable \SWP{} schedule \cite{OPT_PIPE}.
+
+\paragraph{Blackwell-specific consequences in the Twill evidence.}
+In evaluation, the authors explicitly state that \Blackwell{} requires substantially different \SWP{}+\WS{} strategies than Hopper due to a faster Tensor Core and a larger set of required synchronization operations (Tensor Memory loads/stores) \cite{OPT_PIPE}. They give a concrete kernel-design consequence: rescaling is moved to a third warp group because reading accumulators from Tensor Memory requires blocking synchronization; placing it on the exponentials warp would disrupt the pipeline \cite{OPT_PIPE}. This is precisely the kind of schedule-dependent, \Blackwell{}-specific synchronization tax that a compiler and IR must represent.
+
+\paragraph{What Twill does not yet solve: end-to-end lowering and \TMEM{} allocation robustness.}
+Crucially, Twill is presented as deriving schedules and warp assignments from dependence graphs, but the authors report that when attempting to integrate with Triton, Triton made incorrect decisions (memory allocation, layout conversion, synchronization placement), leading to compilation failure or poor performance; thus they hand-compile Twill pipelines into CUDA C++ \cite{OPT_PIPE}. Moreover, they state Triton was unable to generate code for \Blackwell{} because it could not construct Tensor Memory allocation strategies that contain aliasing, and they report toolchain realities such as \texttt{ptxas} failing to allocate registers without significant spilling for certain schedules \cite{OPT_PIPE}. These are not just ``engineering details'': they delimit what schedules are actually usable in the current ecosystem.
+
+\paragraph{Toolchain mismatch vs.\ project constraint.}
+All Twill experiments are reported under CUDA~13.0 \cite{OPT_PIPE}, whereas the \TileIR{} backend is positioned in the CUDA~13.1 era and explicitly requires CUDA~13.1+ \cite{NV_BLOG_TILE}. Therefore, any claim that Twill-observed \Blackwell{} strategies (or compiler failure modes) persist identically under the project toolchain target (CUDA \(>13.0\)) is \emph{UNVERIFIED} from these sources alone \cite{OPT_PIPE,NV_BLOG_TILE}. (Part~III will need explicit verification steps; Part~II only flags the instability.)
+
+\subsection{Failure modes in current compiler stacks: a \Blackwell{} evidence summary}
+The combined evidence indicates that ``finding a schedule'' and ``lowering a schedule'' are inseparable on \Blackwell{}:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Memory allocation is schedule-critical.}
+  Twill’s framework includes memory-aware constraints (Figure~5) \cite{OPT_PIPE}, while the \Blackwell{} microarchitecture evidence makes \TMEM{} allocation/data movement/deallocation explicit via \texttt{tcgen} PTX instruction families \cite{ARCH_BW}. The gap is not merely ``add a new memory space''; it is to make \TMEM{} allocation \emph{schedule-aware} and robust to intentional aliasing patterns used by expert kernels \cite{OPT_PIPE}.
+  \item \textbf{Synchronization placement is a first-order performance decision.}
+  Blocking synchronization interrupts in-order issue \cite{OPT_PIPE}; \Blackwell{} adds \TMEM{}-related synchronization requirements \cite{OPT_PIPE}; and \TMEM{} requires new instruction sequences and movement pathways \cite{ARCH_BW}. The gap is to model and represent synchronization so that solvers, IRs, and lowerings can preserve overlap without violating correctness.
+  \item \textbf{Layout conversion and instruction selection are entangled with scheduling.}
+  Twill’s authors explicitly cite incorrect layout conversions and instruction/synchronization placement as reasons Triton could not be used directly \cite{OPT_PIPE}. This motivates Part~II's next two sections: tile-centric IRs and layout/verification foundations.
+\end{itemize}
+
+\section{Tile-centric compilation with CUDA \TileIR{}: preserving tile semantics (and the current limitations)}
+This section connects \Blackwell{} scheduling realities to the emerging compiler direction suggested by CUDA Tile / CUDA \TileIR{} and Triton-to-\TileIR{}.
+
+\subsection{CUDA Tile and CUDA \TileIR{} as an IR commitment}
+NVIDIA positions CUDA Tile as a CUDA programming model extension introduced in CUDA~13.1, intended to provide first-class support for tile programming and to shift developer intent from thread-level SIMT toward tile-level operations \cite{NV_BLOG_TILE}. CUDA \TileIR{} is described as an MLIR-based representation driven by a specification that defines semantics, operations, and types \cite{NV_BLOG_TILE}. This framing directly aligns with the scheduling paper's critique that sequential IRs (LLVM/PTX) are ill-equipped for cooperative warps, variable latency, and blocking synchronization: a tile-semantics-preserving IR is a plausible place to encode schedule constraints without immediately collapsing them into a sequential thread program \cite{OPT_PIPE,NV_BLOG_TILE}.
+
+\paragraph{UNVERIFIED boundary (tmemory/tcgen05 coverage).}
+The CUDA Tile IR blog post does \emph{not} establish, within the golden sources, a complete mapping from tile IR operations to \Blackwell{}'s \TMEM{} and \texttt{tcgen05.*} sequences; therefore, any claim that TileIR ``solves'' \TMEM{} lowering is \emph{UNVERIFIED} here \cite{NV_BLOG_TILE,ARCH_BW}. The reliable statement is narrower: TileIR is positioned as preserving tile intent, and it exposes a workflow and limitations that suggest where missing compiler work lies \cite{NV_BLOG_TILE}.
+
+\subsection{Triton-to-\TileIR{} workflow constraints and performance pitfalls}
+The same NVIDIA source makes two constraints explicit and research-relevant:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Prerequisites and maturity.}
+  Triton-to-\TileIR{} is described as source-build-only, requiring CUDA~13.1+ and \Blackwell{} GPUs; the backend is characterized as early-stage with incomplete operation support \cite{NV_BLOG_TILE}. This matters because it implies \emph{per-kernel backend selection} and graceful fallback will remain essential for some time \cite{NV_BLOG_TILE}.
+  \item \textbf{The tensor-of-pointer performance pitfall and the descriptor/\TMA{} mitigation.}
+  The blog explicitly reports suboptimal performance for Triton’s ``tensor-of-pointer'' pattern on CUDA~13.1 TileIR, and recommends a rewrite: instead of materializing per-element pointers inside the kernel, pass (\texttt{shape}, \texttt{strides}, \texttt{block\_shape}) into a tensor descriptor (\texttt{tl.make\_tensor\_descriptor}) and use the \TMA{} load/store API \cite{NV_BLOG_TILE}. This is an explicit interface point where layout metadata must be both \emph{available} and \emph{correct}.
+\end{itemize}
+
+\paragraph{Gap signal (automated rewrites + correctness).}
+The blog’s mitigation guidance implicitly assumes that a compiler (or programmer) can reliably determine when a tensor-of-pointer pattern is descriptor-legal and can produce correct descriptors for the intended layout \cite{NV_BLOG_TILE}. OPT\_PIPE’s evidence that incorrect layout conversions and synchronization placement derail compilation/performance suggests that any automated rewrite system must be paired with stronger layout reasoning and verification (Section~\ref{sec:part2-layouts}) \cite{OPT_PIPE,SEED_1,SEED_2}.
+
+\subsection{Case study: system locality and CTA traversal order (Sawtooth Wavefront Reordering)}
+\label{sec:part2-locality}
+The \Blackwell{}-family locality work on GB10 provides a complementary lesson: not all performance structure is intra-CTA. It studies cache behavior in an attention-like kernel and identifies a capacity-driven onset of L2 non-compulsory misses; it then proposes Sawtooth Wavefront Reordering, which alternates KV traversal direction to reduce reuse distance \cite{SEED_3}. Empirically, they report that sawtooth reduces L2 non-compulsory misses by approximately 50\% and yields throughput gains (e.g., from approximately 1.3~TFLOPS to 2.4~TFLOPS in their CUDA results) \cite{SEED_3}. They also port the optimization to CuTile and report miss-count reductions and throughput improvements in that tile-centric environment, while noting a key limitation: with tile size 128, the CuTile compiler may split tiles that do not fit in L1Tex, altering the access pattern \cite{SEED_3}.
+
+\paragraph{Implication for tile-centric IR and scheduling research.}
+This case study suggests that \emph{inter-CTA traversal order} is an optimizable schedule dimension that can survive (at least sometimes) in tile-centric programming environments like CuTile \cite{SEED_3}. However, neither Twill’s \SWP{}+\WS{} solver framing \cite{OPT_PIPE} nor the CUDA Tile IR blog discussion \cite{NV_BLOG_TILE} provides a first-class representation of CTA traversal order as a schedulable constraint in the same framework as intra-CTA pipelining; treating it as such is therefore a clear research gap motivated by evidence \cite{SEED_3,OPT_PIPE,NV_BLOG_TILE}.
+
+\section{Layouts as compiler infrastructure: linear layouts, CuTe, and formal safety}
+\label{sec:part2-layouts}
+This section argues that \Blackwell{} performance work is inseparable from layout reasoning: descriptors, tile movement, \TMEM{} placement, and schedule feasibility all depend on accurately and safely computing layout transforms.
+
+\subsection{Linear layouts for robust layout propagation and conversion}
+The linear-layouts work motivates a compiler-facing layout representation that can express legacy Triton layouts and avoid backend reimplementation burden (e.g., defining a layout once enables backend interface methods to be reused) \cite{SEED_1}. It also frames layout conversion as a major cost center: Triton is described as always routing layout conversions through shared memory with limited use of efficient hardware primitives, whereas their approach provides optimized code generation for layout conversions (Section~5.4) \cite{SEED_1}. Two constraints matter for \Blackwell{}:
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Expressiveness and compiler robustness.}
+  The work claims strong expressiveness for linear layouts (e.g., ``Every memory layout is a linear layout'' as stated in their Theorem~4.13), and positions linear layouts as a foundation for propagating layout information through shape operations and conversions \cite{SEED_1}.
+  \item \textbf{Explicit limitations.}
+  Linear layouts are described as restricted to power-of-two shapes (mitigated via masking), and some operations (flipping/slicing) are not expressible without extension (affine layouts) \cite{SEED_1}. These limitations are directly relevant to descriptor-based movement: a descriptor path must be correct on masked edges and irregular shapes, not only on ``nice'' power-of-two tiles \cite{NV_BLOG_TILE,SEED_1}.
+\end{itemize}
+
+\paragraph{Gap signal (layout metadata as an optimization contract).}
+TileIR’s descriptor/TMA guidance assumes the compiler can surface correct (\texttt{shape}, \texttt{strides}, \texttt{block\_shape}) information \cite{NV_BLOG_TILE}. Linear layouts provide a candidate mechanism for reliably carrying and transforming that metadata at the compiler level, but the direct mapping from this abstraction to \Blackwell{}-specific \TMEM{} structure and \texttt{tcgen05.*} movement constraints is not established in the golden sources (therefore \emph{UNVERIFIED} as an end-to-end pipeline) \cite{SEED_1,ARCH_BW}.
+
+\subsection{Integer set relations for unification and bounds safety}
+The integer-set-relations work formalizes CuTe layouts as mappings from an \(N\)-D coordinate space to a 1-D index space (shape/stride tuples) and defines core operations such as composition, inverse, and complement \cite{SEED_2}. Its central contribution for this proposal is a correctness argument: naive layout composition can create gaps/holes in the mapping and, if used for code generation without proper bounds checking, can lead to out-of-bounds memory accesses; the work claims integer set relations enable automatic synthesis of required predicates \cite{SEED_2}. It also reports a prototype tool (\texttt{isl-layout}) translating CuTe and linear layouts into integer set relations using ISLpy, and explicitly discusses compile-time complexity considerations \cite{SEED_2}.
+
+\paragraph{Why this matters for \Blackwell{}.}
+Three threads tie this to \Blackwell{} performance work:
+
+\begin{enumerate}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Descriptor correctness is a memory-safety obligation.}
+  The TileIR blog’s recommended rewrite moves from ``explicit pointers'' to ``descriptor parameters'' \cite{NV_BLOG_TILE}. That is effectively a \emph{semantic compression} of many per-element addresses into a few integers; the integer-set-relations framing provides a natural substrate for proving that those integers describe exactly the intended in-bounds set \cite{SEED_2}.
+  \item \textbf{Scheduling feasibility depends on layout lowering.}
+  OPT\_PIPE’s evidence that layout conversion decisions can break compilation/performance implies that schedule solvers cannot ignore layout feasibility and costs \cite{OPT_PIPE}. Formal layout reasoning offers a path to make ``legal layout conversion'' and ``descriptor legality'' explicit constraints rather than implicit assumptions \cite{SEED_2}.
+  \item \textbf{\TMEM{} introduces new layout targets.}
+  \TMEM{} is described with a concrete structural organization and distinct movement instructions \cite{ARCH_BW}. Mapping high-level layouts onto \TMEM{} (and deciding what lives in \TMEM{} vs.\ SMEM/registers) requires both correctness (no OOB) and performance reasoning (avoid pathological transforms), but the golden sources do not provide an integrated, formally checkable pipeline that spans linear layouts, CuTe operations, descriptors, and \TMEM{} \cite{ARCH_BW,SEED_1,SEED_2,NV_BLOG_TILE}.
+\end{enumerate}
+
+\subsection{Bridging to \Blackwell{} primitives: descriptors, \TMEM{} structure, and what remains open}
+Across sources, a consistent picture emerges: \Blackwell{} performance requires explicit management of where tiles live and how they move.
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Movement endpoints multiply.}
+  \TMA{} moves tiles between global and shared memory \cite{OPT_PIPE}; TileIR encourages descriptor-based movement to avoid tensor-of-pointer overhead \cite{NV_BLOG_TILE}; and \TMEM{} movement requires new \texttt{tcgen05.\{cp,ld,st\}} sequences, since traditional shared-memory movement instructions do not interface with \TMEM{} \cite{ARCH_BW}. The unified ``planner'' that jointly reasons about these endpoints is missing in the golden sources (gap only; no claim of an existing solution).
+  \item \textbf{Synchronization and aliasing are not afterthoughts.}
+  OPT\_PIPE reports that reading accumulators from Tensor Memory requires blocking synchronization and that Triton cannot currently construct \TMEM{} allocation strategies with required aliasing, preventing code generation for \Blackwell{} \cite{OPT_PIPE}. This makes \TMEM{} allocation + aliasing control a \emph{correctness and feasibility} precondition, not an optional optimization \cite{OPT_PIPE,ARCH_BW}.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{p{0.26\linewidth} p{0.34\linewidth} p{0.34\linewidth}}
+\toprule
+\textbf{Observed capability / phenomenon} &
+\textbf{Known from sources (evidence)} &
+\textbf{Open question / gap (Part~III)} \\
+\midrule
+\TMEM{} is a new on-chip tier for Tensor Core data, requiring new movement instructions &
+\TMEM{} is described as a dedicated per-SM memory with explicit software-managed allocation/movement via \texttt{tcgen05.*}; traditional movement instructions do not interface with \TMEM{} \cite{ARCH_BW} &
+How to build a \Blackwell{}-valid, CUDA \(>13.0\), PTX \(>9.0\) cost model and lowering strategy that captures \texttt{tcgen05.\{cp,ld,st\}} costs \emph{and} required sync (toolchain-sensitive; currently \emph{UNVERIFIED} at target) \cite{ARCH_BW,OPT_PIPE} \\
+\addlinespace
+Variable-latency tile movement (\TMA{}) makes static scheduling fragile &
+\TMA{} transfers have high dynamic-range latency; under/overestimation breaks utilization; synchronization placement becomes difficult \cite{OPT_PIPE} &
+How to integrate variable-latency movement into schedule synthesis and IR so that synchronization placement is both correct and performance-stable on \Blackwell{} \cite{OPT_PIPE,NV_BLOG_TILE} \\
+\addlinespace
+Blocking synchronization interrupts in-order issue and reshapes \WS{} decisions &
+Consuming accelerator results requires explicit blocking synchronization; in-order issue implies blocking sync interrupts concurrent issue on a warp (Figure~2), motivating \WS{} \cite{OPT_PIPE} &
+Which synchronization points are structurally necessary on \Blackwell{} (e.g., to consume \TMEM{} accumulators) vs.\ artifacts of current lowering, and how should IRs represent them without sequential-IR contortions? \cite{OPT_PIPE,ARCH_BW} \\
+\addlinespace
+Tile-centric IRs provide a path to preserve tile intent, but are incomplete today &
+CUDA Tile is introduced in CUDA~13.1; Triton-to-\TileIR{} targets CUDA \TileIR{} using MLIR infrastructure; limitations include unsupported ops and tensor-of-pointer performance issues; descriptor/\TMA{} APIs are recommended as mitigation \cite{NV_BLOG_TILE} &
+Can we systematically rewrite Triton kernels to descriptor-based movement (and select per-kernel backends) while preserving correctness and \Blackwell{} performance under evolving CUDA releases? \cite{NV_BLOG_TILE,OPT_PIPE} \\
+\addlinespace
+Layout reasoning is both a performance and safety requirement &
+Linear layouts provide a compiler-friendly representation and optimized layout conversion; limitations include power-of-two constraints and non-expressible ops without extension \cite{SEED_1}. Integer set relations unify CuTe and linear layouts; composition without bounds can cause OOB; predicates can be synthesized; tool support (\texttt{isl-layout}) exists \cite{SEED_2} &
+How to connect layout formalisms to practical descriptor generation and \TMEM{} placement, with formally checkable bounds and masks, at acceptable compile-time cost? \cite{SEED_1,SEED_2,NV_BLOG_TILE,ARCH_BW} \\
+\addlinespace
+Inter-CTA traversal order can materially change L2 behavior and throughput &
+Sawtooth wavefront reordering reduces L2 non-compulsory misses by \(\sim 50\%\) and improves throughput; validated in CUDA and CuTile; limitation: CuTile may split large tiles (e.g., size 128) altering access patterns \cite{SEED_3} &
+How to make traversal order a first-class schedule dimension that composes with intra-CTA \SWP{}+\WS{}, and how to reason about compilation behaviors (e.g., tile splitting) that can invalidate locality assumptions? \cite{SEED_3,OPT_PIPE,NV_BLOG_TILE} \\
+\bottomrule
+\end{tabular}
+\caption{Capabilities, evidence, and open gaps motivating the Part~III agenda (no methods detailed here).}
+\label{tab:capability-gap-map}
+\end{table}
+
+% ----------------------------------------------------------------------
+% source_audit (MANDATORY; comment-only to preserve LaTeX-only output)
+%
+% ARCH_BW:
+%   used_for: Blackwell deltas that reshape scheduling/IR: tcgen05.mma as single-thread issuance; TMEM as a dedicated per-SM tier with explicit software-managed allocation/movement; measured TMEM structure/latency/bandwidth; requirement that legacy movement instructions do not interface with TMEM; DE existence + characterization context; toolchain ecosystem note about CUDA 13.0 preliminary TMEM/CTA support and FP6 tooling gap.
+%   anchors: "III-A Blackwell Architecture" (dual-die context); "V-A Tensor Memory (TMEM)" (256KB per SM; 512 columns x 128 lanes; 420-cycle latency; 16/8 TB/s); "IV-A1 Tensor Memory (TMEM)" (traditional instructions cannot interface; tcgen05.{ld,st,cp}); "IV-A2 Decompression Engine Characterization" + Table I; "Software Ecosystem: CUDA 13.0 provides preliminary TMEM/CTA support; FP6 hardware support exists but lacks software tooling."
+%
+% OPT_PIPE:
+%   used_for: Scheduling/codegen synthesis: why sequential IRs struggle (cooperative warps; register pressure; variable-latency TMA; blocking sync + in-order issue); Twill joint SWP+WS constraint formulation; Blackwell-specific evaluation points (CUDA 13.0; faster TC; larger required sync set incl. TMEM loads/stores; blocking sync to read TMEM accumulators); concrete compiler failure modes (Triton incorrect lowering; TMEM allocation with aliasing; ptxas register allocation/spilling).
+%   anchors: "2 Background on GPU Architecture" (four execution contexts); "3.2 Code Generation Challenges" (four factors; TMA dynamic range; blocking sync interrupts issue; Figure 2); "4 Joint Optimization Problem" (SMT/constraints framing); "6.1 Evaluation Platforms" (CUDA 13.0); "6.2.2 Blackwell" (different SWP/WS; TMEM sync); "6.3.2 Blackwell" (aliasing; ptxas spilling).
+%
+% NV_BLOG_TILE:
+%   used_for: Tile-centric compiler direction: CUDA Tile introduced in CUDA 13.1; CUDA Tile IR as spec-driven MLIR IR; Triton-to-TileIR targeting TileIR (preserving tile semantics); workflow constraints (source build; prerequisites CUDA 13.1+ + Blackwell; cache artifact behavior); limitations (unsupported ops; tensor-of-pointer performance degradation) and mitigation via descriptors + TMA load/store API.
+%   anchors: Post date "Jan 30, 2026"; "What are CUDA Tile and CUDA Tile IR?" (introduced in CUDA 13.1); "How to use Triton-to-TileIR" (prereqs); "Limitations of Triton-to-TileIR" (unsupported ops; tensor-of-pointer degradation); descriptor example with (shape, strides, block_shape) via tl.make_tensor_descriptor.
+%
+% SEED_1:
+%   used_for: Layout abstraction for robust codegen: linear layouts express legacy Triton layouts and reduce backend reimplementation; optimized layout conversion codegen (Section 5.4) vs Triton's shared-memory conversions; explicit limitations (power-of-two shapes; masking; affine extension).
+%   anchors: Early motivation paragraph on defining layouts once (utilities + avoiding backend reimplementation); "Theorem 4.13 Every memory layout is a linear layout"; "5.4 Optimal Codegen for Layout Conversions"; limitation statement on power-of-two shapes + masking.
+%
+% SEED_2:
+%   used_for: Formal modeling/verification framing: CuTe layout definition + operations (composition/inverse/complement); explicit correctness hazard (OOB from naive composition without bound checking) and predicate synthesis claim; tool support via isl-layout using ISLpy; complexity discussion.
+%   anchors: "2.1 CuTe Layout" + "2.1.2 Layout Operations"; OOB hazard paragraph (codegen without proper bound checking leads to out-of-bound; predicates can be synthesized); "isl-layout" tool description; "Complexity" heading.
+%
+% SEED_3:
+%   used_for: System/cache locality case study: L2 non-compulsory miss threshold framing; Sawtooth Wavefront Reordering definition + Algorithm 4; reported CUDA results (approx. 50% miss reduction; throughput gains); validation on CuTile; limitation about tile size 128 triggering compiler splitting altering access pattern.
+%   anchors: "3.3 L2 Non-Compulsory Miss Threshold"; "4 Sawtooth Wavefront Reordering"; "Algorithm 4 Sawtooth KV Access Pattern"; "4.2 CUDA Results" (50%); "4.3 Validation on CuTile" + "4.3.2 Limitations" (tile size 128 splitting).
+% ----------------------------------------------------------------------
+
+% === END PART 2 ===

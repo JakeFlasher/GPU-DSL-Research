@@ -1,0 +1,2375 @@
+% ============================================================
+%  BUTA — Blackwell Unified Tile Algebra
+%  Part 2: Model Definition, Semantic Layers,
+%          Objective Functions, and Proof Obligations
+% ============================================================
+\documentclass[10pt,twocolumn]{article}
+
+% ---- Geometry & Typography ----
+\usepackage[margin=0.85in,columnsep=0.25in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% ---- Mathematics ----
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+
+% ---- Figures & Tables ----
+\usepackage{graphicx,booktabs,array,multirow}
+\usepackage{fancyvrb}
+\usepackage{float}
+
+% ---- Cross-references & Links ----
+\usepackage[colorlinks,citecolor=blue!70!black,
+            linkcolor=blue!60!black,urlcolor=blue!50!black]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+% ---- Misc ----
+\usepackage{xcolor}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+% ---- Theorem-like environments ----
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{invariant}[definition]{Invariant}
+\newtheorem{remark}[definition]{Remark}
+\theoremstyle{plain}
+\newtheorem{proposition}[definition]{Proposition}
+\newtheorem{obligation}[definition]{Proof Obligation}
+
+% ---- Convenience macros (matching Part 1) ----
+\newcommand{\BUTA}{\textsc{Buta}}
+\newcommand{\Ftwo}{\mathbb{F}_2}
+\newcommand{\ZZ}{\mathbb{Z}}
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\ISL}{\textsc{ISL}}
+\newcommand{\CuTe}{\textsc{CuTe}}
+\newcommand{\TileIR}{Tile\,IR}
+\newcommand{\TMEM}{\textsc{TMEM}}
+\newcommand{\SMEM}{\textsc{SMEM}}
+\newcommand{\tcgen}{\texttt{tcgen05}}
+\newcommand{\tma}{\textsc{TMA}}
+\newcommand{\II}{\mathit{II}}
+\newcommand{\reuse}{d_{\mathrm{reuse}}}
+\newcommand{\unverified}{\textsc{[unverified]}}
+\newcommand{\inference}{\textsc{[inference]}}
+
+% ---- Continue section numbering from Part 1 ----
+\setcounter{section}{3}
+
+% ---- Title ----
+\title{%
+  \BUTA{}: Blackwell Unified Tile Algebra\\[4pt]
+  \large Part~2 --- Model Definition, Semantic Layers,\\
+         Objective Functions, and Proof Obligations}
+
+\author{%
+  \textit{[Authors redacted for review]}\\
+  Target architecture: NVIDIA Blackwell (B200 cc\,10.0;
+  Grace-Blackwell GB10 cc\,12.0)\\
+  Toolchain: CUDA ${>}\,13.0$ (prefer 13.1+),
+  PTX ${>}\,9.0$ (strict)}
+
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+% ====================================================================
+%  SECTION 4 — BUTA MODEL DEFINITION
+% ====================================================================
+\section{BUTA Model Definition}
+\label{sec:model}
+
+Part~1 established that four simultaneous architectural
+shifts in Blackwell---fifth-generation tensor core
+dispatch~\cite{ARCH_BW}, memory hierarchy
+restructuring with \TMEM{}~\cite{ARCH_BW},
+tile-based programming via CUDA
+\TileIR{}~\cite{NV_BLOG_TILE}, and mixed-reuse
+workload diversity~\cite{NV_workloads}---require
+a single compositional formal model spanning layout
+algebra, pipeline scheduling, data-movement semantics,
+and analytic cache modelling.
+This section defines the seven mathematical objects
+that constitute \BUTA{} and specifies their
+compositional architecture.
+
+\subsection{Model Architecture Overview}
+\label{sec:model:arch}
+
+\begin{definition}[\BUTA{} Model Tuple]
+\label{def:buta-tuple}
+The \emph{Blackwell Unified Tile Algebra} is a
+seven-component system:
+\[
+  \BUTA{} = (\mathcal{L},\;
+             \mathcal{H},\;
+             \mathcal{S},\;
+             \mathcal{D},\;
+             \mathcal{C},\;
+             \mathcal{W},\;
+             \mathcal{P})
+\]
+where $\mathcal{L}$ is the Layout Morphism Space
+(\cref{sec:model:layout}),
+$\mathcal{H}$ is the Memory Tier Graph
+(\cref{sec:model:tier}),
+$\mathcal{S}$ is the Schedule Constraint System
+(\cref{sec:model:sched}),
+$\mathcal{D}$ is the Data Movement Relation
+(\cref{sec:model:datamov}),
+$\mathcal{C}$ is the Cache Traffic Function
+(\cref{sec:model:cache}),
+$\mathcal{W}$ is the Workload Descriptor
+(\cref{sec:model:workload}), and
+$\mathcal{P}$ is the Precision Lattice
+(\cref{sec:model:prec}).
+\end{definition}
+
+\noindent
+\Cref{fig:buta-arch} illustrates the compositional
+architecture.
+The seven objects interact through typed interfaces:
+$\mathcal{P}$ constrains valid layouts in
+$\mathcal{L}$ and determines instruction costs in
+$\mathcal{S}$;
+$\mathcal{W}$ supplies per-operator cost vectors to
+$\mathcal{S}$;
+$\mathcal{L}$ determines address-translation costs
+consumed by $\mathcal{D}$;
+$\mathcal{D}$ is defined over the edges of
+$\mathcal{H}$;
+$\mathcal{S}$ determines tile iteration ordering which
+parameterises $\mathcal{C}$;
+and $\mathcal{H}$ supplies capacity bounds to both
+$\mathcal{S}$ (resource constraints) and $\mathcal{C}$
+(L2 capacity parameter).
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++==========================================================+
+|               BUTA Compositional Architecture             |
++==========================================================+
+|                                                          |
+|  +-----------+  precision   +-----------+                |
+|  | Precision |--constrains->| Layout    |                |
+|  | Lattice   |              | Morphism  |                |
+|  |    P      |--costs----+  | Space  L  |                |
+|  +-----------+           |  +-----+-----+                |
+|                          |        |                      |
+|  +-----------+  cost     |   addr | transforms           |
+|  | Workload  |--vector---+       |                      |
+|  | Desc.  W  |-----------+       v                      |
+|  +-----------+           | +-----+-----+  token    +---------+
+|                          +>| Schedule  |--order--->| Data    |
+|                            | Constr.   |           | Move-   |
+|                            | System S  |<--laten.--| ment  D |
+|                            +-----+-----+           +----+----+
+|                                  |                      |
+|                          tile    | ordering        over |edges
+|                                  v                      v
+|                            +-----+-----+         +-----+-----+
+|                            | Cache     |         | Memory    |
+|                            | Traffic   |<--cap.--| Tier      |
+|                            | Funct. C  |         | Graph  H  |
+|                            +-----------+         +-----------+
+|                                                          |
++==========================================================+
+| Interface types:                                         |
+|   --constrains-->  subset restriction on valid morphisms |
+|   --costs-------->  numeric cost vector parameterisation |
+|   --order-------->  partial order (token DAG)            |
+|   --laten.------->  latency feedback to constraints      |
+|   --cap.--------->  capacity bound parameter             |
+|   --over edges--->  domain/codomain of relation          |
++==========================================================+
+\end{BVerbatim}
+\caption{Compositional architecture of the \BUTA{}
+  seven-object system.
+  Arrows denote typed interfaces between objects.
+  The system is parameterised by compute capability
+  $x \in \{10.0, 12.0\}$~\cite{ARCH_BW}
+  and CUDA version ${\geq}\,13.1$~\cite{NV_BLOG_TILE}.}
+\label{fig:buta-arch}
+\end{figure}
+
+
+% ------ 4.2 Layout Morphism Space ------
+\subsection{Layout Morphism Space $\mathcal{L}$}
+\label{sec:model:layout}
+
+\begin{definition}[Layout Morphism
+  Space~\cite{SEED_1,SEED_2,SEED_4}]
+\label{def:layout-space}
+The \emph{Layout Morphism Space} $\mathcal{L}$ is a
+layered category defined by the triple
+$\mathcal{L} =
+(\mathrm{Obj}_{\mathcal{L}},\;
+ \mathrm{Mor}_{\mathcal{L}},\;
+ \Lambda)$
+where:
+
+\smallskip\noindent
+\textbf{Objects.}\;
+$\mathrm{Obj}_{\mathcal{L}} =
+\{(T, \mu) : T \in \mathbf{TileShapes},\;
+\mu \in \mathrm{Tiers}(\mathcal{H})\}$.
+A tile shape $T = (n_1, \dots, n_k)$ is a tuple of
+positive naturals (an object in $\mathbf{Tuple}$ per
+\cite{SEED_4}); $\mu$ is a memory tier annotation
+drawn from $\mathcal{H}$
+(see \cref{def:tier-graph}).
+
+\smallskip\noindent
+\textbf{Morphisms.}\;
+A morphism $f : (T_1, \mu_1) \to (T_2, \mu_2)$ is a
+coordinate transformation mapping logical indices in
+$T_1$ to physical addresses in tier~$\mu_2$.
+Morphisms compose: given
+$f : (T_1, \mu_1) \to (T_2, \mu_2)$ and
+$g : (T_2, \mu_2) \to (T_3, \mu_3)$,
+$g \circ f : (T_1, \mu_1) \to (T_3, \mu_3)$.
+
+\smallskip\noindent
+\textbf{Layered representation.}\;
+$\Lambda = (\mathcal{L}^{\mathrm{Cat}},\,
+\mathcal{L}^{\ISL{}},\,
+\mathcal{L}^{\Ftwo})$
+is a triple of representation layers:
+\begin{enumerate}[label=(\roman*)]
+  \item $\mathcal{L}^{\mathrm{Cat}}$:
+    morphisms expressed as $\mathbf{Nest}$/$\mathbf{Tuple}$
+    categorical maps~\cite{SEED_4}.
+    Supports composition~($\circ$), logical
+    product~($\otimes$), and logical
+    division~($/$).
+  \item $\mathcal{L}^{\ISL{}}$:
+    morphisms expressed as \ISL{} quasi-affine integer
+    set relations $R : \ZZ^m \to \ZZ^n$~\cite{SEED_2}.
+    Subsumes $\mathcal{L}^{\mathrm{Cat}}$ for all
+    representable layouts and extends to non-linear
+    swizzle patterns via bit-level ISL
+    operations~\cite{SEED_2}.
+  \item $\mathcal{L}^{\Ftwo}$:
+    morphisms expressed as binary matrices
+    $L \in \Ftwo^{m \times n}$~\cite{SEED_1}.
+    Restricted to \emph{linear} layouts; composition
+    is matrix multiplication over~$\Ftwo$ with cost
+    $O(mn)$.
+\end{enumerate}
+\end{definition}
+
+\noindent
+The three layers relate via embedding maps
+$\phi$ and functor~$F$ (see \cref{sec:layout-sem}),
+which are formal proof obligations for \BUTA{}
+(gaps~G1, G2).
+
+
+% ------ 4.3 Memory Tier Graph ------
+\subsection{Memory Tier Graph $\mathcal{H}$}
+\label{sec:model:tier}
+
+\begin{definition}[Memory Tier
+  Graph~\cite{ARCH_BW,NV_BLOG_TILE}]
+\label{def:tier-graph}
+The \emph{Memory Tier Graph} is a capacity-labelled
+directed multigraph
+$\mathcal{H} =
+(N,\, E,\, \mathrm{cap},\, \mathrm{lat},\,
+ \mathrm{bw},\, \mathrm{dtype})$
+parameterised by compute capability
+$x \in \{10.0, 12.0\}$:
+
+\smallskip\noindent
+\textbf{Nodes.}\;
+$N = \{\textsc{RF},\, \TMEM{},\, \SMEM{},\,
+\textsc{L1},\, \textsc{L2},\, \textsc{HBM}\}$.
+
+\smallskip\noindent
+\textbf{Edges.}\;
+$E \subseteq N \times N \times
+\{\texttt{tma},\, \tcgen{}\texttt{.ld},\,
+\tcgen{}\texttt{.st},\, \tcgen{}\texttt{.cp},\,
+\texttt{ld},\, \texttt{st},\, \texttt{mma\_acc}\}$.
+Each edge carries a \emph{descriptor type}
+$\mathrm{dtype}(e) \in
+\{\texttt{idesc}, \texttt{sdesc}, \texttt{none}\}$
+following the \tma{} API~\cite{NV_BLOG_TILE}.
+
+\smallskip\noindent
+\textbf{Label functions.}\;
+\begin{align}
+  \mathrm{cap} &: N \to \RR_{\geq 0}
+    &&\text{(capacity in KB)} \notag\\
+  \mathrm{lat} &: E \to \RR_{> 0}
+    &&\text{(latency in cycles)} \notag\\
+  \mathrm{bw}  &: E \to \RR_{> 0}
+    &&\text{(bandwidth in TB/s)} \notag
+\end{align}
+Capacity is parameterised by~$x$:
+$\mathrm{cap}(\SMEM{}, 10.0) = 228$\,KB,
+$\mathrm{cap}(\SMEM{}, 12.0) = 128$\,KB,
+$\mathrm{cap}(\TMEM{}) = 256$\,KB (both),
+$\mathrm{cap}(\textsc{L2}) \approx 65$\,MB
+(unified)~\cite{ARCH_BW}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++========================================================+
+|   Memory Tier Graph  H   (B200 cc 10.0 / GB10 cc 12.0)|
++========================================================+
+|                                                        |
+|  +--------+ tcgen05.cp  +--------+                     |
+|  |   RF   |<------------|  TMEM  |                     |
+|  | 256 KB |             | 256 KB |                     |
+|  +---+----+             +---+----+                     |
+|      |                  ^   |                          |
+|      |         mma_acc  |   | tcgen05.ld               |
+|      |      (TC writes) |   v                          |
+|      |            +-----+-------+                      |
+|      | explicit   | Tensor Core |                      |
+|      | ld/st      |  (tcgen05)  |                      |
+|      |            +-----+-------+                      |
+|      |                  ^                              |
+|      |          A,B     | operands                     |
+|      v                  |                              |
+|  +--------+  TMA bulk   +--------+   TMA bulk         |
+|  | L1/Tex |<------------|  SMEM  |<------+             |
+|  |        |  coherent   |228/128 |       |             |
+|  +---+----+             +--------+       |             |
+|      |                                   |             |
+|      v                                   |             |
+|  +--------+                          +---+----+        |
+|  |   L2   |                          |  HBM   |        |
+|  | ~65 MB |<------- cache fill ------|192 GB  |        |
+|  | unified|-------> eviction ------->|8 TB/s  |        |
+|  +--------+                          +--------+        |
+|                                                        |
+|  Edge notation:                                        |
+|    ----->  = data movement (labeled by operation type) |
+|    TMEM is ASYMMETRIC:                                 |
+|      TC writes accumulator directly to TMEM            |
+|      tcgen05.cp required for TMEM -> RF transfer       |
+|      tcgen05.ld/st for explicit TMEM access            |
++========================================================+
+\end{BVerbatim}
+\caption{Memory Tier Graph $\mathcal{H}$ for
+  Blackwell, parameterised from~\cite{ARCH_BW}.
+  \TMEM{} is asymmetric: the tensor core writes
+  accumulators directly; explicit
+  $\tcgen{}\texttt{.cp}$ transfers data to RF for
+  epilogue.
+  \tma{} provides bulk asynchronous movement via typed
+  descriptors~\cite{NV_BLOG_TILE}.
+  \SMEM{} capacity depends on compute capability:
+  228\,KB (cc\,10.0) vs.\ 128\,KB
+  (cc\,12.0)~\cite{ARCH_BW}.}
+\label{fig:tier-graph}
+\end{figure}
+
+\begin{remark}
+\TMEM{} read bandwidth of ${\approx}16$\,TB/s per SM
+and write bandwidth of ${\approx}8$\,TB/s per SM are
+attributed to secondary analysis \unverified{}; these
+values enter $\mathrm{bw}$ labels pending independent
+calibration (Part~3)~\cite{ARCH_BW}.
+\end{remark}
+
+
+% ------ 4.4 Schedule Constraint System ------
+\subsection{Schedule Constraint System $\mathcal{S}$}
+\label{sec:model:sched}
+
+\begin{definition}[Schedule Constraint
+  System~\cite{OPT_PIPE,ARCH_BW,NV_BLOG_TILE}]
+\label{def:sched-sys}
+The \emph{Schedule Constraint System} is a
+parameterised constraint-optimisation problem
+$\mathcal{S} =
+(G,\, \mathbf{X},\, \Phi,\, f_{\mathrm{obj}},\,
+ \mathbf{c})$
+where:
+
+\smallskip\noindent
+\textbf{Dependence graph.}\;
+$G = (V, E)$ with $V$ the set of tile-level operations
+(MMA, \tma{} load/store, \tcgen{}\texttt{.cp}, ALU)
+and $E$ directed dependency edges each carrying latency
+$d(u,v)$ and distance $\delta(u,v)$~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+\textbf{Variables.}\;
+$\mathbf{X} =
+\{\mathrm{op}[v,i,t],\; W(v),\; \II\}$
+where $\mathrm{op}[v,i,t] \in \{0,1\}$ encodes
+whether operation~$v$ from iteration~$i$ is scheduled
+at time~$t$;
+$W : V \to \{0,\dots,N_W{-}1\}$ assigns warps;
+$\II \in \NN^+$ is the initiation
+interval~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+\textbf{Constraint set.}\;
+$\Phi = \Phi_{\mathrm{dep}} \wedge
+\Phi_{\mathrm{res}} \wedge
+\Phi_{\mathrm{fu}} \wedge
+\Phi_{\mathrm{2cta}}$ (see~\cref{sec:sched-sem}
+for full specification).
+
+\smallskip\noindent
+\textbf{Objective.}\;
+$f_{\mathrm{obj}} = \min\, \II$
+subject to $\Phi$~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+\textbf{Cost vector.}\;
+$\mathbf{c} : V \times \mathcal{P} \times
+\mathbf{TileShapes} \to \RR_{>0}$
+maps each operation type, precision, and tile shape
+to a latency cost, parameterised by Blackwell
+microbenchmark data~\cite{ARCH_BW}.
+Cost normalisation as a Zero-One Linear Program (ZLP)
+renders ratios tractable for the
+solver~\cite{OPT_PIPE}.
+\end{definition}
+
+
+% ------ 4.5 Data Movement Relation ------
+\subsection{Data Movement Relation $\mathcal{D}$}
+\label{sec:model:datamov}
+
+\begin{definition}[Data Movement
+  Relation~\cite{NV_BLOG_TILE,ARCH_BW}]
+\label{def:datamov-rel}
+The \emph{Data Movement Relation} is a set of typed
+data-flow operations over $\mathcal{H}$:
+\[
+  \mathcal{D} \subseteq
+  N \times N \times \mathrm{Desc} \times
+  \mathrm{Token}^{*} \times \mathrm{Token}^{*}
+\]
+where each element
+$\delta = (\mu_s,\, \mu_d,\, \mathrm{desc},\,
+\bar{\tau}_{\mathrm{in}},\, \bar{\tau}_{\mathrm{out}})$
+represents a data transfer from source tier~$\mu_s$ to
+destination tier~$\mu_d$ via descriptor type
+$\mathrm{desc} \in
+\{\texttt{idesc}, \texttt{sdesc}, \texttt{none}\}$,
+consuming input token sequence
+$\bar{\tau}_{\mathrm{in}}$ and producing output token
+sequence $\bar{\tau}_{\mathrm{out}}$~\cite{NV_BLOG_TILE}.
+
+The induced \emph{token dependency DAG}
+$\mathcal{T} = (\mathrm{Ops},\, \mathrm{TokenEdges})$
+has an edge $(u, v)$ whenever some output token of~$u$
+is consumed as an input token of~$v$.
+The \emph{waits-for} relation is the transitive
+closure of $\mathrm{TokenEdges}$~\cite{NV_BLOG_TILE}.
+\end{definition}
+
+
+% ------ 4.6 Cache Traffic Function ------
+\subsection{Cache Traffic Function $\mathcal{C}$}
+\label{sec:model:cache}
+
+\begin{definition}[Cache Traffic
+  Function~\cite{SEED_3,ARCH_BW}]
+\label{def:cache-func}
+The \emph{Cache Traffic Function} is a map
+\[
+  \mathcal{C} :
+  \mathrm{Perm}(\mathrm{Tiles}) \times \NN \times
+  \RR_{>0} \;\longrightarrow\; \NN
+\]
+defined by
+$\mathcal{C}(\sigma, N_{\mathrm{SM}}, C_{\mathrm{L2}})
+= \sum_{a \in \mathrm{sectors}}
+\mathbf{1}[\reuse(a, \sigma) >
+C_{\mathrm{L2}} / s]$,
+where $\sigma$ is a tile iteration permutation,
+$N_{\mathrm{SM}}$ is the active SM count,
+$C_{\mathrm{L2}} \approx 65$\,MB is the L2 cache
+capacity~\cite{ARCH_BW},
+$s = 32$\,bytes is the sector size, and
+$\reuse(a, \sigma)$ is the reuse distance of cache
+line~$a$ under ordering~$\sigma$~\cite{SEED_3}.
+For streaming tile patterns, L1 is
+negligible~\cite{SEED_3}; L2 is the dominant cache
+tier.
+\end{definition}
+
+\begin{remark}[\inference{}]
+The cache traffic function carries a $(\min, +)$
+tropical semiring structure:
+the additive operation sums per-tile-block miss
+counts (total misses decompose over independent
+sub-programs), and the multiplicative operation
+selects the ordering~$\sigma^{*}$ that minimises
+total misses.
+This semiring structure is inferred from the
+composition of miss-count aggregation (additive,
+\cite{SEED_3}) with reuse-distance minimisation
+(order-dependent, \cite{SEED_3}); it is not
+established in the golden sources.
+\end{remark}
+
+
+% ------ 4.7 Workload Descriptor ------
+\subsection{Workload Descriptor $\mathcal{W}$}
+\label{sec:model:workload}
+
+\begin{definition}[Workload
+  Descriptor~\cite{NV_workloads,ARCH_BW}]
+\label{def:workload}
+A \emph{Workload Descriptor} is a labelled set of
+tile-level operators:
+\[
+  \mathcal{W} =
+  \bigl\{(\mathrm{op}_i,\;
+         \mathrm{AI}_i,\;
+         r_i,\;
+         p_i)
+  : i \in [n]\bigr\}
+\]
+where $\mathrm{op}_i$ is the operation type
+(MMA, TMA, ALU, etc.),
+$\mathrm{AI}_i \in \RR_{>0}$ is the arithmetic
+intensity (FLOP/byte),
+$r_i \in \{\texttt{streaming},\, \texttt{reuse},\,
+\texttt{mixed}\}$ is the reuse class,
+and $p_i \in \mathcal{P}$ is the operating
+precision.
+The two-axis HARP taxonomy~\cite{NV_workloads}
+classifies the overall workload along
+\emph{depth of compute} (leaf-only vs.\ hierarchical)
+and \emph{location of heterogeneity}
+(homogeneous, intra-node, cross-node, cross-depth,
+compound).
+Per-operator arithmetic intensity is determined by
+precision-dependent throughput
+from~\cite{ARCH_BW}.
+\end{definition}
+
+
+% ------ 4.8 Precision Lattice ------
+\subsection{Precision Lattice $\mathcal{P}$}
+\label{sec:model:prec}
+
+\begin{definition}[Precision
+  Lattice~\cite{ARCH_BW,NV_BLOG_TILE}]
+\label{def:prec-lattice-full}
+The \emph{Precision Lattice} is a triple
+$\mathcal{P} = (P,\, \leq_b,\, \sigma)$ where:
+
+\smallskip\noindent
+$P = \{\texttt{FP64},\, \texttt{TF32},\,
+\texttt{BF16},\, \texttt{FP16},\, \texttt{FP8},\,
+\texttt{FP6},\, \texttt{FP4},\,
+\texttt{INT8}\}$~\cite{ARCH_BW}.
+
+\smallskip\noindent
+$\leq_b$ is a partial order by bit-width refinement:
+$p_1 \leq_b p_2$ iff $\mathrm{bits}(p_1)
+\leq \mathrm{bits}(p_2)$.
+
+\smallskip\noindent
+$\sigma : P \to
+\{\textsc{DMMA},\, \textsc{HMMA},\,
+\textsc{QMMA},\, \textsc{OMMA},\,
+\textsc{IMMA}\}$
+maps each precision to its SASS instruction
+class~\cite{ARCH_BW}.
+\TileIR{} types include precision-specific
+encodings (\texttt{fp8e4m3fn},
+\texttt{fp8e5m2}, \texttt{tf32},
+etc.)~\cite{NV_BLOG_TILE}.
+
+\smallskip\noindent
+Throughput scales up to $177\times$ from FP64 to FP4;
+FP32 accumulation halves throughput relative to FP16
+accumulation~\cite{ARCH_BW}.
+FP4 and FP6 are new to Blackwell with no Hopper
+datapaths~\cite{ARCH_BW}.
+\end{definition}
+
+
+% ------ 4.9 Compositional Interface Constraints ------
+\subsection{Compositional Interface Constraints}
+\label{sec:model:compose}
+
+The seven objects interact via \emph{interface
+constraints} that ensure compositional consistency.
+We enumerate the principal interfaces that govern how
+optimisation in one layer constrains or parameterises
+another.
+
+\begin{definition}[Interface
+  Constraint Set $\Psi$]
+\label{def:interface}
+The \emph{interface constraint set} is the conjunction:
+\begin{align}
+  \Psi \;=\;\;
+    &\Psi_{\mathcal{P} \to \mathcal{L}}
+    \;\wedge\;
+    \Psi_{\mathcal{P} \to \mathcal{S}}
+    \;\wedge\;
+    \Psi_{\mathcal{W} \to \mathcal{S}}
+    \;\wedge\;
+    \Psi_{\mathcal{L} \to \mathcal{D}} \notag\\
+    \wedge\;\;
+    &\Psi_{\mathcal{H} \to \mathcal{D}}
+    \;\wedge\;
+    \Psi_{\mathcal{H} \to \mathcal{S}}
+    \;\wedge\;
+    \Psi_{\mathcal{H} \to \mathcal{C}}
+    \;\wedge\;
+    \Psi_{\mathcal{S} \to \mathcal{C}} \notag\\
+    \wedge\;\;
+    &\Psi_{\mathcal{D} \to \mathcal{S}}
+    \label{eq:interface}
+\end{align}
+where each $\Psi_{A \to B}$ denotes a set of
+constraints that the output of object~$A$ imposes on
+object~$B$.
+Specifically:
+\begin{enumerate}[label=(\roman*)]
+  \item $\Psi_{\mathcal{P} \to \mathcal{L}}$:
+    precision~$p$ constrains valid tile shapes
+    and layout bit-widths in
+    $\mathcal{L}$~\cite{ARCH_BW, SEED_1}.
+  \item $\Psi_{\mathcal{P} \to \mathcal{S}}$:
+    precision determines \tcgen{}\texttt{.mma}
+    instruction class and throughput in
+    $\mathbf{c}$~\cite{ARCH_BW}.
+  \item $\Psi_{\mathcal{W} \to \mathcal{S}}$:
+    per-operator AI and reuse class condition the
+    cost vector for the
+    solver~\cite{NV_workloads, OPT_PIPE}.
+  \item $\Psi_{\mathcal{L} \to \mathcal{D}}$:
+    layout morphisms determine addressing for
+    each \tma{} descriptor
+    operation~\cite{SEED_2, NV_BLOG_TILE}.
+  \item $\Psi_{\mathcal{H} \to \mathcal{D}}$:
+    $\mathcal{D}$ operates over edges
+    of~$\mathcal{H}$;
+    edge bandwidth/latency labels constrain
+    achievable throughput~\cite{ARCH_BW}.
+  \item $\Psi_{\mathcal{H} \to \mathcal{S}}$:
+    memory tier capacities impose resource
+    bounds in $\Phi_{\mathrm{res}}$
+    (e.g., live tiles in \SMEM{}
+    $\leq C_{\SMEM{}}(x)$)~\cite{ARCH_BW}.
+  \item $\Psi_{\mathcal{H} \to \mathcal{C}}$:
+    $C_{\mathrm{L2}}$ parameterises the miss
+    prediction threshold~\cite{ARCH_BW, SEED_3}.
+  \item $\Psi_{\mathcal{S} \to \mathcal{C}}$:
+    the schedule determines tile iteration
+    ordering~$\sigma$, which is the primary input
+    to $\mathcal{C}$~\cite{SEED_3}.
+  \item $\Psi_{\mathcal{D} \to \mathcal{S}}$:
+    token-ordered data movement latencies feed
+    back as dependency edge weights in~$G$%
+    ~\cite{OPT_PIPE, NV_BLOG_TILE}.
+\end{enumerate}
+\end{definition}
+
+
+% ====================================================================
+%  SECTION 5 — LAYOUT SEMANTICS LAYER
+% ====================================================================
+\section{Layout Semantics Layer}
+\label{sec:layout-sem}
+
+This section formalises the three-level representation
+hierarchy within $\mathcal{L}$, defines the embedding
+maps between levels, and states the layout invariants
+that \BUTA{} must preserve.
+
+\subsection{Three-Level Hierarchy and Embedding Maps}
+\label{sec:layout-sem:hierarchy}
+
+The three representation layers of $\mathcal{L}$ are
+ordered by generality (ascending) and computational
+efficiency (descending).
+We define the embedding maps that connect them.
+
+\begin{definition}[$\Ftwo$-to-\ISL{}
+  Embedding $\phi$~\inference{}]
+\label{def:phi-embed}
+The map
+$\phi : \Ftwo^{m \times n} \to
+\mathrm{ISL\text{-}Rel}(\ZZ^n, \ZZ^m)$
+is defined by
+\[
+  \phi(L) \;=\;
+  \bigl\{
+    [b_0, \dots, b_{n-1}] \to
+    \bigl[\textstyle\sum_{j} L_{0j}\, b_j
+      \!\!\mod 2,\;
+    \dots,\;
+    \textstyle\sum_{j} L_{(m-1)j}\, b_j
+      \!\!\mod 2
+    \bigr]
+  \bigr\}
+\]
+with domain restricted to
+$b_j \in \{0, 1\}$~\cite{SEED_1, SEED_2}.
+\end{definition}
+
+\begin{obligation}[$\phi$ Correctness (Gap~G1)]
+\label{po:phi}
+Prove:
+(a)~$\phi$ is \emph{injective}:
+distinct $\Ftwo$ matrices yield distinct \ISL{}
+relations on the binary domain;
+(b)~$\phi$ \emph{preserves composition}:
+$\phi(L_2 \cdot L_1) =
+\phi(L_2) \circ_{\ISL{}} \phi(L_1)$
+for all composable pairs~\cite{SEED_1, SEED_2}.
+Planned technique: constructive proof via \ISL{}
+relation composition semantics; automated verification
+on small layout instances using \ISL{} library.
+\end{obligation}
+
+\begin{definition}[Categorical-to-\ISL{}
+  Functor $F$~\inference{}]
+\label{def:F-functor}
+The functor $F : \mathbf{Nest} \to
+\mathrm{ISL\text{-}Rel}$ is defined:
+
+\smallskip\noindent
+\emph{On objects:}\;
+$F\bigl((n_1,\dots,n_k)\bigr) =
+\{[x_1,\dots,x_k] : 0 \leq x_i < n_i\}$.
+
+\smallskip\noindent
+\emph{On morphisms:}\;
+each $\mathbf{Nest}$ morphism~$f$ defining a
+coordinate transformation is mapped to its \ISL{}
+relation representation via Algorithm~1
+of~\cite{SEED_2}, which converts
+$(\mathrm{shape}, \mathrm{stride})$ pairs to
+quasi-affine \ISL{} relations.
+\end{definition}
+
+\begin{obligation}[$F$ Compatibility (Gap~G2)]
+\label{po:F}
+Prove:
+(a)~$F$ \emph{preserves composition}:
+$F(g \circ f) =
+F(g) \circ_{\ISL{}} F(f)$;
+(b)~$F$ preserves \emph{logical product}:
+$F(f \otimes g) =
+F(f) \times_{\ISL{}} F(g)$;
+(c)~$F$ preserves \emph{logical division}:
+$F(f / g) = F(f) /_{\ISL{}} F(g)$;
+(d)~the image of~$F$ \emph{coincides} with the set of
+tractable layouts characterised
+in~\cite{SEED_4}~\cite{SEED_2, SEED_4}.
+Planned technique: category-theoretic proof with
+Python implementation extending the SEED\_4
+codebase~\cite{SEED_4} to emit \ISL{} relations;
+cross-validation with Algorithm~1
+of~\cite{SEED_2}.
+\end{obligation}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Layout Semantics: Commutative Diagram of Embeddings      |
++===========================================================+
+|                                                           |
+|                     Nest                                  |
+|                    /    \                                  |
+|             morph /      \ morph                          |
+|                  v        v                               |
+|       (T1,mu1) ----f----> (T2,mu2)                       |
+|                                                           |
+|       Functor F [PO-2, gap G2]                            |
+|          |                                                |
+|          v                                                |
+|                    ISL-Rel                                 |
+|                   /       \                               |
+|          R_f     /         \  R_g                          |
+|                 v           v                             |
+|       ISL(T1) ----R_f----> ISL(T2)                        |
+|                                                           |
+|       Embedding phi [PO-1, gap G1]                        |
+|          ^                                                |
+|          |                                                |
+|                     F_2                                    |
+|                   /      \                                |
+|             L1   /        \  L2                            |
+|                 v          v                              |
+|       F2^n ----L2*L1^-1--> F2^m                           |
+|                                                           |
+|  Required: F and phi make the diagram COMMUTE             |
+|    phi(L2 * L1) = phi(L2) o phi(L1)      [PO-1(b)]       |
+|    F(g o f)     = F(g) o F(f)            [PO-2(a)]       |
+|    phi(L) in Image(F) for linear L       [PO-2(d)]       |
++===========================================================+
+\end{BVerbatim}
+\caption{Commutative diagram for layout semantics.
+  The categorical layer
+  ($\mathbf{Nest}$~\cite{SEED_4}) maps via functor~$F$
+  to the \ISL{} analytical
+  layer~\cite{SEED_2}; the $\Ftwo$ efficient
+  layer~\cite{SEED_1} embeds via~$\phi$.
+  Commutativity is a proof obligation for
+  \BUTA{}.}
+\label{fig:layout-commute}
+\end{figure}
+
+\subsection{Layout Invariants}
+\label{sec:layout-sem:inv}
+
+\begin{invariant}[INV-L1: Bijectivity]
+\label{inv:L1}
+Every layout morphism
+$f \in \mathrm{Mor}_{\mathcal{L}}$ is
+\emph{injective} on its defined domain:
+for all $\mathbf{c}_1 \neq \mathbf{c}_2 \in
+\mathrm{dom}(f)$,
+$f(\mathbf{c}_1) \neq f(\mathbf{c}_2)$.
+This ensures that distinct logical coordinates map to
+distinct physical addresses, preventing data
+corruption~\cite{SEED_1, SEED_4}.
+\end{invariant}
+
+\begin{invariant}[INV-L2: Composition Correctness]
+\label{inv:L2}
+For any two representation levels
+$\ell_1, \ell_2 \in
+\{\mathrm{Cat}, \ISL{}, \Ftwo\}$
+and composable morphisms $f, g$ representable at both
+levels, the composition at~$\ell_1$ agrees with the
+composition at~$\ell_2$ after applying the appropriate
+embedding.
+Concretely, for $\Ftwo$ and \ISL{}:
+\[
+  \phi(L_g \cdot L_f) \;=\;
+  \phi(L_g) \circ_{\ISL{}} \phi(L_f)
+\]
+and for $\mathbf{Nest}$ and \ISL{}:
+\[
+  F(g \circ f) \;=\;
+  F(g) \circ_{\ISL{}} F(f)
+\]
+where $L_f, L_g$ are the $\Ftwo$ matrices of $f, g$
+respectively~\cite{SEED_1, SEED_2, SEED_4}.
+\end{invariant}
+
+\begin{invariant}[INV-L3: Swizzle Well-Formedness]
+\label{inv:L3}
+Every bit-level swizzle operation modelled as an \ISL{}
+integer set operation~\cite{SEED_2} produces a
+\emph{valid permutation} on memory offsets within the
+target tier.
+That is, for swizzle relation
+$S_w : \ZZ^n \to \ZZ^n$,
+$S_w$ is bijective on
+$\{0, \dots, |\mathrm{tier}| - 1\}$.
+Non-linear swizzles lie outside $\mathcal{L}^{\Ftwo}$
+and require $\mathcal{L}^{\ISL{}}$
+representation~\cite{SEED_1, SEED_2}.
+\end{invariant}
+
+\begin{invariant}[INV-L4: Linear Fragment Closure]
+\label{inv:L4}
+The sub-category $\mathcal{L}^{\Ftwo}$ is
+\emph{closed} under composition and layout-to-layout
+conversion:
+if $L_1, L_2 \in \Ftwo^{m \times n}$ are linear
+layouts, then $L_2 \cdot L_1^{-1}$
+(or pseudoinverse) is again a linear
+layout~\cite{SEED_1}.
+This guarantees that the efficient $\Ftwo$
+computational path remains available throughout a
+chain of linear layout transformations.
+\end{invariant}
+
+
+% ====================================================================
+%  SECTION 6 — DATA MOVEMENT SEMANTICS LAYER
+% ====================================================================
+\section{Data Movement Semantics Layer}
+\label{sec:datamov-sem}
+
+The data movement layer governs how tile data flows
+between memory tiers in $\mathcal{H}$, with correctness
+enforced by the \TileIR{} token ordering
+model~\cite{NV_BLOG_TILE} and capacity constraints
+from Blackwell hardware parameters~\cite{ARCH_BW}.
+
+\subsection{\tma{} Descriptor Relations over
+            $\mathcal{H}$}
+\label{sec:datamov-sem:tma}
+
+\begin{definition}[\tma{} Operation Typing]
+\label{def:tma-typing}
+Each \tma{} bulk data-movement operation in
+$\mathcal{D}$ is typed by a tuple:
+\[
+  \delta_{\tma{}} =
+  (\mu_s,\, \mu_d,\, \mathrm{desc},\,
+   \bar{\tau}_{\mathrm{in}},\,
+   \bar{\tau}_{\mathrm{out}},\,
+   \ell)
+\]
+where $(\mu_s, \mu_d) \in E(\mathcal{H})$ is an edge
+of the tier graph,
+$\mathrm{desc} \in \{\texttt{idesc}, \texttt{sdesc}\}$
+is the descriptor type~\cite{NV_BLOG_TILE},
+$\bar{\tau}_{\mathrm{in}}, \bar{\tau}_{\mathrm{out}}$
+are token sequences, and $\ell \in
+\mathrm{Mor}_{\mathcal{L}}$ is the layout morphism
+governing address translation for the transfer.
+\tma{} descriptors are \emph{strictly preferred} over
+tensor-of-pointer access patterns, which exhibit poor
+performance on
+Blackwell~\cite{NV_BLOG_TILE}.
+\end{definition}
+
+\begin{definition}[\TMEM{} Operations]
+\label{def:tmem-ops}
+\TMEM{}-specific data movement uses three
+\tcgen{}-family operations~\cite{ARCH_BW}:
+\begin{enumerate}[label=(\alph*)]
+  \item $\tcgen{}\texttt{.ld}$:
+    explicit read from \TMEM{} to register file.
+  \item $\tcgen{}\texttt{.st}$:
+    explicit write from register file to \TMEM{}.
+  \item $\tcgen{}\texttt{.cp}$:
+    copy from \TMEM{} to RF, required for
+    epilogue after MMA writes accumulators directly
+    to \TMEM{}.
+\end{enumerate}
+In addition, the tensor core writes accumulators
+directly to \TMEM{} via
+$\texttt{mma\_acc}$ edges, with no explicit
+instruction---the \tcgen{}\texttt{.mma} output
+operand~$D$ resides in \TMEM{}~\cite{ARCH_BW}.
+\TMEM{} is organised as
+$512 \times 128 \times 32$\,bits
+(columns $\times$ lanes $\times$ bit-width)
+with reported hit rates of 61--82\% in multi-stage
+tensor pipelines~\cite{ARCH_BW}.
+\end{definition}
+
+
+\subsection{\TMEM{} Lifecycle State Machine}
+\label{sec:datamov-sem:lifecycle}
+
+\begin{definition}[\TMEM{} Lifecycle~\cite{ARCH_BW}]
+\label{def:tmem-lifecycle}
+The \TMEM{} lifecycle for a given allocation region is
+modelled as a finite-state machine
+$\mathcal{F}_{\TMEM{}} =
+(Q,\, q_0,\, \Sigma,\, \delta_F)$
+with states, initial state, input alphabet, and
+transition function:
+\begin{align}
+  Q &= \{\textsc{Free},\, \textsc{Alloc},\,
+         \textsc{Compute},\,
+         \textsc{Ready},\,
+         \textsc{Consumed}\} \notag\\
+  q_0 &= \textsc{Free} \notag\\
+  \Sigma &= \{\texttt{alloc},\, \texttt{mma},\,
+              \texttt{mma\_done},\, \texttt{cp},\,
+              \texttt{dealloc},\,
+              \texttt{relinquish}\} \notag
+\end{align}
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  TMEM Lifecycle State Machine  F_TMEM                     |
++===========================================================+
+|                                                           |
+|         tcgen05.alloc                                     |
+|  +------+------------>+---------+                         |
+|  | FREE |             |ALLOCATED|                         |
+|  +--^---+             +----+----+                         |
+|     |                      |                              |
+|     |             tcgen05.mma (TC writes D -> TMEM)       |
+|     |                      |                              |
+|     |                      v                              |
+|     |                 +---------+                         |
+|     |  tcgen05.       |COMPUTING|  MMA in progress;       |
+|     |  dealloc        |         |  TMEM region locked     |
+|     |                 +----+----+                         |
+|     |                      |                              |
+|     |              mma_done (accumulator written)         |
+|     |                      |                              |
+|     |                      v                              |
+|     |                 +---------+                         |
+|     +<----------------|  READY  |  Accumulator readable;  |
+|     |  dealloc        |         |  tcgen05.cp available   |
+|     |                 +----+----+                         |
+|     |                      |                              |
+|     |              tcgen05.cp (TMEM -> RF)                |
+|     |                      |                              |
+|     |                      v                              |
+|     |                 +---------+                         |
+|     +<----------------| CONSUMED|  Data in RF;            |
+|        dealloc /      |         |  TMEM may be freed      |
+|        relinquish     +---------+                         |
+|                                                           |
+|  Constraint: sum of live TMEM columns <= 512 per SM       |
+|  MMA.2SM: CTA pair shares TMEM region across TPC          |
++===========================================================+
+\end{BVerbatim}
+\caption{\TMEM{} lifecycle state machine.
+  Transitions are triggered by \tcgen{}-family
+  operations~\cite{ARCH_BW}.
+  The \textsc{Computing} state locks the \TMEM{} region
+  until the MMA completes.
+  The \texttt{relinquish\_alloc\_permit} operation
+  releases the allocation lock for CTA
+  queuing~\cite{ARCH_BW}.
+  \TMEM{} allocation details beyond this model are
+  partially documented \unverified{} (gap~G3).}
+\label{fig:tmem-lifecycle}
+\end{figure}
+
+
+\subsection{Token Ordering and Correctness}
+\label{sec:datamov-sem:tokens}
+
+\begin{definition}[Token Partial
+  Order~\cite{NV_BLOG_TILE}]
+\label{def:token-po}
+The \TileIR{} memory model partitions operations into
+\emph{program-ordered} (sequenced by textual position)
+and \emph{token-ordered} (sequenced by token
+dependencies)~\cite{NV_BLOG_TILE}.
+Define the \emph{token partial order}
+$\preceq_{\mathcal{T}}$ on the operation set
+$\mathrm{Ops}$ as the reflexive transitive closure of
+$\mathrm{TokenEdges}$ in $\mathcal{T}$:
+\[
+  u \preceq_{\mathcal{T}} v
+  \;\iff\;
+  \exists\, \text{path } u \to \cdots \to v
+  \text{ in } \mathcal{T}\,.
+\]
+The \emph{happens-before} relation
+$u \xrightarrow{\mathrm{hb}} v$ is established by
+release/acquire pairs on the same memory
+location~\cite{NV_BLOG_TILE}.
+\end{definition}
+
+\begin{definition}[Data-Race
+  Freedom~\cite{NV_BLOG_TILE}]
+\label{def:drf}
+A tile block is \emph{data-race free} iff for every
+pair of operations $(a, b)$ such that
+$a$ and $b$ access the same memory location and at
+least one writes:
+\[
+  a \preceq_{\mathcal{T}} b
+  \;\;\lor\;\;
+  b \preceq_{\mathcal{T}} a\,.
+\]
+Data races are possible within a single tile block if
+token ordering is
+absent~\cite{NV_BLOG_TILE}.
+\end{definition}
+
+
+\subsection{Data Movement Invariants}
+\label{sec:datamov-sem:inv}
+
+\begin{invariant}[INV-D1: Data Reachability]
+\label{inv:D1}
+Every tile datum consumed by a compute operation has a
+\emph{path} from \textsc{HBM} to the compute unit
+through $\mathcal{H}$:
+for every operand~$o$ of every $v \in V$,
+there exists a sequence of edges
+$e_1, \dots, e_k \in E(\mathcal{H})$
+such that
+$\mu_s(e_1) = \textsc{HBM}$ and
+$\mu_d(e_k) = \mathrm{tier}(v.\mathrm{operand})$%
+~\cite{ARCH_BW, NV_BLOG_TILE}.
+For tensor-core MMA: operands~$A$ from \SMEM{}
+(or \TMEM{} in TS mode); operands~$B$ from
+\SMEM{}; accumulator~$D$ to
+\TMEM{}~\cite{ARCH_BW}.
+\end{invariant}
+
+\begin{invariant}[INV-D2: Token DAG Acyclicity]
+\label{inv:D2}
+The token dependency graph
+$\mathcal{T} = (\mathrm{Ops}, \mathrm{TokenEdges})$
+is a \emph{directed acyclic graph} within each tile
+block.
+This ensures the token partial order
+$\preceq_{\mathcal{T}}$ is well-defined and prevents
+circular waits~\cite{NV_BLOG_TILE}.
+\end{invariant}
+
+\begin{invariant}[INV-D3: Tier Capacity]
+\label{inv:D3}
+At every point in the execution, the sum of
+\emph{live} tile allocations at each memory tier does
+not exceed the tier capacity:
+\begin{align}
+  \forall\, t,\;\forall\, \mu \in N(\mathcal{H}):\quad
+  &\sum_{\substack{a \in \mathrm{allocs}(t) \\
+  \mathrm{tier}(a) = \mu}}
+  \mathrm{size}(a)
+  \;\leq\; \mathrm{cap}(\mu, x) \notag
+\end{align}
+In particular:
+\TMEM{} live columns $\leq 512$
+(i.e., $\leq 256$\,KB)~\cite{ARCH_BW};
+\SMEM{} live tiles $\leq C_{\SMEM{}}(x)$
+($228$\,KB for cc\,10.0,
+$128$\,KB for cc\,12.0)~\cite{ARCH_BW}.
+\end{invariant}
+
+\begin{invariant}[INV-D4: \TMEM{} Lifecycle Ordering]
+\label{inv:D4}
+Every \TMEM{} allocation follows the state machine
+$\mathcal{F}_{\TMEM{}}$
+(\cref{def:tmem-lifecycle}):
+allocation precedes use, deallocation follows last
+read, and
+$\texttt{relinquish\_alloc\_permit}$ releases the
+allocation lock before kernel exit or CTA
+re-queuing~\cite{ARCH_BW}.
+No \TMEM{} region may be in state \textsc{Computing}
+when a $\tcgen{}\texttt{.cp}$ or
+$\tcgen{}\texttt{.ld}$ targets it.
+\end{invariant}
+
+
+% ====================================================================
+%  SECTION 7 — SCHEDULING SEMANTICS LAYER
+% ====================================================================
+\section{Scheduling Semantics Layer}
+\label{sec:sched-sem}
+
+The scheduling layer instantiates the constraint
+system $\mathcal{S}$ with Blackwell-specific
+parameters and extends the
+OPT\_PIPE~\cite{OPT_PIPE} formulation to handle
+2CTA MMA mode~\cite{NV_BLOG_TILE}.
+
+\subsection{Blackwell-Parameterised ILP+SMT
+            Formulation}
+\label{sec:sched-sem:ilp}
+
+The ILP determines a lower bound on the initiation
+interval $\II$, and the SMT encoding holistically
+captures the joint SWP+WS
+problem~\cite{OPT_PIPE}.
+The Blackwell parameterisation instantiates the
+abstract cost vector $\mathbf{c}$ of
+\cref{def:sched-sys} with measured hardware
+latencies.
+
+\begin{definition}[Blackwell Cost Vector]
+\label{def:cost-vector}
+The cost vector for a Blackwell SM of compute
+capability~$x$ is:
+\begin{align}
+  \mathbf{c}(x) &= \bigl(
+    c_{\mathrm{MMA}}(p, T),\;
+    c_{\mathrm{TMA}}^{\mathrm{ld}}(T),\;
+    c_{\mathrm{TMA}}^{\mathrm{st}}(T),\; \notag\\
+    &\qquad c_{\mathrm{ALU}},\;
+    c_{\TMEM{}}^{\mathrm{cp}}
+  \bigr) \label{eq:cost-vector}
+\end{align}
+where $p \in \mathcal{P}$ is precision,
+$T$ is tile shape, and each component is a latency in
+cycles.
+Known anchors from~\cite{ARCH_BW}:
+\begin{enumerate}[label=(\alph*)]
+  \item $c_{\mathrm{MMA}}(p, T) \approx 11.0$--$11.4$
+    cycles, approximately constant across tile sizes and
+    precisions for FP16 inputs~\cite{ARCH_BW}.
+  \item The SM has 4~warp schedulers, supporting up to
+    $N_{\mathrm{WS}}(10.0) = 64$ and
+    $N_{\mathrm{WS}}(12.0) = 48$ concurrent
+    warps~\cite{ARCH_BW}.
+  \item Execution contexts: $\leq 4$ per SM, bounding
+    the maximum number of in-flight software pipeline
+    stages~\cite{ARCH_BW, OPT_PIPE}.
+\end{enumerate}
+ZLP normalisation (per \cite{OPT_PIPE}) converts
+absolute cycles to minimal positive integer ratios for
+solver tractability.
+\end{definition}
+
+\begin{remark}
+A complete cost table covering all precisions
+($\mathcal{P}$), tile sizes, and operation types
+is not available from the golden sources.
+\tcgen{}\texttt{.mma} latency constancy
+across precisions beyond FP16 is \unverified{} for
+FP4, FP6, and FP64 (gap~G9).
+TMA bulk load/store latencies for specific tile sizes
+are not published and require independent
+calibration (Part~3).
+\end{remark}
+
+
+\subsection{Constraint Decomposition}
+\label{sec:sched-sem:constraints}
+
+The full constraint set
+$\Phi = \Phi_{\mathrm{dep}} \wedge
+\Phi_{\mathrm{res}} \wedge
+\Phi_{\mathrm{fu}} \wedge
+\Phi_{\mathrm{2cta}}$
+is specified below.
+
+\begin{definition}[Dependency Constraints
+  $\Phi_{\mathrm{dep}}$~\cite{OPT_PIPE}]
+\label{def:phi-dep}
+For every dependency edge $(u, v, d, \delta) \in E$:
+\begin{equation}
+  M(v) - M(u) + \II \cdot \delta
+  \;\geq\; d(u,v)
+  \label{eq:dep-constraint-p2}
+\end{equation}
+where $d(u,v)$ is the latency of edge $(u,v)$ drawn
+from $\mathbf{c}(x)$ and $\delta(u,v)$ is the
+iteration distance~\cite{OPT_PIPE}.
+In the 3-D boolean encoding, this becomes:
+for all $v, i, t$ with $\mathrm{op}[v,i,t] = 1$ and
+predecessor $u$ at time $t'$:
+$t - t' + \II \cdot \delta \geq d$~\cite{OPT_PIPE}.
+\end{definition}
+
+\begin{definition}[Resource Constraints
+  $\Phi_{\mathrm{res}}$~\cite{ARCH_BW,OPT_PIPE}]
+\label{def:phi-res}
+At every time step~$t$, the number of active execution
+contexts does not exceed the SM limit:
+\begin{equation}
+  \sum_{v \in V}
+  \mathbf{1}\bigl[\exists\, i :
+    \mathrm{op}[v,i,t] = 1\bigr]
+  \;\leq\; 4
+  \label{eq:resource}
+\end{equation}
+Additionally, memory tier capacities from
+$\mathcal{H}$ apply:
+live \SMEM{} allocations $\leq C_{\SMEM{}}(x)$;
+live \TMEM{} allocations $\leq 256$\,KB.
+The concurrent warp count is bounded by
+$N_{\mathrm{WS}}(x)$~\cite{ARCH_BW}.
+\end{definition}
+
+\begin{definition}[Functional Unit Exclusivity
+  $\Phi_{\mathrm{fu}}$~\cite{OPT_PIPE}]
+\label{def:phi-fu}
+At most one operation per functional unit type per
+cycle:
+for each unit class
+$u_c \in \{\text{TC},\, \tma{},\, \text{ALU}\}$
+and time step $t$:
+\begin{equation}
+  \sum_{\substack{v \in V \\ \mathrm{unit}(v) = u_c}}
+  \sum_{i}
+  \mathrm{op}[v,i,t]
+  \;\leq\; 1
+  \label{eq:fu-excl}
+\end{equation}
+where $\mathrm{unit}(v)$ maps each operation to its
+functional unit class~\cite{OPT_PIPE}.
+\end{definition}
+
+
+\subsection{2CTA MMA Constraint}
+\label{sec:sched-sem:2cta}
+
+\begin{definition}[2CTA Constraint
+  $\Phi_{\mathrm{2cta}}$~\cite{NV_BLOG_TILE,ARCH_BW}]
+\label{def:phi-2cta}
+When $\texttt{num\_ctas} = 2$, a CTA pair
+$(\mathrm{CTA}_0, \mathrm{CTA}_1)$ mapped to the same
+TPC (two adjacent SMs) shares input operands from the
+aggregate \SMEM{} of both SMs~\cite{NV_BLOG_TILE}.
+This introduces a \emph{CTA-pair assignment variable}:
+\[
+  \mathrm{cta}(v) \in \{0, 1\}
+  \quad \forall\, v \in V
+\]
+and the following constraints:
+\begin{enumerate}[label=(\alph*)]
+  \item \emph{MMA pairing}: for every MMA operation
+    $v$, the operand-$A$ load and operand-$B$ load
+    must jointly span both CTAs:
+    $\mathrm{cta}(v.A_{\mathrm{load}}) \cup
+    \mathrm{cta}(v.B_{\mathrm{load}})
+    = \{0, 1\}$~\cite{NV_BLOG_TILE}.
+  \item \emph{\SMEM{} sharing}: total \SMEM{} per TPC
+    $= C_{\SMEM{}}^{(0)} + C_{\SMEM{}}^{(1)}$,
+    with shared operand region counted once.
+    The MMA.2SM instruction leverages TPC-internal
+    bandwidth~\cite{ARCH_BW}.
+  \item \emph{Symmetry}: $\mathrm{CTA}_0$ and
+    $\mathrm{CTA}_1$ are interchangeable;
+    the solver may break symmetry by fixing
+    $\mathrm{cta}(v_0) = 0$ for one
+    operation~$v_0$.
+\end{enumerate}
+\end{definition}
+
+\begin{remark}
+2CTA mode is critical for dense dot
+workloads~\cite{NV_BLOG_TILE}.
+OPT\_PIPE~\cite{OPT_PIPE} does not explicitly model
+inter-CTA coupling; extending the SMT formulation with
+$\Phi_{\mathrm{2cta}}$ is a formal contribution of
+\BUTA{} (gap~G6).
+Inter-CTA synchronisation latency within a TPC is not
+well characterised and is \unverified{} pending
+microbenchmark calibration.
+\end{remark}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Schedule Constraint Architecture for Blackwell           |
++===========================================================+
+|                                                           |
+|  Dependence Graph G = (V, E)                              |
+|  +------+  d,delta  +------+  d,delta  +------+          |
+|  | TMA  |---------->| MMA  |---------->| TMEM |          |
+|  | load |           | S,O  |           |  cp  |          |
+|  +------+           +------+           +------+          |
+|      |                  ^                  |              |
+|      |     tokens       |                  |              |
+|      +---> [NV_BLOG_TILE] <---------+-----+              |
+|                                                           |
+|  Solver Pipeline:                                         |
+|  +----------+   II_lb   +----------+   (M,W,II)          |
+|  |   ILP    |---------->|   SMT    |----------> Schedule  |
+|  | min II   |           | SWP+WS  |                      |
+|  |          |           | op[v,i,t]|                      |
+|  +----+-----+           +----+-----+                      |
+|       |                      |                            |
+|       v                      v                            |
+|  Cost vector c(x)      Constraint set Phi                 |
+|  from ARCH_BW:          = Phi_dep [OPT_PIPE]              |
+|  - MMA: 11.0-11.4 cyc   AND Phi_res [ARCH_BW]            |
+|  - WS: 64/48 warps      AND Phi_fu  [OPT_PIPE]           |
+|  - Exec ctx: <=4        AND Phi_2cta [NV_BLOG_TILE]      |
++===========================================================+
+\end{BVerbatim}
+\caption{Schedule constraint architecture.
+  The ILP lower-bounds $\II$; the SMT encodes joint
+  SWP+WS~\cite{OPT_PIPE} with Blackwell cost
+  vector~\cite{ARCH_BW} and 2CTA
+  constraint~\cite{NV_BLOG_TILE}.
+  Token ordering from $\mathcal{D}$ injects additional
+  dependency edges into~$G$ (gap~G7).}
+\label{fig:sched-arch}
+\end{figure}
+
+
+\subsection{Scheduling Invariants}
+\label{sec:sched-sem:inv}
+
+\begin{invariant}[INV-S1: Resource Feasibility]
+\label{inv:S1}
+Active execution contexts
+$\leq 4$ per SM at all times~\cite{ARCH_BW, OPT_PIPE}.
+Concurrent warps
+$\leq N_{\mathrm{WS}}(x)$~\cite{ARCH_BW}.
+Memory tier capacities respected per
+INV-D3~(\cref{inv:D3}).
+\end{invariant}
+
+\begin{invariant}[INV-S2: No Data Hazards]
+\label{inv:S2}
+For every dependency $(u, v, d, \delta) \in E$:
+$M(v) - M(u) + \II \cdot \delta \geq d(u,v)$%
+~\cite{OPT_PIPE}.
+This ensures that no operation reads data before its
+producer has completed.
+\end{invariant}
+
+\begin{invariant}[INV-S3: Functional Unit Exclusivity]
+\label{inv:S3}
+At most one operation per TC, per \tma{} unit, and per
+ALU cluster per cycle~\cite{OPT_PIPE}.
+This models the physical constraint that Blackwell SMs
+have one 5th-gen tensor core per
+SM~\cite{ARCH_BW}.
+\end{invariant}
+
+\begin{invariant}[INV-S4: 2CTA Pairing]
+\label{inv:S4}
+When $\texttt{num\_ctas} = 2$: both CTAs of the TPC
+pair are co-scheduled; shared \SMEM{} operand
+regions are allocated consistently; MMA.2SM operations
+reference operands from both SMs' \SMEM{}
+stores~\cite{NV_BLOG_TILE, ARCH_BW}.
+\end{invariant}
+
+\begin{invariant}[INV-S5: Liveness]
+\label{inv:S5}
+All iterations of the software-pipelined loop
+eventually complete; no deadlock arises in the
+producer-consumer pipeline.
+The modulo schedule $(M, \II)$ with period $\II$
+guarantees progress: iteration $i+1$ initiates
+exactly $\II$ cycles after
+iteration~$i$~\cite{OPT_PIPE}.
+\end{invariant}
+
+\begin{remark}
+\TileIR{} (CUDA~13.1) does not expose
+$\texttt{num\_warps}$ as a tuning parameter;
+only an occupancy hint (integer 1--32)
+is available~\cite{NV_BLOG_TILE}.
+This creates a tension with $W(v)$ in $\mathcal{S}$,
+which assigns specific warps to
+operations~\cite{OPT_PIPE}.
+\BUTA{} treats $W(v)$ as a \emph{logical}
+assignment: the compiler maps logical warp indices to
+physical warps subject to the occupancy
+hint \inference{}.
+\end{remark}
+
+
+% ====================================================================
+%  SECTION 8 — CACHE TRAFFIC SEMANTICS LAYER
+% ====================================================================
+\section{Cache Traffic Semantics Layer}
+\label{sec:cache-sem}
+
+The cache traffic layer predicts L2 sector-level misses
+as a function of tile iteration order, building on the
+reuse-distance formalism of Zhu, Pan, and
+Ding~\cite{SEED_3} and hardware parameters
+from~\cite{ARCH_BW}.
+
+\subsection{Parameterised Reuse-Distance Model}
+\label{sec:cache-sem:model}
+
+\begin{definition}[Parameterised Cache Traffic Model]
+\label{def:cache-model-param}
+For a tile program with iteration space $\mathcal{I}$,
+tile ordering permutation
+$\sigma : \mathcal{I} \to \mathcal{I}$,
+active SM count $N_{\mathrm{SM}}$,
+and L2 capacity $C_{\mathrm{L2}}$,
+the predicted L2 sector miss count is:
+\begin{equation}
+  \mathcal{C}(\sigma, N_{\mathrm{SM}}, C_{\mathrm{L2}})
+  = \sum_{a \in \mathrm{sectors}}
+    \mathbf{1}\!\Bigl[
+      \reuse(a, \sigma) >
+      \frac{C_{\mathrm{L2}}}{s}
+    \Bigr]
+  \label{eq:miss-model}
+\end{equation}
+where $s = 32$\,bytes is the sector size and
+$\reuse(a, \sigma)$ is the \emph{reuse distance}:
+the count of distinct cache lines accessed between
+consecutive accesses to line~$a$ under
+ordering~$\sigma$~\cite{SEED_3}.
+For Blackwell:
+$C_{\mathrm{L2}} \approx 65$\,MB (unified across
+SMs)~\cite{ARCH_BW}.
+\end{definition}
+
+\begin{definition}[Sawtooth Ordering Bound
+  ~\cite{SEED_3}]
+\label{def:sawtooth-bound}
+For a streaming split-$Q$ dataflow with persistent
+CTAs and $N_{\mathrm{CTA}}$ active CTAs, the
+\emph{sawtooth order} (alternating inner-loop scan
+direction) guarantees:
+\[
+  \reuse(a, \sigma_{\mathrm{saw}}) < D_{\mathrm{data}}
+  \;\;\text{for fraction}\;\;
+  \geq \bigl(1 - 1/N_{\mathrm{CTA}}\bigr)
+\]
+of sector accesses, where $D_{\mathrm{data}}$ is the
+total data footprint~\cite{SEED_3}.
+This achieves a 67\% L2 miss reduction
+(370M\,$\to$\,120M sectors) and up to 60\% throughput
+increase (41\,$\to$\,66~TFLOPS causal) on
+GB10~\cite{SEED_3}.
+\end{definition}
+
+\begin{remark}
+The reuse-distance model has been validated
+\emph{only} for Flash Attention on GB10
+(cc\,12.0, 128\,KB \SMEM{})~\cite{SEED_3}.
+Generalisation to GEMM, convolution, or other
+workloads on B200 (228\,KB \SMEM{},
+cc\,10.0) is an \inference{} claim (gap~G5).
+Furthermore, L1 is negligible for streaming attention
+patterns~\cite{SEED_3}; non-streaming patterns where
+L1 matters require a separate model extension.
+\end{remark}
+
+
+\subsection{Tropical Semiring Structure}
+\label{sec:cache-sem:semiring}
+
+\begin{proposition}[\inference{}]
+\label{prop:tropical}
+The cache traffic function $\mathcal{C}$ over tile
+program compositions admits a $(\min, +)$ tropical
+semiring structure.
+Let $P = P_1 ; P_2$ be the sequential composition of
+two tile programs with independent data footprints.
+Then:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Additive decomposition}: the total
+    miss count decomposes as
+    $\mathcal{C}(P, \sigma) =
+    \mathcal{C}(P_1, \sigma|_{P_1}) +
+    \mathcal{C}(P_2, \sigma|_{P_2})$.
+  \item \emph{Optimal selection}:
+    $\mathcal{C}^{*}(P) =
+    \min_{\sigma}\, \mathcal{C}(P, \sigma)$.
+\end{enumerate}
+The semiring $(\NN \cup \{\infty\},\, \min,\, +)$
+governs optimisation: total cost is additive over
+sequential stages, and the optimal ordering minimises
+the sum.
+\end{proposition}
+
+\begin{remark}
+This semiring structure is inferred from the
+compositional properties of
+$\reuse$~\cite{SEED_3} and does not appear in the
+golden sources.
+Its validity depends on the assumption of independent
+data footprints between composed tile programs; shared
+data between stages may break additive
+decomposition.
+\end{remark}
+
+
+\subsection{Cache Traffic Invariants}
+\label{sec:cache-sem:inv}
+
+\begin{invariant}[INV-T1: Conservation]
+\label{inv:T1}
+Total sector accesses decompose exactly into hits and
+misses:
+$|\mathrm{accesses}| =
+|\mathrm{hits}| + |\mathrm{misses}|$.
+The model $\mathcal{C}$ predicts $|\mathrm{misses}|$;
+$|\mathrm{hits}| =
+|\mathrm{accesses}| -
+\mathcal{C}(\sigma, N_{\mathrm{SM}},
+C_{\mathrm{L2}})$~\cite{SEED_3}.
+\end{invariant}
+
+\begin{invariant}[INV-T2: Monotonicity]
+\label{inv:T2}
+For streaming tile patterns, increasing active SM
+count leads to non-decreasing miss rate:
+if $N_{\mathrm{SM}}' > N_{\mathrm{SM}}$ then
+$\mathcal{C}(\sigma, N_{\mathrm{SM}}',
+C_{\mathrm{L2}})
+\geq
+\mathcal{C}(\sigma, N_{\mathrm{SM}},
+C_{\mathrm{L2}})$~\cite{SEED_3}.
+More active SMs increase L2 contention and reduce
+effective per-SM cache capacity.
+L2 hit rate correlates with
+$N_{\mathrm{SM}}$~\cite{SEED_3}.
+\end{invariant}
+
+\begin{invariant}[INV-T3: Reuse Distance Bound]
+\label{inv:T3}
+Sawtooth ordering achieves
+$\reuse(a, \sigma_{\mathrm{saw}}) < D_{\mathrm{data}}$
+for a fraction
+$\geq (1 - 1/N_{\mathrm{CTA}})$
+of sector accesses~\cite{SEED_3}.
+This provides a \emph{worst-case} bound on miss rate
+under sawtooth ordering, independent of L2 cache
+capacity.
+\end{invariant}
+
+\begin{invariant}[INV-T4: Capacity Ceiling]
+\label{inv:T4}
+If the total working set fits in L2
+($D_{\mathrm{data}} < C_{\mathrm{L2}}$),
+then the miss rate approaches zero for streaming
+access patterns:
+$\mathcal{C}(\sigma, N_{\mathrm{SM}},
+C_{\mathrm{L2}}) \to 0$
+as $D_{\mathrm{data}} / C_{\mathrm{L2}} \to 0$%
+~\cite{SEED_3, ARCH_BW}.
+Blackwell's ${\sim}65$\,MB L2~\cite{ARCH_BW}
+combined with the 58\% cache-miss latency
+reduction~\cite{ARCH_BW} makes this ceiling
+achievable for moderate problem sizes.
+\end{invariant}
+
+
+% ====================================================================
+%  SECTION 9 — WORKLOAD CLASSIFICATION AND PRECISION
+% ====================================================================
+\section{Workload Classification within the Model}
+\label{sec:workload-class}
+
+\subsection{HARP Taxonomy Applied to Blackwell SM}
+\label{sec:workload-class:harp}
+
+The HARP two-axis taxonomy~\cite{NV_workloads}
+classifies the Blackwell SM as follows:
+
+\begin{definition}[Blackwell SM
+  Classification~\cite{NV_workloads,ARCH_BW}]
+\label{def:sm-class}
+Under the HARP taxonomy:
+\begin{enumerate}[label=(\alph*)]
+  \item \emph{Depth of compute}: the B200 GPU is
+    leaf-only (compute at SM level, no hierarchical
+    compute)~\cite{NV_workloads}.
+  \item \emph{Heterogeneity}: the SM is
+    \emph{intra-node heterogeneous}---CUDA cores and
+    5th-generation tensor cores are distinct
+    sub-accelerators with asymmetric latencies and data
+    paths~\cite{NV_workloads, ARCH_BW}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[SM Sub-Accelerator
+  Decomposition \inference{}]
+\label{def:sm-decomp}
+Applying the HARP taxonomy at the SM level yields a
+formal object:
+\[
+  \mathrm{SM}(x) = \bigl(
+    \underbrace{\text{CUDA\_cores}}_{\text{ALU}},\;
+    \underbrace{\text{TC\_5thgen}}_{\text{MMA}},\;
+    \underbrace{\TMEM{}}_{\text{near-compute}},\;
+    \underbrace{\SMEM{}(x)}_{\text{shared}},\;
+    \underbrace{\text{RF}}_{\text{private}}
+  \bigr)
+\]
+with per-component latencies forming the cost vector
+$\mathbf{c}(x)$ consumed by
+$\mathcal{S}$~\cite{ARCH_BW, OPT_PIPE}.
+\end{definition}
+
+\begin{remark}
+The introduction of \TMEM{} as a near-compute memory
+tier challenges the pure leaf-only classification:
+\TMEM{}-aware scheduling adds a data-placement
+variable absent in prior models~\cite{ARCH_BW}.
+B200 dual-die topology (148~SMs, 74 per die via
+NV-HBI~\cite{ARCH_BW}) and explicit \TMEM{}
+are not classified in the HARP taxonomy as
+published~\cite{NV_workloads} \inference{}.
+\end{remark}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  SM Sub-Accelerator Model (HARP + ARCH_BW)                |
++===========================================================+
+|                                                           |
+|  Workload Descriptor W                                    |
+|  +----------+----------+---------+---------+              |
+|  | Operator | AI       | Reuse   | Prec.   |              |
+|  +----------+----------+---------+---------+              |
+|  | MMA S    | high     | reuse   | FP16    | --> TC       |
+|  | MMA O    | high     | reuse   | FP16    | --> TC       |
+|  | softmax  | low      | stream  | FP32    | --> CUDA     |
+|  | TMA Kj   | N/A      | stream  | FP16    | --> TMA unit |
+|  | TMA Vj   | N/A      | stream  | FP16    | --> TMA unit |
+|  | TMEM cp  | N/A      | N/A     | FP32    | --> tcgen05  |
+|  +----------+----------+---------+---------+              |
+|       |                                                   |
+|       v  cost vector c(x) parameterised per operator      |
+|                                                           |
+|  SM(10.0) = (CUDA_cores, TC_5thgen, TMEM, SMEM, RF)      |
+|              |            |          |      |      |      |
+|         c_ALU=?    c_MMA=11.2  UNVERIFIED  228KB 256KB   |
+|                    cycles       bw values                 |
+|                                                           |
+|  Classification [NV_workloads]:                           |
+|    Depth of compute: leaf-only                            |
+|    Heterogeneity:    intra-node (CUDA + TC)               |
+|    Workload type:    mixed-reuse (high-AI MMA + low-AI    |
+|                      epilogue)                            |
++===========================================================+
+\end{BVerbatim}
+\caption{Workload classification applied to Flash
+  Attention forward on Blackwell.
+  Each operator in $\mathcal{W}$ is labelled with
+  arithmetic intensity, reuse class, and
+  precision~\cite{NV_workloads, ARCH_BW}.
+  The SM sub-accelerator model routes operators to
+  physical units with distinct costs.
+  Mixed-reuse workloads~\cite{NV_workloads} contain
+  both compute-bound (MMA) and memory-bound (softmax)
+  operators.}
+\label{fig:workload-class}
+\end{figure}
+
+
+\subsection{Precision-Dependent Cost Conditioning}
+\label{sec:workload-class:prec}
+
+The precision lattice $\mathcal{P}$
+(\cref{def:prec-lattice-full}) conditions the
+scheduling cost vector on a per-operator basis.
+Different precisions induce different SASS
+instructions~\cite{ARCH_BW}, potentially different
+\SMEM{} layout requirements~\cite{SEED_1}, and
+different throughput
+scalings~\cite{ARCH_BW}.
+
+\begin{definition}[Precision-Parameterised
+  Layout Space \inference{} (Gap~G8)]
+\label{def:layout-prec}
+For each precision $p \in \mathcal{P}$, the valid
+layout space is:
+\[
+  \mathcal{L}(p) =
+  \bigl\{f \in \mathrm{Mor}_{\mathcal{L}} :
+  \mathrm{bits}(f) = \mathrm{bits}(p),\;
+  f \text{ satisfies alignment}(p)
+  \bigr\}
+\]
+where $\mathrm{alignment}(p)$ encodes MMA tile shape
+requirements
+$\mathrm{MMA\_M}(p) \times \mathrm{MMA\_N}(p) \times
+\mathrm{MMA\_K}(p)$ for the hardware~\cite{ARCH_BW}.
+The $\Ftwo$ matrix dimension changes with element
+bit-width: wider elements require fewer address bits
+for the same tile shape~\cite{SEED_1}.
+\end{definition}
+
+\begin{remark}
+FP4/FP6 layout requirements and block scaling formats
+(MXFP4/MXFP8) are not fully documented in the golden
+sources \unverified{}.
+Empirical testing with \tcgen{} microbenchmarks is
+required to characterise precision-specific swizzle
+patterns and determine which fall outside the $\Ftwo$
+fragment (gap~G8)~\cite{ARCH_BW, SEED_1}.
+\end{remark}
+
+
+% ====================================================================
+%  SECTION 10 — OBJECTIVE FUNCTIONS AND PROOF OBLIGATIONS
+% ====================================================================
+\section{Objective Functions and Proof Obligations}
+\label{sec:obj-proofs}
+
+This section states the three optimisation objectives
+that \BUTA{} targets and the six proof obligations
+required to establish model soundness.
+
+\subsection{Objective Functions}
+\label{sec:obj-proofs:obj}
+
+\begin{definition}[OBJ-1: Minimise Initiation
+  Interval~\cite{OPT_PIPE}]
+\label{def:obj1}
+\begin{equation}
+  \min\; \II
+  \quad \text{subject to}\quad
+  \Phi_{\mathrm{dep}} \wedge
+  \Phi_{\mathrm{res}} \wedge
+  \Phi_{\mathrm{fu}} \wedge
+  \Phi_{\mathrm{2cta}}
+  \label{eq:obj1}
+\end{equation}
+This is the primary scheduling objective:
+minimise the steady-state cycle count per loop
+iteration.
+The ILP determines a lower bound; the SMT holistically
+solves the joint SWP+WS
+problem~\cite{OPT_PIPE}.
+Cost vector $\mathbf{c}(x)$ is parameterised
+by~\cite{ARCH_BW}.
+\end{definition}
+
+\begin{definition}[OBJ-2: Minimise L2 Cache
+  Misses~\cite{SEED_3,ARCH_BW}]
+\label{def:obj2}
+\begin{equation}
+  \min_{\sigma \in \mathrm{Perm}(\mathrm{Tiles})}\;
+  \mathcal{C}(\sigma, N_{\mathrm{SM}}, C_{\mathrm{L2}})
+  \quad \text{s.t.}\quad
+  \text{INV-T1} \wedge \cdots \wedge \text{INV-T4}
+  \label{eq:obj2}
+\end{equation}
+subject additionally to layout constraints
+INV-L1\,--\,L4 (tile ordering must be compatible with
+the chosen layout morphisms).
+The sawtooth ordering~\cite{SEED_3} provides a known
+feasible solution;
+OBJ-2 seeks to establish whether it is optimal or
+whether better orderings exist for specific workloads.
+\end{definition}
+
+\begin{definition}[OBJ-3: Composite
+  Cost \inference{}]
+\label{def:obj3}
+\begin{equation}
+  \min\;
+  \alpha \cdot \II
+  \;+\;
+  \beta \cdot \mathcal{C}(\sigma, N_{\mathrm{SM}},
+    C_{\mathrm{L2}})
+  \;+\;
+  \gamma \cdot \mathrm{DM}_{\mathrm{vol}}
+  \label{eq:obj3}
+\end{equation}
+subject to all invariants
+(INV-L1\,--\,L4, INV-D1\,--\,D4,
+INV-S1\,--\,S5, INV-T1\,--\,T4)
+and interface constraints~$\Psi$
+(\cref{def:interface}),
+where
+$\mathrm{DM}_{\mathrm{vol}} = \sum_{e \in
+\mathcal{D}} \mathrm{size}(e)$
+is the total data movement volume across
+$\mathcal{H}$ edges, and
+$\alpha, \beta, \gamma > 0$ are calibration
+weights~\cite{OPT_PIPE, SEED_3, ARCH_BW}.
+\end{definition}
+
+\begin{remark}
+OBJ-3 is a \emph{multi-objective} formulation.
+The weights $\alpha, \beta, \gamma$ must be calibrated
+empirically: $\alpha$ in cycles per initiation,
+$\beta$ in cycles per L2 miss (related to the 58\%
+cache-miss latency reduction on
+Blackwell~\cite{ARCH_BW}), and $\gamma$ in cycles per
+byte of data movement.
+OBJ-3 does not appear in any golden source and is
+an \inference{} contribution of \BUTA{}.
+\end{remark}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Objective Function Architecture                          |
++===========================================================+
+|                                                           |
+|  OBJ-1: min II             OBJ-2: min C(sigma)           |
+|  [OPT_PIPE + ARCH_BW]     [SEED_3 + ARCH_BW]             |
+|         \                      /                          |
+|          \    OBJ-3: min      /                           |
+|           \  alpha*II +      /                            |
+|            \ beta*C(sigma)+ /                             |
+|             \ gamma*DM_vol /                              |
+|              \            /                               |
+|               v          v                                |
+|        +---------------------+                            |
+|        | Joint Optimisation  |                            |
+|        +-----+-----+--------+                            |
+|              |     |                                      |
+|     Subject to:    |                                      |
+|  INV-L1..L4  |  INV-D1..D4                               |
+|  INV-S1..S5  |  INV-T1..T4                               |
+|  Interface   |  constraints Psi                           |
+|              v                                            |
+|  +---------------------------------------------------+   |
+|  | Calibration: alpha, beta, gamma from               |   |
+|  | hardware counters on B200/GB10 [ARCH_BW, SEED_3]   |   |
+|  +---------------------------------------------------+   |
++===========================================================+
+\end{BVerbatim}
+\caption{Objective function architecture.
+  OBJ-1 and OBJ-2 are anchored in golden
+  sources~\cite{OPT_PIPE, SEED_3};
+  OBJ-3 is a composite \inference{} objective
+  combining scheduling, cache, and data-movement
+  costs under all model invariants.}
+\label{fig:obj-arch}
+\end{figure}
+
+
+\subsection{Proof Obligations}
+\label{sec:obj-proofs:po}
+
+We state six proof obligations required for \BUTA{}
+model soundness.
+Proof Obligations~1--5 each address a specific
+inter-layer correctness property;
+Proof Obligation~6 is the end-to-end composition
+theorem.
+
+\begin{obligation}[PO-1: $\Ftwo$-to-\ISL{}
+  Embedding Correctness (Gap~G1)]
+\label{po:1}
+\emph{Statement.}\;
+The embedding $\phi$ (\cref{def:phi-embed}) is
+injective and preserves composition over the binary
+domain.
+
+\smallskip\noindent
+\emph{Planned technique.}\;
+Constructive proof: define
+$\phi(L)$ as an \ISL{} relation with binary domain
+constraints ($b_j \in \{0,1\}$); show injectivity by
+demonstrating that distinct $\Ftwo$ matrices yield
+distinct \ISL{} relations;
+prove composition preservation via \ISL{} relation
+composition semantics matching $\Ftwo$ matrix
+multiplication~\cite{SEED_1, SEED_2}.
+Automated checking via \ISL{} \texttt{compute\_flow}
+for small layout sizes.
+
+\smallskip\noindent
+\emph{Falsifiable prediction.}\;
+All $\Ftwo$ layouts in the Triton test suite
+have verified \ISL{} equivalents~\cite{SEED_1};
+composition preservation holds for all layout pairs in
+the CUTLASS test suite~\cite{SEED_4}.
+\end{obligation}
+
+\begin{obligation}[PO-2: Categorical-to-\ISL{}
+  Compatibility (Gap~G2)]
+\label{po:2}
+\emph{Statement.}\;
+The functor $F$ (\cref{def:F-functor}) preserves
+composition, logical product, and logical division;
+its image coincides with the tractable layout
+set~\cite{SEED_4}.
+
+\smallskip\noindent
+\emph{Planned technique.}\;
+Category-theoretic proof with Python
+implementation extending the SEED\_4
+codebase~\cite{SEED_4} to emit \ISL{}
+relations; cross-validation with Algorithm~1
+of~\cite{SEED_2}.
+Verify that the image of $F$ covers all \CuTe{}
+layouts convertible by
+Algorithm~1~\cite{SEED_2}.
+
+\smallskip\noindent
+\emph{Falsifiable prediction.}\;
+Functor $F$ defined and tested on all CUTLASS test
+layouts from~\cite{SEED_4}; image of $F$ covers all
+\CuTe{} layouts handled by Algorithm~1
+of~\cite{SEED_2}.
+\end{obligation}
+
+\begin{obligation}[PO-3: Schedule Feasibility
+  Soundness (Gap~G6)]
+\label{po:3}
+\emph{Statement.}\;
+Any schedule $(M, W, \II)$ satisfying the SMT
+constraints $\Phi$ is \emph{realisable} on a
+Blackwell SM:
+resource counts are respected, dependency latencies
+are met, and 2CTA pairing is valid.
+
+\smallskip\noindent
+\emph{Planned technique.}\;
+Given a satisfying assignment from the SMT solver,
+verify:
+(a)~resource counts against
+$\mathcal{R}(s, x)$~\cite{ARCH_BW};
+(b)~dependency latencies against \tcgen{}\texttt{.mma}
+and \tma{} measured
+costs~\cite{ARCH_BW};
+(c)~2CTA pairing constraints match TPC topology
+(\texttt{num\_ctas=2})~\cite{NV_BLOG_TILE}.
+Reference: Twill~\cite{OPT_PIPE} rediscovery of
+expert Flash Attention schedules serves as
+cross-validation.
+
+\smallskip\noindent
+\emph{Falsifiable prediction.}\;
+Solver with calibrated Blackwell cost vector produces
+schedules matching or exceeding expert FA3/FA4
+schedules~\cite{OPT_PIPE};
+Blackwell parameterisation yields distinct optimal
+schedules vs.\ Hopper~\cite{OPT_PIPE}.
+\end{obligation}
+
+\begin{obligation}[PO-4: Cache Model
+  Fidelity (Gap~G5)]
+\label{po:4}
+\emph{Statement.}\;
+Predicted L2 miss count
+$\mathcal{C}(\sigma, N_{\mathrm{SM}}, C_{\mathrm{L2}})$
+matches measured hardware counter values within a
+bounded relative error.
+
+\smallskip\noindent
+\emph{Planned technique.}\;
+Derive predicted L2 miss count from reuse-distance
+model~\cite{SEED_3}; compare against hardware
+performance counters (via Nsight Compute) on
+GB10~\cite{SEED_3} and
+B200~\cite{ARCH_BW};
+bound prediction error statistically with confidence
+interval.
+Reproduce the SEED\_3 67\% miss reduction
+result~\cite{SEED_3} as a baseline.
+
+\smallskip\noindent
+\emph{Falsifiable prediction.}\;
+Predicted miss count within 15\% of measured for
+sawtooth-ordered Flash Attention on
+GB10~\cite{SEED_3};
+model correctly predicts when sawtooth ordering helps
+vs.\ hurts.
+\end{obligation}
+
+\begin{obligation}[PO-5: Memory Ordering
+  Correctness (Gap~G7)]
+\label{po:5}
+\emph{Statement.}\;
+The \TileIR{} token ordering
+$\preceq_{\mathcal{T}}$~(\cref{def:token-po})
+is respected by any schedule $(M, W, \II)$ produced
+by $\mathcal{S}$;
+well-formed token DAGs are data-race free.
+
+\smallskip\noindent
+\emph{Planned technique.}\;
+Formalise token dependencies as additional edges in
+the dependence graph $G$: for each token edge
+$(u, v) \in \mathcal{T}$, add dependency
+$M(v) \geq M(u) + \mathrm{lat}(u)$
+to~$\Phi_{\mathrm{dep}}$~\cite{NV_BLOG_TILE,
+OPT_PIPE}.
+Data-race freedom (\cref{def:drf}) is checked as a
+decidable property of the token DAG:
+for all conflicting pairs, verify
+ordering~\cite{NV_BLOG_TILE}.
+
+\smallskip\noindent
+\emph{Falsifiable prediction.}\;
+Token-augmented solver produces correct schedules
+for all Triton-to-\TileIR{} test programs;
+no data races detected in solver output for
+well-formed programs.
+\end{obligation}
+
+\begin{obligation}[PO-6: End-to-End Semantic
+  Preservation \inference{}]
+\label{po:6}
+\emph{Statement.}\;
+The composition of layout selection
+($\mathcal{L}$), data movement ($\mathcal{D}$),
+scheduling ($\mathcal{S}$), and cache ordering
+($\mathcal{C}$) preserves the operational semantics of
+the original tile program: the output tensor computed
+under the optimised configuration is
+\emph{bitwise identical} to the output under a
+reference sequential execution.
+
+\smallskip\noindent
+\emph{Planned technique.}\;
+Layer simulation relations:
+define a simulation relation
+$\sim_{\ell}$ for each semantic layer~$\ell$
+such that:
+\begin{enumerate}[label=(\roman*)]
+  \item $\mathcal{L}$: layout morphisms preserve
+    data values (INV-L1 bijectivity);
+  \item $\mathcal{D}$: token DAG acyclicity
+    (INV-D2) and capacity (INV-D3) ensure
+    well-ordered data delivery;
+  \item $\mathcal{S}$: schedule respects
+    dependencies (INV-S2) and resources (INV-S1);
+  \item $\mathcal{C}$: cache traffic affects only
+    performance, not correctness
+    (conservation, INV-T1).
+\end{enumerate}
+Compose: $\sim \;= \;\sim_{\mathcal{L}} \circ
+\sim_{\mathcal{D}} \circ \sim_{\mathcal{S}} \circ
+\sim_{\mathcal{C}}$ is a bisimulation between
+optimised and reference
+executions~\cite{SEED_1, SEED_2, SEED_4,
+OPT_PIPE, NV_BLOG_TILE, ARCH_BW}.
+
+\smallskip\noindent
+\emph{Falsifiable prediction.}\;
+Optimised Flash Attention produces bitwise-identical
+output to reference implementation for all test
+inputs on both B200 and GB10.
+\end{obligation}
+
+
+\subsection{Proof Obligation Dependency Structure}
+\label{sec:obj-proofs:deps}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Proof Obligation Dependency Graph                        |
++===========================================================+
+|                                                           |
+|  PO-1: F2->ISL        PO-2: Cat->ISL                     |
+|  [SEED_1, SEED_2]     [SEED_4, SEED_2]                   |
+|       \                   /                               |
+|        \                 /                                |
+|         v               v                                 |
+|  +------+---+---+------+                                 |
+|  |  Layout Layer Sound  |                                 |
+|  |  (INV-L1..L4)        |                                 |
+|  +----------+-----------+                                 |
+|             |                                             |
+|             v                                             |
+|  PO-3: Schedule Sound    PO-5: Token Order                |
+|  [OPT_PIPE, ARCH_BW,    [NV_BLOG_TILE,                   |
+|   NV_BLOG_TILE]           OPT_PIPE]                       |
+|       \                      /                            |
+|        \                    /                             |
+|         v                  v                              |
+|     PO-4: Cache Fidelity                                  |
+|     [SEED_3, ARCH_BW]                                     |
+|              \                                            |
+|               v                                           |
+|  +---------------------------+                            |
+|  |  PO-6: End-to-End        |                             |
+|  |  Semantic Preservation    |                             |
+|  |  [ALL SOURCES]            |                             |
+|  |  Requires: PO-1..PO-5    |                             |
+|  +---------------------------+                            |
+|                                                           |
+|  Legend:                                                   |
+|    ---->  =  "depends on"                                 |
+|    PO-6 is the capstone: requires all prior POs           |
++===========================================================+
+\end{BVerbatim}
+\caption{Dependency graph among proof obligations.
+  PO-1 and PO-2 establish layout-layer soundness;
+  PO-3 and PO-5 establish scheduling and memory
+  ordering soundness;
+  PO-4 establishes cache model fidelity;
+  PO-6 (end-to-end) requires all five.
+  Each PO is anchored to specific golden
+  sources.}
+\label{fig:po-deps}
+\end{figure}
+
+\noindent
+\Cref{fig:po-deps} illustrates the dependency
+structure.
+PO-6 is the \emph{capstone} obligation: it composes
+the soundness guarantees of PO-1--PO-5 into a
+single end-to-end statement.
+The dependency structure reveals that layout soundness
+(PO-1, PO-2) is a prerequisite for all downstream
+obligations, since layout correctness underpins the
+data movement relation $\mathcal{D}$ and the
+scheduling cost vector in $\mathcal{S}$.
+
+\subsection{Summary of Model Guarantees}
+\label{sec:obj-proofs:summary}
+
+\Cref{tab:guarantee-summary} links each semantic layer
+to its invariants, objective functions, and proof
+obligations.
+
+\begin{table}[t]
+\centering
+\caption{Model guarantee matrix: layers, invariants,
+  objectives, and proof obligations.}
+\label{tab:guarantee-summary}
+\footnotesize
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Layer} & \textbf{Invariants}
+  & \textbf{Obj.} & \textbf{POs} \\
+\midrule
+Layout $\mathcal{L}$
+  & INV-L1..L4 & --- & PO-1, PO-2 \\
+Data Mvmt $\mathcal{D}$
+  & INV-D1..D4 & (OBJ-3) & PO-5 \\
+Schedule $\mathcal{S}$
+  & INV-S1..S5 & OBJ-1 & PO-3 \\
+Cache $\mathcal{C}$
+  & INV-T1..T4 & OBJ-2 & PO-4 \\
+Composite
+  & All & OBJ-3 & PO-6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ====================================================================
+%  SOURCE AUDIT
+% ====================================================================
+\section*{Source Audit (Part~2)}
+\label{sec:audit-p2}
+
+\noindent
+All eight golden sources are cited in this part.
+\Cref{tab:audit-p2} records usage.
+
+\begin{table}[H]
+\centering
+\caption{Part~2 source audit: usage and anchors.}
+\label{tab:audit-p2}
+\footnotesize
+\begin{tabular}{@{}p{1.3cm}p{6.0cm}@{}}
+\toprule
+\textbf{ID} & \textbf{Used for (anchor)} \\
+\midrule
+ARCH\_BW &
+  Memory tier graph parameterisation (\TMEM{} 256\,KB,
+  \SMEM{} 228/128\,KB, L2 ${\sim}$65\,MB);
+  SM resource bounds (148 SMs, 4 WS, 64/48 warps);
+  \tcgen{}.mma latency 11.0--11.4 cycles;
+  precision lattice and SASS mappings;
+  58\% cache-miss latency reduction;
+  MMA.2SM TPC-internal bandwidth;
+  cost vector parameterisation for $\mathcal{S}$. \\
+\addlinespace
+OPT\_PIPE &
+  Schedule constraint system $\mathcal{S}$ definition
+  ($G{=}(V,E)$, $\mathrm{op}[v,i,t]$, $W(v)$, $\II$);
+  ILP for modulo scheduling; SMT for joint SWP+WS;
+  ZLP normalisation; dependency constraint formulation;
+  functional unit exclusivity;
+  Twill cross-validation of PO-3. \\
+\addlinespace
+NV\_BLOG\_ TILE &
+  Data movement relation $\mathcal{D}$ (TMA descriptors,
+  token-ordered memory model, waits-for relation,
+  happens-before);
+  2CTA MMA constraint ($\Phi_{\mathrm{2cta}}$,
+  $\texttt{num\_ctas}{=}2$);
+  \TileIR{} precision types;
+  occupancy hint limitation (\texttt{num\_warps}
+  not exposed);
+  data-race freedom definition. \\
+\addlinespace
+NV\_work\-loads &
+  Workload descriptor $\mathcal{W}$ (two-axis HARP
+  taxonomy: depth of compute $\times$ heterogeneity);
+  B100 leaf-only classification;
+  GPU+TC intra-node heterogeneous;
+  mixed-reuse workload characterisation;
+  SM sub-accelerator decomposition. \\
+\addlinespace
+SEED\_1 &
+  $\Ftwo$ representation layer of $\mathcal{L}$
+  (binary matrices, composition, layout-to-layout
+  conversion); linear fragment closure (INV-L4);
+  precision-dependent layout bit-width;
+  embedding $\phi$ source definition. \\
+\addlinespace
+SEED\_2 &
+  \ISL{} representation layer of $\mathcal{L}$
+  (quasi-affine relations, Algorithm~1 CuTe$\to$ISL);
+  swizzle as bit-level ISL operation (INV-L3);
+  tiling as quasi-affine transformation;
+  cross-system layout unification;
+  functor $F$ target definition. \\
+\addlinespace
+SEED\_3 &
+  Cache traffic function $\mathcal{C}$ (reuse-distance
+  formalism, sawtooth ordering bound, 67\% L2 miss
+  reduction on GB10, 60\% throughput increase);
+  L1 negligible for streaming attention;
+  L2 hit rate ${\sim}f(N_{\mathrm{SM}})$;
+  INV-T1..T4 anchoring; PO-4 validation basis. \\
+\addlinespace
+SEED\_4 &
+  Categorical representation layer of $\mathcal{L}$
+  ($\mathbf{Tuple}$/$\mathbf{Nest}$ categories,
+  morphisms, compatibility with CuTe operations);
+  tractable layout characterisation;
+  CUTLASS validation; functor $F$ source definition;
+  PO-2 anchoring. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ====================================================================
+%  BIBLIOGRAPHY
+% ====================================================================
+\begin{thebibliography}{8}
+
+\bibitem{ARCH_BW}
+A.~Jarmusch and S.~Chandrasekaran,
+``Microbenchmarking NVIDIA's Blackwell Architecture:
+An In-Depth Architectural Analysis,''
+\emph{arXiv:2512.02189v1}, Dec.~2025.
+\url{https://arxiv.org/html/2512.02189v1}
+
+\bibitem{OPT_PIPE}
+K.~Soi, A.~Venkat, T.~Nowicki, and
+G.~Biros,
+``Optimal Software Pipelining and Warp
+Specialization for Tensor Core GPUs,''
+\emph{arXiv:2512.18134v1}, Dec.~2025.
+\url{https://arxiv.org/html/2512.18134v1}
+
+\bibitem{NV_BLOG_TILE}
+NVIDIA,
+``Advancing GPU Programming with the CUDA Tile IR
+Backend for OpenAI Triton,''
+\emph{NVIDIA Developer Blog}, Jan.~2026.
+\url{https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/}
+
+\bibitem{NV_workloads}
+S.~Garg, M.~Pellauer, and T.~Krishna,
+``HARP: A Taxonomy for Heterogeneous and
+Hierarchical Processors for Mixed-Reuse Workloads,''
+\emph{arXiv:2502.13113}, Feb.~2025.
+\url{https://arxiv.org/html/2502.13113}
+
+\bibitem{SEED_1}
+J.~Zhou, M.~Lezcano, A.~Goucher, et~al.,
+``Linear Layouts: Robust Code Generation of Efficient
+Tensor Computation Using $\mathbb{F}_2$,''
+\emph{arXiv:2505.23819v3}, Oct.~2025.
+\url{https://arxiv.org/html/2505.23819v3}
+
+\bibitem{SEED_2}
+S.~Bhaskaracharya, N.~Acharya, M.~Hagedorn,
+and S.~Grover,
+``Modeling Layout Abstractions Using Integer Set
+Relations,''
+\emph{arXiv:2511.10374v1}, Nov.~2025.
+\url{https://arxiv.org/html/2511.10374v1}
+
+\bibitem{SEED_3}
+Z.~Zhu, J.~Pan, and Y.~Ding,
+``Sawtooth Wavefront Reordering: Enhanced CuTile
+FlashAttention on NVIDIA GB10,''
+\emph{arXiv:2601.16032v2}, Jan.~2026.
+\url{https://arxiv.org/html/2601.16032v2}
+
+\bibitem{SEED_4}
+R.~Carlisle, A.~Shah, H.~Stern, and
+D.~VanKoughnett,
+``Categorical Foundations for CuTe Layouts,''
+\emph{arXiv:2601.05972v1}, Jan.~2026.
+\url{https://arxiv.org/pdf/2601.05972v1}
+
+\end{thebibliography}
+
+\end{document}

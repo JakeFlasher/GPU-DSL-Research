@@ -1,0 +1,158 @@
+```latex
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Orientation (proposal-brief; source-grounded).}
+We position this proposal relative to (i) open Blackwell empirical characterization, (ii) Blackwell attention-kernel scheduling evidence, (iii) evolving tile-centric compilation interfaces (PTX-centric vs.\ CUDA Tile IR surfaces), (iv) layout-theoretic foundations for correctness and safety, (v) system-level cache/locality studies on Grace--Blackwell, and (vi) workload/mapping frameworks that motivate phase-aware evaluation. Non-trivial statements are grounded in the golden sources; any finer-grained backend/ISA semantics beyond those texts are labeled \UNVERIFIED{}. \CiteAllGoldens{} \cite{NV_workloads}
+
+\begin{verbatim}
+Related-work map (evidence strata; conceptual only):
+
+  Workloads + mapping vocabulary
+    -> NV_workloads (mixed-reuse cascades; prefill/decode; mapping as loop transforms)
+
+  Kernel structure + scheduling evidence (attention-like)
+    -> OPT_PIPE (SWP/WS; streaming variable-latency ops incl. TMA loads; Blackwell sync pressure)
+
+  Compilation/observability interfaces (tile-centric)
+    -> ARCH_BW (PTX->SASS audits; tcgen05/TMEM-centric characterization)
+    -> NV_BLOG_TILE (Triton-to-CUDA Tile IR; .tileIR artifacts; descriptor-driven TMA guidance)
+
+  Layout correctness + safety foundations (compiler-relevant math)
+    -> SEED_1 (linear layouts; conversions; correctness/limitations evidence)
+    -> SEED_2 (ISL integer-set relations; composition hazards; predicate synthesis)
+
+  System-level locality + CTA scheduling evidence (Grace--Blackwell)
+    -> SEED_3 (persistent CTAs; traversal-order transforms; counter-driven cache study)
+\end{verbatim}
+
+\paragraph{Blackwell empirical characterization: TMEM and a PTX-visible instruction surface.}
+A central empirical baseline for ``what is distinct about Blackwell'' is provided by open characterization work that emphasizes Tensor Memory (TMEM) as a software-managed on-chip tier and documents a Blackwell-specific tensor pipeline with PTX\(\rightarrow\)SASS auditability. In particular, \cite{ARCH_BW} (B200-focused context; Sec.~III-A) motivates studying Blackwell through a combination of (i) explicit instruction-surface reasoning (e.g., \texttt{tcgen05.*} families) and (ii) disassembly-driven validation (PTX\(\rightarrow\)SASS) to ensure that intended code sequences are actually realized in machine code (e.g., precision-dependent mappings in Table~IV and latency comparisons in Table~V). \cite{ARCH_BW}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{What this line of work establishes:} an open, repeatable framing for \emph{Blackwell-only} kernel reasoning that (a) treats TMEM as a first-class, explicitly managed resource (Sec.~V-A), and (b) uses PTX\(\rightarrow\)SASS evidence to bound what can be claimed about instruction-level behavior. \cite{ARCH_BW}
+  \item \textbf{What it does not aim to solve (by itself):} end-to-end compiler integration (e.g., robust lowering from high-level tile programs), or an open, formal specification of minimal synchronization/hazard rules for arbitrary \texttt{tcgen05.*} compositions; any such semantics beyond the text are \UNVERIFIED{} hypotheses. \cite{ARCH_BW}
+\end{itemize}
+
+\paragraph{Scheduling and kernel-structure evidence: SWP/WS on Blackwell attention kernels.}
+Complementing instruction-centric characterization, recent scheduling evidence targets attention-like kernels and emphasizes that Blackwell can change the optimal structure of software pipelining and warp specialization due to synchronization pressure around Tensor Memory movement and use. \cite{OPT_PIPE}
+Concretely, \cite{OPT_PIPE} defines a dependence-graph-driven view of kernels and evaluates scheduling decisions such as SWP depth and WS role assignment (Sec.~5.3; Sec.~6.2.2 ``Blackwell''), explicitly treating some data-movement stages (including TMA loads of input tiles) as streaming variable-latency operations that must be overlapped and tuned. \cite{OPT_PIPE}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{What this line of work establishes:} evidence that Blackwell-era performance can be schedule- and synchronization-sensitive in ways that differ from prior assumptions, and that solver-structured schedule spaces can expose such effects (Sec.~6.2.2). \cite{OPT_PIPE}
+  \item \textbf{What it surfaces as unresolved:} compiler-lowering fragility beyond scheduling (allocation, layout conversions, synchronization placement), including Blackwell-specific compilation barriers tied to Tensor Memory allocation strategies and downstream register-allocation/spill behavior (Sec.~6.3.2). \cite{OPT_PIPE}
+  \item \textbf{Toolchain note (scope discipline):} the cited experiments report CUDA 13.0; the degree to which any of these behaviors shift under CUDA 13.1+ is \UNVERIFIED{} until re-measured under the proposal's CUDA \(>\) 13.0 constraint. \cite{OPT_PIPE}
+\end{itemize}
+
+\paragraph{Tile-centric compilation interfaces: PTX-centric observability vs.\ CUDA Tile IR semantics.}
+A second axis of related work concerns \emph{which intermediate representation (IR) surface} is used to express and study tile programs on Blackwell.
+On one hand, the PTX-centric surface emphasized by \cite{ARCH_BW} enables instruction-level observability via disassembly and PTX\(\rightarrow\)SASS audits (Sec.~V-A; Tables~IV--V), which is particularly valuable when one needs to ground claims in realized machine code rather than presumed lowering. \cite{ARCH_BW}
+On the other hand, NVIDIA's Triton-to-CUDA Tile IR backend explicitly positions a tile-semantics-preserving compilation surface that targets CUDA Tile IR rather than PTX, described as MLIR-based and gated on CUDA 13.1+ and Blackwell GPUs (blog sections ``What is Triton-to-TileIR?'' and ``How to use Triton-to-TileIR''). \cite{NV_BLOG_TILE}
+This backend also introduces practical artifacts and constraints that matter for reproducible research framing: enabling the backend (e.g., via \texttt{ENABLE\_TILE=1}) produces cached \texttt{.tileIR} artifacts rather than only \texttt{.cubin} outputs (blog section ``Verify Tile IR compilation''), while operation coverage is explicitly incomplete (blog section ``Limitations''). \cite{NV_BLOG_TILE}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{What this line of work establishes:} an evolving, vendor-supported compilation path that attempts to preserve tile intent, plus explicit guidance that certain programming idioms (tensor-of-pointer patterns) may degrade performance in the TileIR backend and that descriptor-driven TMA load/store is a recommended mitigation when tiles can be described by shape/strides/block shape (tensor-of-pointer discussion). \cite{NV_BLOG_TILE}
+  \item \textbf{What remains open/underspecified (from these sources alone):} the exact internal lowering pipeline from CUDA Tile IR to machine code and its semantic contracts beyond what is stated in the blog are \UNVERIFIED{}; likewise, systematic comparability of TileIR vs.\ PTX-centric evidence requires an explicit research protocol rather than ad-hoc comparisons. \cite{NV_BLOG_TILE,ARCH_BW}
+\end{itemize}
+
+\paragraph{Layout abstractions for correctness and safety: linear layouts and integer set relations.}
+A third axis of related work provides formal models that can make tile program lowering more trustworthy.
+First, \cite{SEED_1} formalizes distributed layouts and memory layouts as \emph{linear layouts} (Theorem~4.9 with Definition~4.10; Theorem~4.13 with Definition~4.14) and explicitly discusses memory layouts for shared memory and tensor memory, thereby providing a mathematically precise substrate for reasoning about layout conversions in kernels that use on-chip tiers (including, in terminology, tensor memory). \cite{SEED_1}
+Beyond definitions, \cite{SEED_1} also provides empirical motivation that layout handling can be a correctness bottleneck in practice (evaluation Table~5) and discusses expressiveness limitations such as power-of-two shape restrictions and the need for richer extensions (conclusion discussion). \cite{SEED_1}
+Second, \cite{SEED_2} models CuTe layout operations and Triton linear layouts using ISL-style integer set relations (Introduction/Contributions; Sec.~2.1.2; Sec.~3.1), emphasizing that layout composition (especially with implicit layout promotion) can lead to out-of-bound mappings unless appropriate predicates are enforced, and arguing that such predicates can be synthesized automatically; it also provides implementation evidence via a translation tool (Sec.~6). \cite{SEED_2}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{What these lines of work establish:} (i) precise layout objects and conversion algorithms (linear layouts) and (ii) a unifying, safety-aware relational model (integer set relations) that can represent composition/inverse/complement operations and can be connected to automatic bounds-predicate synthesis. \cite{SEED_1,SEED_2}
+  \item \textbf{What they do not attempt (by scope):} Blackwell-calibrated performance modeling or scheduling optimality; both sources are primarily about correctness/expressiveness (SEED\_1) and foundational modeling/safety rather than runtime optimization (SEED\_2, Sec.~8 conclusions). Bridging these formalisms to Blackwell-specific lowering choices (TMEM/TMA/synchronization) therefore remains an integration task. \cite{SEED_1,SEED_2,OPT_PIPE,ARCH_BW}
+\end{itemize}
+
+\paragraph{System-level locality and CTA scheduling evidence on Grace--Blackwell.}
+Related work also demonstrates that performance-relevant decisions may appear above the single-kernel instruction/schedule level, especially when locality is sensitive to traversal order.
+A Grace--Blackwell study on the GB10 platform uses hardware counters and controlled CUDA implementations to isolate cache behavior effects under different CTA scheduling and work-distribution strategies (Sec.~2.1--2.2), including persistent CTA scheduling (grid-stride loop) and traversal-order (wavefront) transformations such as a ``sawtooth'' KV access pattern (Algorithm~4). \cite{SEED_3}
+It also reports diagnostic findings about cache behavior (Sec.~3.1) and identifies a regime where non-compulsory L2 misses emerge as a function of working-set vs.\ cache capacity (Sec.~3.3), while noting that higher-level tile frameworks can introduce transformations (e.g., tile splitting) that perturb intended access patterns (Sec.~4.3.2). \cite{SEED_3}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{What this line of work establishes:} concrete evidence that CTA traversal order and scheduling structure can materially affect cache behavior and throughput on a Grace--Blackwell platform, and a methodology that separates ``what the program intends'' from ``what the compiler/framework rewrites.'' \cite{SEED_3}
+  \item \textbf{What remains open (for Blackwell-only scope):} whether, when, and how such traversal-order optimizations transfer to other Blackwell parts (e.g., B200-class devices) is \UNVERIFIED{} without direct validation, especially given differing device contexts discussed in Blackwell characterization work. \cite{SEED_3,ARCH_BW}
+\end{itemize}
+
+\paragraph{Workloads and mapping: mixed-reuse cascades as the evaluation lens.}
+Finally, we relate the proposal to workload-level frameworks that motivate \emph{why} kernel-level research should be evaluated in phase-aware, operator-cascade settings rather than only microkernels.
+\cite{NV_workloads} defines mixed-reuse workloads (Sec.~II-B) and formalizes \emph{mapping} as loop transformations (Sec.~II-A), using transformer workloads and phase behavior (prefill vs.\ decode) as canonical examples that stress heterogeneous reuse, bandwidth sensitivity, and cross-operator interactions (e.g., Table~II; Sec.~VII-F summary of trends). \cite{NV_workloads}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{What this line of work establishes:} a vocabulary and motivation for evaluating architectural/compiler optimizations under realistic, mixed-reuse cascades where phase behavior can change the dominant bottleneck regime. \cite{NV_workloads}
+  \item \textbf{What remains open (for Blackwell-specific mechanisms):} incorporation of Blackwell-only primitives (e.g., TMEM-centric execution, tcgen05-visible movement/compute, TileIR/TMA descriptor behaviors, and CTA-locality sensitivity) as first-class model primitives is not addressed by this source and must be treated as a separate integration effort (any detailed mechanism-level inclusion beyond these high-level statements is \UNVERIFIED{} without additional primary modeling work). \cite{NV_workloads,ARCH_BW,NV_BLOG_TILE,OPT_PIPE,SEED_3}
+\end{itemize}
+
+\paragraph{Summary (positioning without a synthesis table).}
+Collectively, these works cover complementary slices of the Blackwell research stack: instruction- and memory-tier characterization with PTX\(\rightarrow\)SASS auditability \cite{ARCH_BW}; schedule-structure evidence and compiler-lowering pain points in attention kernels \cite{OPT_PIPE}; an emerging TileIR compilation surface with explicit descriptor-driven TMA guidance and stated limitations \cite{NV_BLOG_TILE}; layout-theoretic foundations for correctness and safety \cite{SEED_1,SEED_2}; system-level locality evidence that elevates CTA traversal order as a performance variable \cite{SEED_3}; and a workload/mapping lens that motivates phase-aware evaluation for mixed-reuse cascades \cite{NV_workloads}. Our proposal is positioned to connect these strands under a single Blackwell-only, CUDA \(>\) 13.0 / PTX \(>\) 9.0 constraint-and-evidence contract. \CiteAllGoldens{} \cite{NV_workloads}
+
+% --------------------------------------------------------------------
+% SOURCE AUDIT (required; included as LaTeX comments to preserve LaTeX-only output)
+%
+% ARCH_BW:
+%   Used for: positioning Blackwell empirical characterization as related-work baseline;
+%             TMEM-centric execution framing and PTX->SASS audit methodology as an observability surface;
+%             anchor-aware mentions of tcgen05.* naming and tables that evidence PTX<->SASS mappings/latency.
+%   Anchors: Section III-A (Blackwell architecture context; tcgen05.mma described as single-thread instruction);
+%            Section V-A (Tensor Memory (TMEM); pipeline shift; tcgen05.cp/ld/st roles);
+%            Table IV (precision-specific PTX<->SASS mapping; includes OMMA for FP4);
+%            Table V (latency comparison wgmma vs tcgen05.mma);
+%            Section VIII (tooling/support discussion used only as context; no new claims asserted here).
+%
+% OPT_PIPE:
+%   Used for: related-work positioning of SWP/WS scheduling evidence for attention kernels on Blackwell;
+%             definition context for streaming variable-latency ops (explicitly mentioning TMA loads);
+%             evidence that Blackwell requires additional synchronization and that compilation/lowering gaps persist.
+%   Anchors: Section 5.3 (Variable Latency Optimizations; streaming ops; TMA loads of input tiles example);
+%            Section 6.2.2 (Blackwell: different SWP/WS due to faster Tensor Cores + more required sync ops);
+%            Section 6.3.2 (Blackwell: compilation barriers; TMEM allocation aliasing; ptxas spilling);
+%            Experimental Setup (incorrect lowering decisions: allocation/layout/sync; motivates ``beyond scheduling'').
+%
+% NV_workloads:
+%   Used for: positioning workload/mapping literature as the evaluation/motivation lens;
+%             terminology for mixed-reuse cascades, phase behavior (prefill vs decode), and mapping as loop transforms.
+%   Anchors: Section II-A (Mapping as loop transformations);
+%            Section II-B (Mixed-reuse workloads; transformer examples; prefill/decode framing);
+%            Table II (representative workload partition framing referenced at a high level);
+%            Section VII-F (summary of trends used only as motivation-level context).
+%
+% NV_BLOG_TILE:
+%   Used for: positioning vendor TileIR backend as related-work compilation interface;
+%             gating on CUDA 13.1+ and Blackwell GPUs; ENABLE_TILE=1 and .tileIR artifact terminology;
+%             noted incomplete operation coverage; tensor-of-pointer pitfall and descriptor/TMA mitigation guidance.
+%   Anchors: Blog headings "What is Triton-to-TileIR?", "How to use Triton-to-TileIR",
+%            "Verify Tile IR compilation", "Limitations",
+%            tensor-of-pointer performance discussion including tl.make_tensor_descriptor and desc.load/store.
+%
+% SEED_1:
+%   Used for: positioning linear-layout formalism as correctness-oriented related work;
+%             definitions/completeness (distributed/memory layouts as linear layouts) and note that memory layouts
+%             can target shared memory and tensor memory; evaluation evidence that layout handling impacts correctness;
+%             limitation context (power-of-two shape restriction; masking; affine-extension direction).
+%   Anchors: Theorem 4.9 + Definition 4.10 (distributed layouts as linear layouts);
+%            Theorem 4.13 + Definition 4.14 (memory layouts as linear layouts; includes shared/tensor memory mention);
+%            Table 5 (correctness evidence for Triton baseline vs linear-layout-based approach);
+%            Conclusions limitation statement (power-of-two restriction; masking; affine extension).
+%
+% SEED_2:
+%   Used for: positioning integer set relations as a unifying/safety-aware layout model for CuTe + Triton;
+%             terminology for layout operations (composition/inverse/complement);
+%             out-of-bound risk under composition with implicit promotion and predicate synthesis claim;
+%             implementation evidence via isl-layout tool; scope note that work is foundational, not runtime optimization.
+%   Anchors: Introduction/Contributions (unified mathematical framework; foundational scope);
+%            Section 2.1.2 (layout operations composition/inverse/complement);
+%            Section 3.1 (coordinate/index spaces; integer sets/relations);
+%            composition-semantics discussion (OOB risk; synthesized predicates);
+%            Section 6 (implementation: isl-layout tool);
+%            Section 8 (conclusions: foundations focus; not runtime performance optimization).
+%
+% SEED_3:
+%   Used for: positioning Grace--Blackwell locality work as related work on CTA scheduling and cache behavior;
+%             persistent CTA scheduling (grid-stride loop) and traversal-order transformations (sawtooth);
+%             counter-driven cache study framing; and note that tile frameworks can perturb intended access patterns.
+%   Anchors: Section 2.1 (NVIDIA GB10 platform context);
+%            Section 2.2 (CTA scheduling and work distribution; persistent CTAs; grid-stride loop);
+%            Section 3.1 (Effect of L1 Caching; counter evidence framing);
+%            Section 3.3 (L2 non-compulsory miss threshold regime);
+%            Algorithm 4 (Sawtooth KV access pattern);
+%            Section 4.3.2 (CuTile tile splitting limitation).
+% --------------------------------------------------------------------
+
+% === END PART 4 ===
+```

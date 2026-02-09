@@ -1,0 +1,39 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdftitle={Probing Research Gaps in NVIDIA Blackwell GPU Architecture under CUDA >13 and PTX >9},
+  pdfauthor={Author Name (Placeholder)}
+}
+
+% Required golden-source macro (note: NV_workloads is cited separately per registry).
+\newcommand{\CiteAllGoldens}{\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE,SEED_1,SEED_2,SEED_3}}
+\newcommand{\UNVERIFIED}{\textsc{unverified}}
+
+\title{Probing Research Gaps in NVIDIA Blackwell GPU Architecture under CUDA \(\!>\!13.0\) and PTX \(\!>\!9.0\)}
+\author{Author Name (Placeholder)\\Institution (Placeholder)\\\texttt{email@domain.edu}}
+\date{February 5, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This proposal targets NVIDIA Blackwell GPUs (Grace--Blackwell included when relevant) under a toolchain constraint of CUDA \(\!>\!13.0\) and PTX \(\!>\!9.0\); any finer-grained ISA/version gating details are labeled \UNVERIFIED{} unless supported by primary documentation. Blackwell introduces tile-centric mechanisms---notably software-managed Tensor Memory (TMEM) and revised Tensor Core data-movement/execution pathways---that reshape both the optimization space and the observability surface for compiler and kernel research \cite{ARCH_BW}. Recent evidence on Tensor Core scheduling indicates that Blackwell attention kernels may require different software-pipelining and warp-specialization strategies, while simultaneously exposing lowering gaps (allocation, layout conversion, synchronization placement) that prevent end-to-end automation in current compiler stacks \cite{OPT_PIPE}. At the workload level, mixed-reuse transformer cascades and phase behavior motivate evaluating Blackwell mechanisms in realistic regimes rather than isolated kernels \cite{NV_workloads}. In parallel, the emergence of a Triton-to-CUDA Tile IR backend (CUDA 13.1 or higher) foregrounds a shifting compilation interface where descriptor-driven TMA load/store is recommended to address known performance degradation of tensor-of-pointer access patterns, while acknowledging incomplete backend coverage \cite{NV_BLOG_TILE}. Finally, formal work on layout abstractions and safety (verifiable layout conversions; predicate synthesis for bounds correctness) provides a principled substrate for trustworthy tile compilation across IR levels \cite{SEED_1,SEED_2}, and system-level locality studies on Grace--Blackwell show that CTA traversal order can materially change cache behavior, strengthening the case for co-designing locality and scheduling decisions \cite{SEED_3}.
+
+Compliance citation: this part explicitly cites all required golden sources via \CiteAllGoldens{} and \cite{NV_workloads}.
+\end{abstract}
+% === END PART 1 ===

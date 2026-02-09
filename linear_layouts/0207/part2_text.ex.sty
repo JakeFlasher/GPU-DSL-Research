@@ -1,0 +1,241 @@
+\section{Unified Model Blueprint: Blackwell-Aware Tile Semantics (BATS)}
+\label{sec:part2:bats_blueprint}
+
+\CiteAllGoldens
+
+\subsection{Model goal and design drivers (Blackwell-only)}
+\label{sec:part2:drivers}
+
+We define a unified, \emph{theory-first} semantic model for \emph{tile-centric} GPU kernels on NVIDIA Blackwell (including Grace--Blackwell when relevant), targeting toolchains with CUDA \(> 13.0\) (prefer \(13.1+\)) and PTX \(> 9.0\) (strict). The model is explicitly motivated by: (i) Blackwell-specific architectural features and instruction families that introduce new on-chip tensor memory and tensor-core execution pathways, which must be treated as first-class semantic objects \cite{ARCH_BW}; (ii) solver-ready scheduling formulations that expose feasibility boundaries via dependence, memory/liveness, synchronization, and warp-specialization constraints \cite{OPT_PIPE}; (iii) descriptor-driven tile data movement in the CUDA Tile IR backend, including stated limitations that affect which memory-access representations should be modeled as primary rather than as baseline fallbacks \cite{NV_BLOG_TILE}; (iv) workload structure in modern ML and mixed-reuse cascades, where mapping choices (tiling, parallelization, ordering) dominate performance and interact with bandwidth/overlap constraints, motivating a \emph{compositional} model rather than a single-kernel microbenchmark model \cite{NV_workloads}; and (v) cache-traffic and scheduling-level locality considerations that can be modeled and validated against counters at the level of predicted sector accesses and traversal order \cite{SEED_3}.
+
+\paragraph{Version-gating caveat (toolchain compliance).}
+Some golden sources describe experiments under CUDA \(13.0\) \cite{OPT_PIPE,ARCH_BW}, while the Tile IR backend prerequisites require CUDA \(13.1+\) and Blackwell GPUs \cite{NV_BLOG_TILE}. Additionally, none of the golden sources, as summarized in the provided context pack, explicitly proves that Blackwell-specific PTX features used in these works require (or are guaranteed compatible with) PTX \(> 9.0\); therefore, \textbf{UNVERIFIED}: the exact PTX-version requirements for specific Blackwell PTX instruction families and for any descriptor/TMA path. This blueprint therefore treats \((\text{CUDA},\text{PTX})\) as an \emph{explicit model parameter} that is part of the instantiation contract rather than an implicit assumption \cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}.
+
+\subsection{Three semantic layers and their interfaces}
+\label{sec:part2:three_layers}
+
+BATS is organized as three coupled layers:
+\[
+\textbf{Hardware (PTX/SASS)} \;\longleftrightarrow\; \textbf{Layout (CuTe/Linear/Relations)} \;\longleftrightarrow\; \textbf{Logical (Tensor)}.
+\]
+The intent is to make each interface \emph{explicitly checkable} by invariants and proof obligations, rather than relying on engineering intuition.
+
+\subsubsection{Logical layer: tensors, tiles, and program meaning}
+\label{sec:part2:logical_layer}
+
+\paragraph{Tensor domains.}
+A logical tensor \(X\) is modeled as a function on an index set:
+\[
+X : \mathcal{I}_X \to \mathcal{V},
+\]
+where \(\mathcal{I}_X \subseteq \mathbb{Z}^{d_X}\) is a finite, rectangular index domain (typically a product of integer intervals) and \(\mathcal{V}\) is a value set (e.g., floating-point, integer, packed formats). BATS does not assume a specific dtype semantics beyond what is required to state that reads/writes are well-defined; any microarchitectural dtype claims (e.g., FP6 tooling status) are treated as external constraints when sourced \cite{ARCH_BW}.
+
+\paragraph{Tile extraction.}
+For any tensor \(X\), a \emph{tile} is specified by a finite subset \(\mathcal{T} \subseteq \mathcal{I}_X\) together with an ordering (e.g., lexicographic) used only to define deterministic serialization when needed. We write \(X|_{\mathcal{T}}\) for the restriction.
+
+\paragraph{Program semantics as dependence-respecting transformations.}
+We model a kernel (or a kernel stage) as a dependence-structured computation over tiles, compatible with a dependence-graph view used in modulo scheduling \cite{OPT_PIPE}. At this layer, a program \(P\) denotes a partial function (or relation, if nondeterminism is modeled) on logical tensors:
+\[
+\llbracket P \rrbracket_{\mathrm{log}} : \prod_{k} \mathcal{X}^{\mathrm{in}}_k \to \prod_{\ell} \mathcal{X}^{\mathrm{out}}_\ell.
+\]
+The need for compositionality across \emph{mixed-reuse cascades} (some stages compute-heavy, some memory-heavy, with dependencies limiting overlap) motivates treating \(P\) as a composition of stages whose mappings can be optimized jointly rather than in isolation \cite{NV_workloads}.
+
+\subsubsection{Layout layer: a unified representation space}
+\label{sec:part2:layout_layer}
+
+The layout layer provides a \emph{mathematical bridge} from logical indices to physical locations, designed to support (i) algebraic reasoning (composition, inversion, divisibility), (ii) solver embedding, and (iii) compatibility with descriptor-based tile movement.
+
+\paragraph{Canonical layout object as an integer-set relation.}
+A layout is represented as an integer-set relation (in the sense of ISL-style relations) between a logical coordinate space and a physical coordinate space \cite{SEED_2}:
+\[
+L_X \;\subseteq\; \mathcal{I}_X \times \mathcal{P}_X,
+\]
+where \(\mathcal{P}_X\) is a physical location space (e.g., linear offsets, \((\text{segment},\text{offset})\) pairs, or other structured coordinates). We write \((i,p)\in L_X\) to mean that logical index \(i\) is stored at physical location \(p\). The layout is:
+\begin{itemize}
+  \item \emph{functional} if for every \(i\in \mathcal{I}_X\) there exists a unique \(p\) with \((i,p)\in L_X\);
+  \item \emph{injective} if \((i,p)\in L_X\) and \((i',p)\in L_X\) implies \(i=i'\);
+  \item \emph{bijective onto its range} if it is functional and injective (a typical correctness requirement for a non-aliasing tensor view).
+\end{itemize}
+These properties are checkable in principle using relation operations (domain/range, inverse, difference) emphasized in the relation-based unification approach \cite{SEED_2}.
+
+\paragraph{\(\mathbb{F}_2\)-linear sublanguage (linear layouts).}
+For power-of-two shapes and bit-structured coordinate spaces, we additionally admit the linear-layout formalism: layouts as linear maps between labeled vector spaces over \(\mathbb{F}_2\) \cite{SEED_1}. Concretely, for a bit-vector representation of indices and offsets, a linear layout is a matrix \(M\) over \(\mathbb{F}_2\) inducing a mapping
+\[
+\ell_M : \mathbb{F}_2^{n} \to \mathbb{F}_2^{m}.
+\]
+This sublanguage is valuable because it provides strong closure and algebraic operators (composition, product, divisions, right inverses) and bank-conflict reasoning as linear-algebraic invariants \cite{SEED_1}. The power-of-two restriction is explicit and therefore becomes a \emph{typed precondition} of any proof obligation that uses \(\mathbb{F}_2\)-linearity \cite{SEED_1,SEED_2}.
+
+\paragraph{Equivalence of representations (interface invariant).}
+BATS treats the relation representation as the \emph{ambient} language, and \(\mathbb{F}_2\)-linear layouts as a decidable sublanguage. We posit an embedding (as an interface specification, not an assumed theorem in this document):
+\[
+\Phi : \{\text{\(\mathbb{F}_2\)-linear layouts}\} \to \{\text{integer-set relations}\},
+\]
+intended to realize the ``linear layout \(\leftrightarrow\) integer relation'' bridge discussed in the unification work \cite{SEED_2}, while preserving the algebraic meaning of linear-layout operators \cite{SEED_1}. The correctness of \(\Phi\) is a proof obligation (Table~\ref{tab:part2:invariants_obligations}).
+
+\subsubsection{Hardware layer: Blackwell PTX/SASS as abstract transitions}
+\label{sec:part2:hardware_layer}
+
+\paragraph{Machine state.}
+Let \(\mathcal{S}_{BW}\) be an abstract set of Blackwell machine states, including (at minimum) architectural registers, predicate state, and named memory segments. We deliberately do not fix cache sizes, bank counts, or undocumented datapaths in \(\mathcal{S}_{BW}\); such details are introduced only when supported by evidence \cite{ARCH_BW,SEED_3}.
+
+\paragraph{Instruction semantics as relations.}
+Each relevant hardware instruction or instruction sequence is modeled as a transition relation
+\[
+\Rightarrow_{i} \;\subseteq\; \mathcal{S}_{BW} \times \mathcal{S}_{BW}.
+\]
+BATS focuses on the instruction families implicated by the golden sources:
+\begin{itemize}
+  \item Blackwell tensor-memory and tensor-core pathways, including TMEM as a dedicated on-chip memory tier for tensor-core operations and a Blackwell-specific PTX instruction family for tensor-core compute and related movement \cite{ARCH_BW};
+  \item descriptor-driven tile load/store interfaces used by the Tile IR backend, described at the API/IR boundary via tensor descriptors and ``TMA load/store'' calls \cite{NV_BLOG_TILE};
+  \item synchronization and warp-specialization constraints that must hold for any such instruction schedule to be feasible, as captured via constraint templates in a solver-oriented scheduler \cite{OPT_PIPE}.
+\end{itemize}
+
+\paragraph{Blackwell-specific hardware objects (as parameters with evidence).}
+We treat TMEM as a named memory segment \(\mathrm{tmem}\) that exists per SM, with size and addressing constraints supported by empirical characterization \cite{ARCH_BW}. We treat the existence of a Blackwell PTX instruction family for TMEM data movement and tensor-core MMA as evidence-backed, while leaving exact PTX version gating \textbf{UNVERIFIED} absent primary toolchain documentation \cite{ARCH_BW}.
+
+\subsection{Bridging maps: meaning preservation across layers}
+\label{sec:part2:bridging_maps}
+
+\subsubsection{Concretization: from logical tensors to bytes under a layout}
+\label{sec:part2:concretization}
+
+For each tensor \(X\) and chosen layout \(L_X\), define a concretization operator
+\[
+\gamma_{L_X} : X \mapsto \mathrm{MemImage}(X,L_X),
+\]
+where \(\mathrm{MemImage}(X,L_X)\) is a partial function from physical locations \(\mathcal{P}_X\) to values \(\mathcal{V}\), given by:
+\[
+\mathrm{MemImage}(X,L_X)(p) \;=\; X(i) \quad \text{whenever } (i,p)\in L_X,
+\]
+and undefined outside the range of \(L_X\). If \(L_X\) is bijective onto its range, then \(\gamma_{L_X}\) is well-defined and non-aliasing.
+
+\subsubsection{Descriptorization: a layout witness for tile movement}
+\label{sec:part2:descriptorization}
+
+The Tile IR backend introduces a \emph{tensor descriptor} object parameterized by base pointer, shape, strides, and block shape, used to express tile load/store without materializing a tensor-of-pointers \cite{NV_BLOG_TILE}. We model a descriptor as an abstract tuple:
+\[
+D \;=\; (\mathrm{base}, \mathrm{shape}, \mathrm{strides}, \mathrm{block\_shape}),
+\]
+together with a specification-level interpretation map:
+\[
+\mathrm{Rel}(D) \;\subseteq\; \mathcal{I}^{\mathrm{tile}} \times \mathcal{P},
+\]
+where \(\mathcal{I}^{\mathrm{tile}}\) is the tile-local logical index space (determined by \(\mathrm{block\_shape}\)) and \(\mathcal{P}\) is the physical location space addressed by the descriptor. The exact arithmetic of address calculation is treated as part of the API contract exposed by the backend and therefore anchored to the backend description rather than invented here \cite{NV_BLOG_TILE}.
+
+\paragraph{Semantics-preservation obligation for descriptor rewrites.}
+The backend notes that representing memory access as a tensor-of-pointers can be suboptimal on CUDA \(13.1\) Tile IR and suggests rewriting to descriptor-based access \cite{NV_BLOG_TILE}. In BATS, this is modeled as a semantic equivalence requirement:
+\[
+\text{(pointer-materialized access)} \;\equiv\; \text{(descriptor-driven access)}
+\]
+whenever \(\mathrm{Rel}(D)\) matches the intended layout relation \(L_X\) on the accessed tile. This becomes a checkable proof obligation at the layout--hardware interface (Table~\ref{tab:part2:invariants_obligations}).
+
+\subsubsection{Abstraction: from hardware executions back to layout relations}
+\label{sec:part2:abstraction}
+
+Given a hardware execution trace (or a symbolic description of memory effects), we define an abstraction operator that extracts the induced relation between logical indices and physical locations:
+\[
+\alpha : \{\text{hardware traces}\} \to \{\text{relations}\}.
+\]
+BATS requires that for any compiled kernel realization of a logical program \(P\) under chosen layouts, the extracted relation agrees with the specified layout relations on all program-observable loads/stores. This ``trace-to-relation'' interface aligns with the emphasis on verifying or reconstructing layouts from relational descriptions \cite{SEED_2} and with empirical PTX-to-SASS auditing as a methodology for ensuring the intended datapaths are exercised \cite{ARCH_BW}.
+
+\subsection{Commutative diagram: layout transforms vs Blackwell tile movement}
+\label{sec:part2:commutative_diagram}
+
+We now state the central commutativity principle that makes layout algebra meaningful for Blackwell: \emph{layout-level transformations must commute with their hardware realizations} (e.g., descriptor-driven bulk copy / tile transfer), up to the concretization map.
+
+\paragraph{Layout transform as relation composition.}
+Let \(\tau\) be a logical index-space transform (e.g., reshape/transpose/join/split/broadcast within the supported shape-operator closure family), modeled as a relation
+\[
+\tau \;\subseteq\; \mathcal{I}_{X'} \times \mathcal{I}_{X}.
+\]
+A transformed layout is defined by relation composition (where defined):
+\[
+L_{X'} \;:=\; L_X \circ \tau.
+\]
+This is the relation-level counterpart of the algebraic closure and composition operations emphasized for layout reasoning \cite{SEED_1,SEED_2}.
+
+\paragraph{Hardware realization as a tile-movement primitive.}
+Let \(\mathrm{Move}_{\tau}\) denote a (possibly multi-instruction) hardware primitive that realizes the movement of a tile between two buffers such that the logical effect corresponds to applying \(\tau\) in the layout layer. In practice, \(\mathrm{Move}_{\tau}\) may be instantiated via descriptor-based load/store (Tile IR ``TMA load/store'' interface) \cite{NV_BLOG_TILE} and/or by Blackwell TMEM-related movement instructions (treated abstractly here, with evidence of their existence and purpose) \cite{ARCH_BW}. We do not assume a particular instruction sequence; \(\mathrm{Move}_{\tau}\) is an abstract operator on machine states.
+
+\paragraph{ASCII commutative diagram (layout \(\leftrightarrow\) hardware).}
+\begin{verbatim}
+          (Logical tile view)                          (Physical realization)
+      X restricted to tile T  -- concretize γ_{L_X} -->   Mem image under L_X
+               |                                                |
+               |  logical transform τ                            |  hardware move Move_τ
+               v                                                v
+     (Logical tile view after τ) -- concretize γ_{L_{X'}} -->  Mem image under L_{X'}
+\end{verbatim}
+
+\paragraph{Commutativity axiom (semantic preservation of layout transforms).}
+For all tensors \(X\) and tile subsets \(\mathcal{T}\subseteq \mathcal{I}_X\) such that \(\tau\) is defined on \(\mathcal{T}\), BATS requires:
+\[
+\gamma_{L_{X'}}\!\bigl( X \circ \tau \bigr)
+\;=\;
+\mathrm{Move}_{\tau}\!\bigl( \gamma_{L_X}(X) \bigr),
+\]
+where equality is interpreted as equality of the induced physical-location-to-value mapping on the range locations touched by the tile transfer. This is the precise statement that ``layout algebra'' (SEED\(_1\), SEED\(_2\)) and ``tile movement'' (Tile IR descriptors, Blackwell memory pathways) compose into a coherent semantics \cite{SEED_1,SEED_2,NV_BLOG_TILE,ARCH_BW}.
+
+\subsection{Invariants and proof obligations (layout-first, Blackwell-adapted)}
+\label{sec:part2:invariants_proofs}
+
+Table~\ref{tab:part2:invariants_obligations} enumerates the core invariants and proof obligations that make BATS rigorous. Each item is derived from the layout formalisms of SEED\(_1\) and SEED\(_2\) and explicitly adapted to Blackwell by requiring compatibility with evidence-backed Blackwell memory/compute objects (e.g., TMEM; Blackwell PTX instruction families) and toolchain-facing descriptor interfaces \cite{SEED_1,SEED_2,ARCH_BW,NV_BLOG_TILE}.
+
+\begin{table}[t]
+\centering
+\caption{BATS invariants and proof obligations: SEED\(_1\)/SEED\(_2\)-derived, Blackwell-adapted.}
+\label{tab:part2:invariants_obligations}
+\begin{tabular}{|p{0.20\textwidth}|p{0.37\textwidth}|p{0.33\textwidth}|}
+\hline
+\textbf{Invariant (statement)} & \textbf{Meaning / source basis} & \textbf{Proof obligation (Blackwell adaptation)} \\
+\hline
+\textbf{I1: Functional, non-aliasing layout relation} &
+Layouts are relations \(L \subseteq \mathcal{I}\times\mathcal{P}\) intended to behave like total functions on \(\mathcal{I}\); relation operators (domain/range/inverse/composition) enable formal checks \cite{SEED_2}. &
+Show that every layout used for Blackwell tile movement (including descriptor-driven paths) denotes a functional, injective relation on each tile domain; otherwise, require explicit aliasing semantics. Tie the ``physical space'' \(\mathcal{P}\) to Blackwell segments (e.g., TMEM vs shared/global) without inventing segment geometry \cite{ARCH_BW,NV_BLOG_TILE}. \\
+\hline
+\textbf{I2: Closure of the layout family under shape operations} &
+SEED\(_1\) proves a closure/minimality property for a distributed-layout family under common tensor shape operations; SEED\(_2\) expresses such transformations as relation compositions/inverses with quasi-affine constructs \cite{SEED_1,SEED_2}. &
+For any Tile IR-admissible shape op in the targeted pipeline, encode it as a relation transform \(\tau\) and prove that \(L' = L \circ \tau\) remains in the representable family (linear-layout sublanguage when applicable, relation language otherwise). Confirm that this preserves meaning under Blackwell tile movement (commutativity in Section~\ref{sec:part2:commutative_diagram}) \cite{NV_BLOG_TILE,ARCH_BW}. \\
+\hline
+\textbf{I3: Equivalence of \(\mathbb{F}_2\)-linear and relation encodings} &
+Linear layouts over \(\mathbb{F}_2\) provide strong algebraic structure and bank-conflict modeling \cite{SEED_1}; SEED\(_2\) proposes representing such layouts as integer-set relations to unify with CuTe/ISL tooling \cite{SEED_2}. &
+Define and prove correctness of an embedding \(\Phi\) from linear layouts to relations for power-of-two domains, preserving composition/product/division operators. Blackwell adaptation: require that any TMEM/shared-memory layout constraints used in proofs are introduced only when supported by measurement or documentation; otherwise mark as \textbf{UNVERIFIED} parameters \cite{ARCH_BW,SEED_1,SEED_2}. \\
+\hline
+\textbf{I4: Swizzle bijectivity / involution (when claimed)} &
+SEED\(_2\) models CuTe-style swizzles as bijective bit manipulations representable as relations and described as involutions under stated conditions \cite{SEED_2}. &
+When swizzles are used to mitigate conflicts or improve locality, prove the swizzle relation is bijective on the addressed interval and (if required) involutive. Blackwell adaptation: connect the swizzle objective to Blackwell-relevant memory tiers (e.g., shared memory, TMEM) but treat bank/segment parameters as calibration inputs unless explicitly provided \cite{SEED_2,SEED_1,ARCH_BW}. \\
+\hline
+\textbf{I5: SIMD / instruction-tile applicability via algebraic divisibility} &
+SEED\(_1\) reduces applicability of a SIMD primitive to an algebraic condition (left division) between an instruction tile and a layout \cite{SEED_1}. &
+Instantiate the instruction-tile object for Blackwell tensor-core execution pathways (e.g., tcgen05 MMA operand layouts) \textbf{only} using evidence-backed constraints. Prove that selected layouts satisfy the divisibility/applicability condition for the targeted instruction subset; otherwise treat as \textbf{UNVERIFIED} and exclude from claims \cite{ARCH_BW,SEED_1}. \\
+\hline
+\textbf{I6: Descriptor--layout agreement (descriptorization correctness)} &
+NV\_BLOG\_TILE exposes descriptors \((\mathrm{base},\mathrm{shape},\mathrm{strides},\mathrm{block\_shape})\) as a primary way to express tile movement, and motivates rewrites away from tensor-of-pointers for performance \cite{NV_BLOG_TILE}. &
+Define \(\mathrm{Rel}(D)\) and prove \(\mathrm{Rel}(D)\) equals the intended layout relation \(L\) on the accessed tile region. Then prove that replacing pointer-materialized accesses by descriptor-driven load/store preserves logical semantics (commutativity with \(\gamma_L\)) \cite{NV_BLOG_TILE,SEED_2}. \\
+\hline
+\textbf{I7: ``Measured-parameter'' separation} &
+ARCH\_BW and SEED\(_3\) emphasize measurement-driven characterization and counter-validated models (TMEM/DE/tensor-core latency/bandwidth; sector-access modeling) \cite{ARCH_BW,SEED_3}. &
+Partition BATS into (i) symbolic invariants/proofs (layout correctness, commutativity) and (ii) numeric parameters (latencies, bandwidths, traffic coefficients) that are fitted/validated separately. Blackwell adaptation: explicitly scope parameters by SKU (e.g., B200 vs GB10) and by toolchain version \cite{ARCH_BW,SEED_3}. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Interfaces to scheduling and cache-traffic objectives (hooks, not methods)}
+\label{sec:part2:interfaces}
+
+Although Part~2 is a blueprint (not the solver-methods section), BATS must expose interfaces that connect layout and hardware semantics to optimization objectives.
+
+\paragraph{Scheduling interface (feasibility layer).}
+We treat the schedule as a constrained object over a dependence graph, where feasibility includes dependence satisfaction, resource and memory-capacity constraints via SSA-style liveness, synchronization constraints, and warp-specialization constraints \cite{OPT_PIPE}. BATS contributes: (i) layout-derived memory-footprint and communication objects (e.g., cross-warp transfers implied by a layout or by descriptorization choices), and (ii) layout-preservation obligations for any schedule-induced reordering that changes tile traversal order.
+
+\paragraph{Cache-traffic interface (predictive objective layer).}
+We include a cache-traffic semantics layer that maps a \emph{tile traversal order} and tile shapes to a predicted L2 sector-access count (or surrogate), following the sector-access modeling approach and counter-validation emphasis in the Grace--Blackwell locality study \cite{SEED_3}. At the blueprint level, this is a cost functional
+\[
+\mathrm{Cost}_{\mathrm{L2}}(P, \{L_X\}, \sigma, \theta),
+\]
+where \(\sigma\) is a schedule/traversal order and \(\theta\) is a parameter vector to be instantiated per device/toolchain; the key requirement is falsifiability against counters rather than heuristic tuning \cite{SEED_3}.
+
+\paragraph{Workload-compositionality interface (why the model is unified).}
+Finally, workload structure motivates treating \(P\) as a cascade of stages with distinct reuse and mapping sensitivities, rather than a single homogeneous kernel; BATS therefore defines all interfaces (layout, schedule, traffic) to be compositional under stage composition, aligned with mapping-centric workload taxonomies and mixed-reuse characterizations \cite{NV_workloads}.
+
+% === END PART 2 ===

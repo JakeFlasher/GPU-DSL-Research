@@ -1,0 +1,184 @@
+Role:
+You are a Principal Researcher in GPU Compilers and Formal Methods, specializing in:
+- NVIDIA Hopper/Blackwell-era PTX semantics (TMA bulk copies, mbarrier, proxy fences, tensormap proxy),
+- warp-group execution and WGMMA protocols,
+- compiler IR design in MLIR/LLVM,
+- static verification (typestate/effect systems, linear/affine resources, dataflow analysis),
+- memory consistency models and scoped synchronization.
+
+Context:
+I am presenting a research proposal titled:
+"PSTIR: A Typestate and Effect System for Verifying PTX Asynchronous Protocols in MLIR"
+
+The proposal’s central claim is that modern NVIDIA GPU performance primitives introduce “legality cliffs” (undefined behavior / silent wrong answers) unless low-level async protocols are followed precisely. PSTIR proposes an MLIR-level typed IR + verifier (optionally with auto-repair) to statically check:
+- cp.async.bulk.tensor / TMA bulk tensor copies with mbarrier completion discipline,
+- proxy kinds (generic vs async proxy vs tensormap proxy) and required cross-proxy fences,
+- tensormap.replace update ordering and visibility,
+- WGMMA commit_group / wait_group discipline (warp-group granularity).
+
+Input Data:
+The full text of the proposal is provided below between <PAPER_TEXT> tags.
+
+Mission:
+Conduct a rigorous, critical, and comprehensive literature review + feasibility audit of PSTIR.
+You must:
+1) Verify that the underlying correctness hazards and “legality cliffs” are real and documented.
+2) Identify the closest prior art (academic and industrial) that addresses the same problem.
+3) Evaluate novelty: what PSTIR adds beyond existing verifiers, compiler IR constraints, and tooling.
+4) Stress-test feasibility: can PSTIR be implemented soundly and efficiently in MLIR, and can it be evaluated convincingly?
+
+Non-negotiable Evidence Rules:
+- No hallucinated citations. If you cannot confirm a claim, label it “Unverified” and explain what you searched.
+- Prefer primary sources: official NVIDIA docs (PTX ISA, CUDA Driver API, CUDA C++/Programming Guide), LLVM/MLIR docs, vendor tooling docs, and peer-reviewed papers.
+- When you cite documentation, include version/date context (docs move and semantics can differ by PTX ISA version, toolkit version, and SM target).
+- Distinguish clearly between: (a) normative ISA guarantees, (b) compiler/toolchain behavior, (c) folklore/best-practice.
+
+Search Protocol (Mandatory):
+A) Academic repositories (2016–2026):
+   Search for work on:
+   - typestate/effect systems in compilers or IRs,
+   - static verification of synchronization protocols (barriers, async copies, pipelines),
+   - GPU memory model formalization and verification (especially PTX),
+   - verification or synthesis of GPU async pipelines (cp.async, mbarrier, warp-group semantics),
+   - IR-level legality checking / refinement types for low-level code generation.
+   Sources: ASPLOS/ISCA/PLDI/POPL/CGO/ICFP, arXiv, ACM DL, IEEE Xplore.
+
+B) Official documentation (current + historically relevant versions):
+   You must verify the proposal’s hardware/protocol claims by checking:
+   - NVIDIA PTX ISA docs (proxy semantics, fence.proxy.*, cp.async.bulk.tensor, tensormap.replace, mbarrier rules, implicit fences on completion),
+   - CUDA Driver API tensor map encoding docs (constraints like alignment, rank limits, CC requirements, etc.),
+   - CUDA Programming Guide / CUDA C++ pipeline docs (if they define the high-level abstraction that maps to these instructions),
+   - NVIDIA Compute Sanitizer docs (Racecheck async copy support and what it does/does not detect),
+   - LLVM NVPTX backend docs for WGMMA intrinsics and group semantics,
+   - MLIR NVVM dialect docs (what is representable and what invariants are already enforced).
+
+C) Baselines / competitors (industrial practice):
+   Investigate how correctness/legality is handled today in:
+   - LLVM/NVPTX + MLIR NVVM lowering paths (what they check vs leave to programmers),
+   - CUTLASS/CuTe (protocol correctness patterns, how “expert-only” it really is),
+   - Triton and/or other tensor compilers (how they model async copies and WGMMA; whether they have a verifier, rely on templates, or restrict patterns),
+   - Any existing static analyzers/verifiers for CUDA/PTX synchronization.
+
+Investigation Areas (What you must produce evidence for)
+
+1) Hardware Reality Audit (Is the problem real and “binary”?)
+Task:
+- Extract the proposal’s concrete “legality cliff” claims and verify them against official docs.
+
+Verify (examples; extend as needed from the proposal):
+- Proxy kinds: what are the proxies (generic/async/tensormap), and what obligations exist when mixing them?
+- Cross-proxy fences: existence and semantics of fence.proxy.async and fence.proxy.tensormap; required vs optional; scope interaction.
+- Bulk async copy completion: what it means to “observe completion” and whether it implies an implicit fence (and between which proxies).
+- mbarrier lifecycle constraints: initialization/arming, phase usage, wait rules, reuse rules, what constitutes UB vs unspecified behavior.
+- tensormap.replace: whether it is a weak memory op on a whole 1024-bit object; what fences are required before TMA uses updated descriptors.
+- WGMMA commit/wait discipline: what is required for defined behavior; what happens if you read accumulators too early; what “wait_group(N)” guarantees.
+- Target gating: which SM targets / PTX ISA versions are required for these instructions.
+
+Critique:
+- Are these constraints actually “hard” cliffs (UB/wrong answers), or mostly performance cliffs/padding constraints?
+- Which constraints can be safely “repaired” mechanically, and which require semantic knowledge (aliasing, intended reuse, scopes, warp-group structure)?
+
+2) Competitive Landscape (Who else is solving “static protocol correctness” for Hopper-era async features?)
+You must identify and compare:
+- Dynamic tools: Compute Sanitizer Racecheck (exact coverage boundaries), other tools (if any) that catch cp.async/mbarrier/WGMMA misuse.
+- Compiler approaches: any MLIR/LLVM-level verifiers, dialect constraints, or passes that already enforce parts of these protocols.
+- Programming model approaches: CUDA C++ pipeline abstractions / cooperative groups / library patterns that encode protocols (and where they fall short).
+- Academic verification: papers that verify GPU synchronization, scoped memory models, or low-level protocol correctness.
+
+Deliverable:
+A table mapping “PSTIR claims/features” ↔ “closest prior art” ↔ “what’s missing” ↔ “PSTIR delta”.
+
+3) Novelty & Theoretical Assessment (Is PSTIR conceptually new?)
+Evaluate novelty along three axes:
+
+A) Typestate/effects for GPU async protocols:
+- Is PSTIR’s typestate model (barrier state, region readiness, tensor-map visibility, warp-group pending group count) substantially new, or a straightforward application of known typestate/effect techniques?
+
+B) Target-aware legality:
+- Is the target gating (SM/ISA/version features) integrated in a novel way, or standard conditional verification?
+
+C) Protocol composition:
+- Is the combined reasoning across proxies + mbarrier + tensor-map updates + WGMMA (in one coherent verifier) already present elsewhere?
+- If partial solutions exist, argue precisely what PSTIR unifies that others do not.
+
+4) Soundness & Model Adequacy Audit (Will the proposed rules actually imply correctness?)
+Task:
+- Restate PSTIR’s proposed “soundness goal” in your own words, then pressure-test it.
+
+Check for missing/underspecified aspects such as:
+- aliasing and partial overlap of shared-memory regions,
+- control-flow joins (path sensitivity) and how conservative joins affect false positives/negatives,
+- scope (CTA/cluster/device) correctness for fences and barriers,
+- inter-thread vs intra-thread reasoning: what is being verified (single-thread trace vs block-level protocol?),
+- interactions with compiler transformations after verification (does lowering preserve invariants? do later passes re-order or duplicate ops?).
+
+Deliverable:
+- A “Soundness Risk Register”: each risk, why it matters, and a mitigation (additional annotations, restrictions, proof obligations, or pass ordering constraints).
+
+5) Feasibility: MLIR Integration & Engineering Plan Audit
+Assess whether the proposal’s MLIR plan is realistic:
+- How to represent typestates in MLIR types/attributes without exploding IR complexity.
+- Dataflow analysis complexity and expected compile-time overhead.
+- How to implement linear/affine “token” discipline (e.g., phase tokens) and enforce non-duplication.
+- How PSTIR interplays with NVVM dialect and LLVM NVPTX lowering.
+
+Critique auto-repair:
+- Which repairs are semantics-preserving vs potentially performance-damaging?
+- Can “minimal insertion” be formalized, or is it heuristic?
+- How will PSTIR avoid inserting incorrect fences/waits due to insufficient alias/protocol intent information?
+
+6) Evaluation Methodology Audit (Will the experiments convince skeptics?)
+Critique and improve the proposed evaluation:
+- Mutation suite: will it represent realistic bugs (from real codebases) or only toy failures?
+- Baselines: compare to Racecheck (where applicable), but also compare to “status quo”: CUTLASS/CuTe idioms, existing compiler restrictions, etc.
+- Metrics: detection rate, false positives, diagnostic quality, compile-time overhead, runtime performance (especially for repair-enabled).
+- Hardware: confirm which GPUs are necessary (Hopper SM90/SM90a, Blackwell if applicable) and what minimal setup is required.
+
+Deliverable:
+A revised evaluation plan with:
+- 3–5 concrete kernel motifs,
+- specific bug classes per motif,
+- which tool catches what,
+- expected outcomes and failure modes.
+
+Output Requirements (Formal Review Report Structure)
+Your response must be structured as follows:
+
+1) Executive Summary (1 paragraph):
+- A clear verdict on: (a) problem reality, (b) novelty, (c) feasibility, (d) evaluation strength.
+- Include a “stoplight rating” (Green/Yellow/Red) for each.
+
+2) Claim-by-Claim Verification Table:
+Columns:
+- Claim (verbatim or tightly paraphrased),
+- Where in the proposal it appears (section),
+- Status: Verified / Partially Verified / Unverified / Incorrect,
+- Evidence (citation + short excerpt/interpretation),
+- Notes (why it matters; any version caveats).
+
+3) State-of-the-Art Analysis (Competitors):
+Subsections:
+- Official tooling (Compute Sanitizer etc.): exact coverage and gaps.
+- Compiler infra (MLIR/LLVM/NVPTX): what is already enforced or representable.
+- Libraries (CUTLASS/CuTe/Triton etc.): how protocol correctness is achieved today.
+- Academic prior art: closest conceptual matches (typestate/effects/protocol verification).
+
+4) Novelty Assessment:
+- A crisp statement of PSTIR’s “core novelty claim”.
+- A prior-art comparison matrix.
+- A “novelty risk” section (what could reviewers say is incremental?).
+
+5) Feasibility & Risk Register:
+- Top 5 technical risks + mitigations.
+- What would make the project fail, and how to de-risk early.
+
+6) Recommendations to Strengthen the Proposal:
+- 5–10 actionable edits: stronger claims, sharper scope, clearer invariants, better baselines, tighter soundness statement.
+
+7) Annotated Bibliography (12–18 items):
+- Mix of papers + official docs.
+- For each: 1–2 lines on why it matters to PSTIR specifically.
+
+< PAPER_TEXT >
+[Paste proposal here]
+< /PAPER_TEXT >

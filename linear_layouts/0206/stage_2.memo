@@ -1,0 +1,353 @@
+```json
+{
+  "ResearchState": {
+    "Current_Thesis": "On Blackwell with CUDA 13.1+, Tile IR turns spilling/occupancy from an emergent PTXAS outcome into an explicitly-tunable design surface: the Triton→TileIR path exposes knobs (`occupancy`, `num_ctas`) and favors descriptorized TMA over tensor-of-pointers, so the right scientific object is the *spill-onset frontier* as a function of those knobs and tile shapes, validated with fail-closed provenance because the backend can fall back to PTX.",
+    "Key_Insights": [
+      "CUDA 13.1 introduces CUDA Tile (Tile IR + cuTile) and `tileiras` (Tile IR bytecode → SASS); the initial CUDA Tile release targets Blackwell GPUs. (CUDA 13.1 release notes).",
+      "Triton-to-TileIR is enabled with `ENABLE_TILE=1`, uses CUDA 13.1 features, and explicitly falls back to the NVIDIA PTX backend when a Tile IR compilation bug occurs—so any measurement must detect fallback per kernel. (Triton-to-tile-IR README).",
+      "Tile-backend performance tuning is currently dominated by two knobs: `occupancy` (1–32 active thread blocks per SM, default 1) and `num_ctas` (critical; `num_ctas=2` enables 2CTA mode MMA on Blackwell for dense dot workloads). `num_warps` is not exposed yet and large-reduction norm kernels may spill. (Triton-to-tile-IR README).",
+      "Nsight Compute 2025.4 provides (i) direct spill counters (`sass__inst_executed_register_spilling` and breakdowns) and (ii) launch/resource metrics that enable both provenance and occupancy attribution, including `launch__execution_model` (SIMT vs Tile), `launch__registers_per_thread`, and `launch__occupancy_limit_registers`. (NCU 2025.4 Profiling Guide).",
+      "NVIDIA calls out Triton’s tensor-of-pointers loads/stores as suboptimal on the CUDA 13.1 Tile IR backend and recommends rewriting to TMA via tensor descriptors (e.g., `tl.make_tensor_descriptor`) to avoid materializing per-element pointers in registers; Tile-backend cache artifacts use `.tileIR` extensions. (NVIDIA Tile IR + Triton blog)."
+    ],
+    "Evidence_Bank": {
+      "CUDA 13.1 introduces CUDA Tile and tileiras; targets Blackwell": [
+        "CUDA_RN"
+      ],
+      "`ENABLE_TILE=1` enables Tile IR backend; fallback-to-PTX; `occupancy` + `num_ctas` are critical; `num_warps` not exposed": [
+        "TRITON_TILE_REPO"
+      ],
+      "Tensor-of-pointers is a known perf issue; TMA descriptors recommended; `.tileIR` cache artifacts": [
+        "NV_BLOG_TILE"
+      ],
+      "Token ordering semantics (program deps do not order memory ops; tokens preserved)": [
+        "TILE_SPEC"
+      ],
+      "Spill + occupancy + provenance metrics (NCU 2025.4+)": [
+        "NCU_GUIDE"
+      ]
+    },
+    "Open_Questions": [
+      "What concrete codegen decisions does the Tile IR backend change when `occupancy` changes (unroll, pipeline depth, live-range shaping), and how do those decisions move spill onset?",
+      "How much of observed spill onset is address-generation driven (tensor-of-pointers) vs pipeline state vs ordering constraints?",
+      "Given fallback-to-PTX, what is the strongest per-kernel, fail-closed provenance check that survives autotuning and multi-process runs?",
+      "Which Nsight Compute 2025.4 metric subset best separates (A) occupancy loss due to register allocation from (B) performance loss due to local-memory spill traffic?"
+    ],
+    "Execution_Plan": {
+      "Stage": "2/3 Methodology_Design (executing now)",
+      "Next_Steps": [
+        "Define an A/B harness in tritonbench: same kernel + same meta-parameters compiled under PTX vs TileIR; sweep Tile-only knobs (`occupancy`) and shared knobs (`num_ctas`).",
+        "Implement a fail-closed provenance gate: reject any data where TileIR was requested but (a) NCU reports `launch__execution_model!=Tile` or (b) cache artifacts fail a TileIR bytecode magic-number check.",
+        "Lock the Nsight Compute metric set for spill-onset phase diagrams: spill instruction counters + register/occupancy limit metrics + execution model provenance."
+      ]
+    }
+  }
+}
+```
+
+## Stage 2 — Methodology Design: A/B microbenchmarks for *spill onset* (PTX vs Tile IR) with fail-closed provenance
+
+### 0) Version lock (the experiment *is* the platform contract)
+
+Everything below assumes:
+
+- **GPU:** Blackwell-class only.
+- **CUDA Toolkit:** **13.1+** (CUDA Tile initial release targets Blackwell; introduces `tileiras`). ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html?utm_source=openai))  
+- **Triton backend:** **Triton-to-tile-IR** repo (Tile backend enabled via `ENABLE_TILE=1`; falls back to PTX on Tile compilation bugs). ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+- **Profiler:** **Nsight Compute 2025.4+** (spill counters + Tile workload support + SIMT/Tile execution-model visibility). ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/ReleaseNotes/index.html?utm_source=openai))  
+
+If any run violates this (e.g., Hopper-only stack, CUDA < 13.1, Nsight Compute < 2025.4), it is **out of scope** and should be rejected (or labeled **[Legacy]** and quarantined from conclusions).
+
+---
+
+### 1) A/B definition: what differs, what must not differ
+
+**Goal:** isolate how the backend changes the **spill/occupancy frontier** for the *same* Triton kernel family.
+
+| Dimension | Control (A) | Experiment (B) | Rationale |
+|---|---|---|---|
+| Backend | Triton → PTX → SASS | Triton → Tile IR → SASS | This is the thesis axis (allocator/scheduler locus changes). CUDA 13.1 explicitly introduces Tile IR + `tileiras`. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html?utm_source=openai)) |
+| Enablement | `ENABLE_TILE` **unset** | `ENABLE_TILE=1` | This is the documented switch. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR)) |
+| Kernel code | identical | identical | Otherwise you’re measuring algorithm differences, not compiler differences. |
+| Shared tuning knobs | `num_ctas` sweep | `num_ctas` sweep | `num_ctas` is “critical”, and `num_ctas=2` enables 2CTA mode MMA on Blackwell dense dot workloads. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR)) |
+| Tile-only knob | N/A | `occupancy` sweep (1–32, default 1) | Occupancy is explicitly exposed and “critical”. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR)) |
+| Provenance | must be SIMT | must be Tile | Required to avoid silent fallback contamination. `launch__execution_model` enables this gate. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html)) |
+
+Two immediate implications for *experimental discipline*:
+
+1. **TileIR runs are not trustworthy by default** because the repo explicitly **falls back to PTX** on compilation bugs. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+2. **`num_warps` is not exposed yet** on CUDA 13.1 Tile IR backend; kernels with large reduction dimensions (XXXNorm) can spill. That makes `occupancy` + kernel structure the primary levers. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+---
+
+### 2) Fail-closed provenance (per kernel, autotune-safe, multi-process-safe)
+
+You need *at least one* provenance check that is **external to Triton** (so it cannot lie), and *at least one* that is **artifact-based** (so it survives weird profiling modes).
+
+#### 2.1 Primary provenance gate (external, per-kernel): `launch__execution_model`
+
+Nsight Compute exposes:
+
+- `launch__execution_model`: “Kernel execution model i.e. **SIMT or Tile**.” ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+**Fail-closed rule:**
+
+- If `ENABLE_TILE=1` and **`launch__execution_model != Tile`**, then **discard the run** (or hard-fail the harness).  
+- If `ENABLE_TILE` is unset and `launch__execution_model != SIMT`, likewise discard (this catches any weird mixed stack).
+
+This is strong because it is **post-facto truth from the profiling toolchain**, not from Triton logs.
+
+#### 2.2 Secondary provenance gate (artifact content, not extension): Tile IR bytecode magic number
+
+NVIDIA’s Tile IR bytecode format starts with an 8-byte magic number:
+
+- `\x7FTileIR\x00` ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/local/sections/bytecode.html?utm_source=openai))  
+
+The NVIDIA blog notes that when the Tile IR backend is active, Triton caches kernels with `.tileIR` extensions. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))
+
+**Fail-closed rule (content-based):**
+
+- When TileIR is requested, find the cache artifact that claims to be Tile IR bytecode (e.g., `.tileIR`).  
+- Read the first 8 bytes; require exact match to `\x7FTileIR\x00`. ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/local/sections/bytecode.html?utm_source=openai))  
+- If not, mark as “not TileIR provenance” and fail the datapoint.
+
+This avoids the “file extension says TileIR” trap.
+
+#### 2.3 Practical cache hygiene constraint (minimize cross-talk)
+
+The blog indicates Triton cache is typically in `~/.triton/cache`. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+
+For phase-diagram sweeps (many variants), enforce one of:
+
+- **Fresh cache per run** (preferred), or
+- **Cache purge + unique kernel names** per config.
+
+(Exact env knobs for cache dir are not in the golden sources you provided, so I’m not naming them as “facts”; this is a harness requirement, not a documented API claim.)
+
+#### 2.4 Multi-process safety (profiling serialization)
+
+Nsight Compute serializes profiling across processes using lock files. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+This matters because autotuning frameworks often spawn multiple workers; Nsight Compute will prevent counter collisions, but you still must ensure your **provenance gate is checked per kernel instance** (not only once per program).
+
+---
+
+### 3) Microbenchmark harness: tritonbench as the execution envelope
+
+Minimum viable use of tritonbench (documented):
+
+- Install and run an operator benchmark, e.g. `python run.py --op gemm`. ([github.com](https://github.com/meta-pytorch/tritonbench))  
+
+**How we use it in Stage 2:**
+
+- Treat tritonbench as the **shape generator + timing harness** for “realistic” operators (GEMM, norms, attention if present).
+- Add a small “research mode” wrapper that:
+  1. Sweeps the parameter grid (tile shapes, `num_ctas`, `occupancy`).
+  2. Runs under NCU with a fixed metric set.
+  3. Enforces the provenance gates above.
+
+If the existing `gemm` op is the only guaranteed one from the README, start there and then extend with a minimal reduction/norm op (because TileIR-specific spilling risk is explicitly called out for large reductions). ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+---
+
+### 4) Parameter space: minimal grids that still produce *spill-onset phase diagrams*
+
+The stage-2 design constraint is: **small enough to finish**, rich enough to separate mechanisms.
+
+#### 4.1 Common axes (all kernel families)
+
+- Backend: `{PTX, TileIR}`
+- `num_ctas`: `{1, 2}` (because 2CTA mode is a Blackwell-specific performance regime shift for dense dot workloads). ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+- TileIR `occupancy` (TileIR only): `{1, 2, 4, 8, 16, 32}` (as documented range + default). ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+#### 4.2 GEMM family (start here; it hits every mechanism you care about)
+
+**Why GEMM first:** it’s where (a) `num_ctas=2` is called out as critical, and (b) tensor-of-pointers vs descriptorization is cleanly expressible, and (c) spill onset often presents as a sharp cliff when you deepen the mainloop pipeline.
+
+**Axes:**
+- Tile shape grid (small, medium, large):
+  - `BLOCK_M ∈ {64, 128}`
+  - `BLOCK_N ∈ {64, 128}`
+  - `BLOCK_K ∈ {32, 64}`
+- Pipeline depth proxy: whatever Triton exposes for staging (often `num_stages` in PTX path; exact API on TileIR is not in the golden sources, so treat this as “kernel variant knob” and confirm in code).
+- **Address generation mode (critical for reg pressure):**
+  - **Tensor-of-pointers** loads/stores.
+  - **TMA descriptor** loads/stores using `tl.make_tensor_descriptor` + `desc.load/store` (as in NVIDIA’s guidance). ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+
+This yields a compact GEMM grid like:
+- 2×2×2 tile shapes × 2 (`num_ctas`) × 6 (`occupancy`) × 2 (pointer-vs-descriptor) ≈ **192 points** per backend (but note: `occupancy` only applies to TileIR).
+
+That is “phase diagram sized” without exploding.
+
+#### 4.3 Norm / reduction family (second; it is the TileIR spill canary)
+
+The repo explicitly warns:
+- `num_warps` not exposed; XXXNorm with large reduction dims may spill. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+So you want a benchmark where the only plausible local-memory traffic is spilling.
+
+**Axes:**
+- Reduction dimension: `R ∈ {256, 512, 1024, 2048, 4096, 8192}`
+- Blocked reduction tile: `BLOCK_R ∈ {128, 256, 512}` (or whatever your implementation supports)
+- `occupancy` sweep (TileIR)
+- Optional: pointer-vs-descriptor input loads (if applicable)
+
+This family is where you should expect the strongest `occupancy` ↔ spilling interaction.
+
+---
+
+### 5) Nsight Compute 2025.4 metric set: separating **occupancy loss** from **spill traffic**
+
+The key is to measure *both*:
+
+1) **“Did the allocator spill?”** (instruction-level evidence)  
+2) **“Did registers cap occupancy?”** (resource evidence)  
+3) **“Was it TileIR or SIMT?”** (provenance)
+
+#### 5.1 Provenance + resource/occupancy metrics (launch-derived; no extra replay pass)
+
+Collect:
+
+- `launch__execution_model` (SIMT vs Tile) — **provenance gate**. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- `launch__registers_per_thread` and/or `launch__registers_per_thread_allocated`. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- `launch__occupancy_limit_registers` (and optionally shared/warps limits to prove registers are the limiter). ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- `sm__maximum_warps_per_active_cycle_pct` (theoretical occupancy). ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- (Optional) `launch__stack_size` (stack growth often co-occurs with spilling; treat this as correlation, not causation). ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+#### 5.2 Spill metrics (direct spill counters, not inference)
+
+Nsight Compute provides explicit spill counters:
+
+- `sass__inst_executed_register_spilling` ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- plus breakdowns that matter for attribution:
+  - `sass__inst_executed_register_spilling_mem_local`
+  - `sass__inst_executed_register_spilling_mem_shared`
+  - `sass__inst_executed_register_spilling_op_read`
+  - `sass__inst_executed_register_spilling_op_write` ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+And the “ambient” local memory instruction counters:
+
+- `sass__inst_executed_local_loads`
+- `sass__inst_executed_local_stores` ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+These let you distinguish:
+
+- **Occupancy loss without spilling:** high `launch__registers_per_thread`, low `launch__occupancy_limit_registers`, but `sass__inst_executed_register_spilling ≈ 0`.
+- **Spilling-induced traffic:** `sass__inst_executed_register_spilling > 0` and/or elevated local loads/stores.
+
+#### 5.3 Precision/replay guardrail (avoid “tiny kernel” counter noise)
+
+Nsight Compute warns that multi-pass collection and small/variable workloads can distort derived values; it recommends making launches large enough to reach steady state (rule of thumb: > ~20 µs) and/or collecting fewer metrics per run. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+So: **do not** try to collect “all metrics” on microkernels; collect the minimal set above.
+
+---
+
+### 6) Data collection protocol (so phase diagrams don’t lie)
+
+For each kernel configuration point:
+
+1. **Compile + warm up** once outside profiling to populate caches and stabilize clocks (timing harness run).
+2. Run **NCU** with:
+   - the metric set above,
+   - per-kernel collection (kernel replay / application replay, not range replay),
+   - CSV or JSON output for ingestion.
+3. **Apply fail-closed provenance:**
+   - Assert `launch__execution_model` matches expectation. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+   - If TileIR: assert TileIR bytecode artifact magic number if you are also using artifact checks. ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/local/sections/bytecode.html?utm_source=openai))  
+4. Repeat the measurement `n=5–10` times (especially for borderline spill onset), report median + dispersion.
+
+Also: minimize background GPU activity; Nsight Compute notes asynchronous engines can pollute some memory metrics, especially for small kernels. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+---
+
+### 7) How we turn metrics into a *spill-onset frontier*
+
+Define two binary labels per datapoint:
+
+- **SpillPresent:** `sass__inst_executed_register_spilling > 0`. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- **RegsLimitOccupancy:** `launch__occupancy_limit_registers` is the binding limiter *or* theoretical occupancy changes across configs primarily due to `launch__registers_per_thread`. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+Then compute two frontiers:
+
+1. **Spill frontier**: smallest tile/pipeline setting where SpillPresent flips to true, as a function of `occupancy` and `num_ctas`.
+2. **Occupancy frontier**: contour lines of theoretical occupancy (`sm__maximum_warps_per_active_cycle_pct`) vs tile/pipeline settings; overlay `launch__registers_per_thread`. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+**What “success” looks like in Stage 2 data:**
+- In TileIR, the spill frontier should move when `occupancy` moves (that is the whole “first-class design variable” claim). The repo states `occupancy` is critical and defaults to 1; this is the knob you’re testing. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+- Descriptorization (TMA tensor descriptors) should shift the frontier relative to tensor-of-pointers if the register-pressure mechanism is correct. NVIDIA explicitly motivates this rewrite to avoid materializing pointer tensors. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+
+---
+
+### 8) Mapping Stage-1 hypotheses into Stage-2 microbench A/B tests
+
+#### H1 (Descriptorization shifts spill onset right)
+
+**Test:** GEMM kernel, two variants:
+- Variant P: tensor-of-pointers (compute `a_ptrs`, `b_ptrs`, `tl.load(a_ptrs)`).
+- Variant D: TMA descriptors (`tl.make_tensor_descriptor` + `desc.load/store`). ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+
+**Sweep:** `occupancy × num_ctas × tile shape`.
+
+**Readout:** compare:
+- `launch__registers_per_thread` and `launch__occupancy_limit_registers` ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+- `sass__inst_executed_register_spilling(_mem_local/shared)` ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+#### H3 (`occupancy` creates an “occupancy-pressure contract”)
+
+**Test:** Hold kernel + tile shape constant; sweep `occupancy ∈ {1,2,4,8,16,32}`.
+
+**Expected observable:** changes in:
+- `launch__registers_per_thread` (backend chooses different allocation/schedule strategy) and/or
+- spill counters. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+This is explicitly motivated because `occupancy` is documented as critical and defaults to 1. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+#### Token-order pressure (currently a constrained test from Triton)
+
+Tile IR token semantics are explicit in the spec (program deps do not order memory ops; tokens must be used). ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html))  
+But Triton-to-tile-IR README notes token support would require extending Triton APIs; current implementation focuses on compatibility. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+So, for Stage 2:
+- Treat “token-induced live-range pressure” as **plausible but not directly user-controllable** from Triton today.
+- If you want to test it anyway, the clean route is a **direct Tile IR microbench** (outside Triton) where you can insert token-ordered ops explicitly—*but that is an extension track*, not required for the core PTX-vs-TileIR A/B in tritonbench.
+
+---
+
+## Consolidated ResearchState (post Stage-2 design)
+
+```json
+{
+  "Current_Thesis": "Tile IR on Blackwell makes spill onset a first-class, knob-dependent phenomenon (not just a PTXAS artifact), because the Triton→TileIR backend exposes `occupancy`/`num_ctas` and changes memory idioms (descriptorized TMA vs tensor-of-pointers), so we should map spill-onset frontiers under strict per-kernel provenance gates that detect PTX fallback.",
+  "Key_Insights": [
+    "CUDA 13.1 introduces CUDA Tile and `tileiras`; initial release targets Blackwell.",
+    "Triton-to-TileIR: enable with `ENABLE_TILE=1`; may fall back to PTX on Tile compilation bugs.",
+    "`occupancy` (1–32, default 1) + `num_ctas` (critical; `num_ctas=2` enables 2CTA MMA on Blackwell dot workloads) are the primary TileIR tuning knobs; `num_warps` not exposed yet and large-reduction norms may spill.",
+    "NCU 2025.4 has explicit spill counters (`sass__inst_executed_register_spilling*`) and launch metrics for provenance (`launch__execution_model`) and reg/occupancy attribution (`launch__registers_per_thread`, `launch__occupancy_limit_registers`).",
+    "NVIDIA recommends rewriting tensor-of-pointers into TMA tensor descriptors (`tl.make_tensor_descriptor`) for TileIR backend performance."
+  ],
+  "Open_Questions": [
+    "Quantify how `occupancy` changes schedules/live ranges (what transformations are being selected) vs simply changing allocator constraints.",
+    "Quantify descriptorization’s effect on register pressure across non-GEMM kernels (norms, attention epilogues).",
+    "If/when Triton exposes tokens, measure token-order-induced spill onset shifts directly."
+  ],
+  "Execution_Plan": {
+    "Stage": "2/3 Methodology_Design (planned; ready to implement)",
+    "Immediate_Next_Steps": [
+      "Implement tritonbench sweep runner for GEMM + one reduction/norm kernel under PTX vs TileIR.",
+      "Integrate provenance gates: NCU `launch__execution_model` + TileIR bytecode magic-number check for cache artifacts.",
+      "Run the first spill-onset phase diagrams: (tile shape × occupancy) with `num_ctas ∈ {1,2}` and pointer-vs-descriptor variants."
+    ]
+  }
+}
+```
+
+---
+Learn more:
+1. [CUDA Toolkit 13.1 - Release Notes — Release Notes 13.1 documentation](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html?utm_source=openai)
+2. [GitHub - triton-lang/Triton-to-tile-IR: incubator repo for CUDA-TileIR backend](https://github.com/triton-lang/Triton-to-tile-IR)
+3. [1. Release Notes — NsightCompute 13.1 documentation](https://docs.nvidia.com/nsight-compute/ReleaseNotes/index.html?utm_source=openai)
+4. [2. Profiling Guide — NsightCompute 13.1 documentation](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html)
+5. [4. Binary Format — Tile IR](https://docs.nvidia.com/cuda/tile-ir/local/sections/bytecode.html?utm_source=openai)
+6. [Advancing GPU Programming with the CUDA Tile IR Backend for OpenAI Triton | NVIDIA Technical Blog](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/)
+7. [GitHub - meta-pytorch/tritonbench: Tritonbench is a collection of PyTorch custom operators with example inputs to measure their performance.](https://github.com/meta-pytorch/tritonbench)
+8. [7. Memory Model — Tile IR](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html)

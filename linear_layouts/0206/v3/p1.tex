@@ -1,0 +1,195 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+% --- Minimal macros (terminology) ---
+\newcommand{\Blackwell}{\textsc{Blackwell}}
+\newcommand{\TMEM}{\textsc{TMEM}}
+\newcommand{\TMA}{\textsc{TMA}}
+\newcommand{\TileIR}{\textsc{Tile IR}}
+\newcommand{\SWP}{\textsc{SWP}}
+\newcommand{\WS}{\textsc{WS}}
+
+\title{Probing Research Gaps in NVIDIA \Blackwell{} GPU Architecture under CUDA \(>13\) and PTX \(>9\)}
+\author{Author Name Placeholder \\
+Affiliation Placeholder \\
+\texttt{email@placeholder.edu}}
+\date{February 5, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+NVIDIA \Blackwell{} introduces architectural and programming-model shifts that elevate tile semantics, explicit data movement, and synchronization to first-class performance concerns---notably via Tensor Memory (\TMEM) and the \texttt{tcgen05.*} Tensor Core instruction paradigm \cite{ARCH_BW}. Concurrently, recent scheduling and compilation studies emphasize that cooperative-warp execution, variable-latency tile movement, and blocking synchronization complicate realization of high-throughput Tensor Core pipelines on \Blackwell{}-class devices \cite{OPT_PIPE}. NVIDIA's CUDA \TileIR{} backend for Triton (CUDA \(13.1+\)) signals an ecosystem move toward IRs that preserve tile-level intent deeper into compilation \cite{NV_BLOG_TILE}, while independent layout-abstraction and verification work argues that robust layout reasoning (and safety checks) is increasingly necessary to prevent correctness and performance failures in highly optimized kernels \cite{SEED_1,SEED_2}. Finally, Grace--\Blackwell{} locality results suggest that inter-CTA traversal order and cache behavior can materially affect end-to-end throughput in attention-like workloads \cite{SEED_3}. This Part~I motivates and frames a \Blackwell{}-only research agenda under hard toolchain constraints (CUDA \(>13.0\), PTX \(>9.0\)), defines key terms, and summarizes related work that motivates the proposal's later gap analysis and methodology.
+\end{abstract}
+
+\section{Introduction and motivation}
+\Blackwell{} is not merely an incremental throughput improvement; it changes the practical locus of optimization by introducing (i) new on-chip storage and (ii) new instruction pathways that strongly couple computation, explicit tile movement, and synchronization.
+
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Architectural pivot toward explicit tile pipelines.}
+  The \Blackwell{} B200 architecture study reports \TMEM{} as a distinct on-chip memory tier and describes \texttt{tcgen05.mma} as a single-thread instruction that can source operands from shared memory and \TMEM{} \cite{ARCH_BW}. This reframes how compilers and kernel authors must reason about accumulator residency, operand staging, and the boundary between ``tensor-core compute'' and ``general computation.''
+
+  \item \textbf{Synchronization and cooperative execution as core constraints.}
+  Scheduling work on Hopper/\Blackwell{}-class GPUs highlights that cooperative-warp execution and blocking synchronization can interrupt otherwise overlapped pipelines, and that variable-latency tile movement makes schedule realization difficult in sequential IR toolchains \cite{OPT_PIPE}. For \Blackwell{}, the same work explicitly notes additional synchronization requirements associated with \TMEM{} interactions \cite{OPT_PIPE}.
+
+  \item \textbf{Compiler ecosystem shift: preserving tile semantics deeper into lowering.}
+  NVIDIA's CUDA \TileIR{} backend for Triton positions \TileIR{} as a specification-driven, MLIR-based representation intended to preserve tile semantics beyond PTX-oriented lowering, with CUDA \(13.1+\) and \Blackwell{} GPUs as stated prerequisites for the Triton-to-\TileIR{} flow \cite{NV_BLOG_TILE}. This motivates revisiting where and how scheduling, layout, and data-movement decisions should be encoded.
+
+  \item \textbf{Correctness pressure from layouts and descriptors.}
+  Layout abstraction and verification efforts argue that (a) a generic, composable layout representation can reduce backend brittleness and reimplementation burden \cite{SEED_1}, and (b) layout composition without proper bounds reasoning can cause out-of-bounds accesses, motivating formal methods (e.g., integer set relations) to synthesize safety predicates \cite{SEED_2}. These considerations become more acute as compilation moves toward descriptor-based data movement and highly structured tile representations \cite{NV_BLOG_TILE}.
+
+  \item \textbf{System-level locality: \Blackwell{}-family behavior can hinge on traversal order.}
+  Grace--\Blackwell{} measurements indicate that cache capacity thresholds and CTA traversal-order transformations (e.g., wavefront-style reorderings) can substantially change L2 miss behavior and throughput in attention-like kernels \cite{SEED_3}. This suggests that \Blackwell{} performance research must span both intra-CTA pipeline design and inter-CTA work ordering.
+\end{itemize}
+
+\paragraph{Scope and non-negotiable constraints.}
+This proposal is restricted to NVIDIA \Blackwell{} (including Grace--\Blackwell{} when directly informative). It is anchored to a toolchain target of CUDA \(>13.0\) (e.g., \(13.1+\)) and PTX \(>9.0\) as hard requirements. Any claim about which CUDA/PTX versions provide specific \Blackwell{} features is treated as \emph{UNVERIFIED} unless explicitly supported by primary documentation or by the golden sources cited here (notably, some cited studies report results under CUDA \(13.0\) \cite{ARCH_BW,OPT_PIPE}, while CUDA \TileIR{} is described as introduced in CUDA \(13.1\) \cite{NV_BLOG_TILE}).
+
+\section{Background and terminology}
+This section establishes terminology used throughout the proposal, with emphasis on \Blackwell{}-specific primitives and the compiler/scheduling vocabulary that interacts with them.
+
+\subsection{Blackwell family scope (\Blackwell{} vs.\ Grace--Blackwell)}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{B200 (\Blackwell{}) as the architectural reference point.}
+  The \Blackwell{} B200 study characterizes B200 as a dual-die design unified to software (via NV-HBI) and uses microbenchmarking to report \TMEM{} behavior and \texttt{tcgen05.*} instruction characteristics \cite{ARCH_BW}. (This proposal treats those measurements as primary \Blackwell{} evidence.)
+
+  \item \textbf{Grace--\Blackwell{} (GB10) as system-locality context.}
+  A locality-focused paper studies a Grace--\Blackwell{} GPU (GB10), reporting cache parameters and demonstrating CTA scheduling and traversal-order effects for attention-like workloads \cite{SEED_3}. Where GB10 results are used to motivate hypotheses about other \Blackwell{} SKUs, such generalization will be explicitly labeled \emph{UNVERIFIED} unless cross-SKU evidence is provided.
+\end{itemize}
+
+\subsection{Toolchain targets: CUDA \(>13.0\) and PTX \(>9.0\)}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{CUDA target.}
+  CUDA \(13.1+\) is particularly salient because NVIDIA describes CUDA \TileIR{} (and a Triton-to-\TileIR{} backend) in the CUDA \(13.1\) era, with \Blackwell{} GPUs as prerequisites \cite{NV_BLOG_TILE}. Separately, \Blackwell{} microarchitectural and scheduling studies report experiments under CUDA \(13.0\) \cite{ARCH_BW,OPT_PIPE}.
+
+  \item \textbf{PTX target.}
+  PTX \(>9.0\) is a hard project constraint. The golden sources motivate \Blackwell{}-specific instruction pathways (\texttt{tcgen05.*}) and \TMEM{} management, but do not, on their own, establish which PTX ISA versions are required for each feature in the CUDA \(13.1+\) toolchain (therefore: \emph{UNVERIFIED} within Part~I; addressed later in the proposal).
+\end{itemize}
+
+\subsection{Compute and memory primitives: \texttt{tcgen05.*}, \TMEM{}, and \TMA{}}
+\paragraph{\texttt{tcgen05.*} and Tensor Core pipelines.}
+The \Blackwell{} architecture study reports that \texttt{tcgen05.mma} replaces prior warp-synchronous MMA usage with a single-thread instruction paradigm and documents PTX-to-SASS mappings by precision (Table~IV) alongside instruction-latency comparisons (Table~V) and a Tensor Core pipeline illustration (Figure~2) \cite{ARCH_BW}. These artifacts provide the grounding for reasoning about instruction selection and pipeline structure without relying on undocumented details.
+
+\paragraph{\TMEM{} (Tensor Memory).}
+\TMEM{} is described as a per-SM on-chip memory with a concrete structural organization (e.g., a two-dimensional arrangement of 32-bit cells) and distinct access pathways \cite{ARCH_BW}. The same study emphasizes that traditional data movement instructions (e.g., \texttt{cp.async}-style shared-memory pathways) do not interface with \TMEM{}, motivating new \texttt{tcgen05.\{cp,ld,st\}} sequences \cite{ARCH_BW}. Scheduling work further notes that \Blackwell{} requires additional synchronization operations around \TMEM{} interactions, including blocking synchronization when consuming certain Tensor Core results \cite{OPT_PIPE}.
+
+\paragraph{\TMA{} (Tensor Memory Accelerator) for tile movement.}
+\TMA{} is described as an asynchronous mechanism for moving tiles between global and shared memory, and is used as the canonical example of variable-latency operations that complicate scheduling and code generation \cite{OPT_PIPE}. NVIDIA's \TileIR{} discussion further emphasizes descriptor-driven tile operations (shape/strides/\texttt{block\_shape}) as a performance-relevant interface for tile movement and to avoid tensor-of-pointer performance pitfalls \cite{NV_BLOG_TILE}.
+
+\subsection{Compilation and IR: CUDA Tile and CUDA \TileIR{}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{CUDA Tile and CUDA \TileIR{}.}
+  NVIDIA describes CUDA Tile as introduced in CUDA \(13.1\), with CUDA \TileIR{} as an MLIR-based IR whose semantics are driven by a specification (operations, types, and behavior) \cite{NV_BLOG_TILE}.
+
+  \item \textbf{Triton-to-\TileIR{}.}
+  The same source frames Triton-to-\TileIR{} as a backend targeting CUDA \TileIR{} (rather than PTX) with the explicit goal of preserving tile semantics deeper into compilation; it also states practical workflow constraints (source-based build, enable/verification behaviors) and limitations (unsupported operations; tensor-of-pointer performance degradation; mitigation via descriptor/TMA APIs) \cite{NV_BLOG_TILE}.
+\end{itemize}
+
+\subsection{Scheduling vocabulary: \SWP{}, \WS{}, and CTA traversal order}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{\SWP{} (software pipelining).}
+  \SWP{} refers to overlapping stages of a loop (e.g., loads, compute, stores) across iterations. In the \Blackwell{}-class scheduling work, \SWP{} is treated jointly with warp-role assignment to address pipeline overlap under cooperative execution constraints \cite{OPT_PIPE}.
+
+  \item \textbf{\WS{} (warp specialization).}
+  \WS{} partitions warps into specialized roles (e.g., tile movement vs.\ compute) to better manage variable-latency operations and synchronization, as emphasized in the scheduling and code generation discussion \cite{OPT_PIPE}.
+
+  \item \textbf{CTA scheduling / traversal order.}
+  CTA scheduling concerns how work is distributed and ordered across CTAs. Grace--\Blackwell{} locality work provides concrete CTA scheduling styles (persistent vs.\ non-persistent) and traversal-order transformations (e.g., wavefront reorderings) to reduce non-compulsory L2 misses (see Algorithms~2/3 and the wavefront-reordering algorithm) \cite{SEED_3}. These concepts motivate treating inter-CTA order as part of the performance envelope for \Blackwell{}-family kernels.
+\end{itemize}
+
+\subsection{Layout abstractions and verification: linear layouts, CuTe, and integer set relations}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item \textbf{Linear layouts (Triton-oriented abstraction).}
+  Linear layouts are proposed as a mechanism to express and compose layouts (including legacy Triton layouts), with claims of completeness under Triton shape operators and techniques for efficient layout-conversion code generation \cite{SEED_1}.
+
+  \item \textbf{CuTe layouts and operations (composition/inverse/complement).}
+  CuTe layouts are formalized as mappings from an \(N\)-D coordinate space to a 1-D index via shape/stride tuples, with core operations including composition, inverse, and complement \cite{SEED_2}.
+
+  \item \textbf{Integer set relations for unification and safety.}
+  Integer set relations are proposed as a unified framework to model layouts (including swizzles) and to address correctness hazards such as out-of-bounds accesses arising from naive layout composition; the work claims that required bounds predicates can be synthesized and describes tool support (e.g., an \texttt{isl}-based prototype) \cite{SEED_2}. This framing becomes relevant in descriptor-based tile movement workflows discussed for \TileIR{} \cite{NV_BLOG_TILE}.
+\end{itemize}
+
+\section{Related work overview}
+This proposal is anchored in six golden sources spanning \Blackwell{} microarchitecture, scheduling/code generation, a tile-centric compiler backend, layout abstraction, formal verification, and \Blackwell{}-family system locality. We summarize each briefly, emphasizing the evidence it contributes to Part~I's framing.
+
+\subsection{Blackwell B200 architecture and microbenchmark evidence \cite{ARCH_BW}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Reports \Blackwell{} B200 architectural context and introduces \TMEM{} as a distinct on-chip tier with explicit management requirements \cite{ARCH_BW}.
+  \item Documents the \texttt{tcgen05} instruction paradigm, including \texttt{tcgen05.mma} and related data-movement instructions (\texttt{tcgen05.\{cp,ld,st\}}) needed for \TMEM{} interaction \cite{ARCH_BW}.
+  \item Provides concrete anchoring artifacts for later reasoning: Tensor Core pipeline depiction (Figure~2), PTX-to-SASS mapping by precision (Table~IV), and latency comparisons (Table~V) \cite{ARCH_BW}.
+\end{itemize}
+
+\subsection{Scheduling and code generation challenges for \Blackwell{}-class Tensor Core kernels \cite{OPT_PIPE}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Argues that sequential IRs (e.g., LLVM/PTX-style lowering) are structurally strained for cooperative-warp kernels and for variable-latency tile movement, particularly when blocking synchronization is required \cite{OPT_PIPE}.
+  \item Discusses \SWP{}+\WS{} as coupled decisions and highlights \Blackwell{}-specific synchronization realities (including blocking sync when consuming certain Tensor Core/\TMEM{} results), illustrated via a blocking-sync depiction (Figure~2) \cite{OPT_PIPE}.
+  \item Notes practical toolchain constraints observed in evaluation (e.g., reliance on CUDA \(13.0\) in reported experiments) and illustrates memory-allocation constraints relevant to compilation failures (Figure~5) \cite{OPT_PIPE}.
+\end{itemize}
+
+\subsection{CUDA Tile IR backend for Triton (CUDA \(13.1+\)) \cite{NV_BLOG_TILE}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Describes CUDA Tile and CUDA \TileIR{} as a spec-driven, MLIR-based IR introduced in CUDA \(13.1\), and positions Triton-to-\TileIR{} as preserving tile semantics deeper into compilation (with \Blackwell{} GPUs as stated prerequisites) \cite{NV_BLOG_TILE}.
+  \item Provides pragmatic workflow and limitation context (e.g., early-stage op coverage; tensor-of-pointer performance pitfalls; mitigation via descriptor-driven \TMA{} load/store APIs) that motivates research into automated, correctness-preserving transformations in tile-centric workflows \cite{NV_BLOG_TILE}.
+\end{itemize}
+
+\subsection{Layout abstraction via linear layouts \cite{SEED_1}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Proposes linear layouts as a composable layout mechanism capable of expressing legacy Triton layouts and reducing backend reimplementation burden, with formal definitions (Section~4) and efficient layout-conversion code generation techniques (including an ``optimal'' conversion discussion) \cite{SEED_1}.
+  \item Explicitly documents limitations (e.g., restrictions tied to shape/operator expressiveness) that are relevant when attempting to systematize layout lowering in highly optimized kernels \cite{SEED_1}.
+\end{itemize}
+
+\subsection{Formal modeling and verification of layouts via integer set relations \cite{SEED_2}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Formalizes CuTe layouts and core operations (composition, inverse, complement) and motivates a unified modeling approach using integer set relations \cite{SEED_2}.
+  \item Highlights correctness hazards (notably, out-of-bounds risks from naive layout composition) and claims predicate synthesis can address required bounds checks; also describes prototype tooling (\texttt{isl}-based) and discusses expressiveness/complexity tradeoffs \cite{SEED_2}.
+\end{itemize}
+
+\subsection{Grace--Blackwell system locality, CTA scheduling, and wavefront reordering \cite{SEED_3}}
+\begin{itemize}[leftmargin=*,itemsep=0.35em]
+  \item Provides an empirical locality study on a Grace--\Blackwell{} GPU, reporting memory-hierarchy context and demonstrating that CTA scheduling and traversal order can change cache-miss behavior and throughput in attention-style kernels \cite{SEED_3}.
+  \item Includes explicit CTA scheduling algorithms (Algorithms~2/3) and a wavefront-style traversal-order transformation (Algorithm~4) with reported reductions in non-compulsory L2 misses; also notes limitations tied to tile sizing and compilation behavior (e.g., splitting effects) \cite{SEED_3}.
+\end{itemize}
+
+% ----------------------------------------------------------------------
+% source_audit (MANDATORY; comment-only to preserve LaTeX-only output)
+%
+% ARCH_BW:
+%   used_for: Blackwell B200 architecture evidence for TMEM structure/role; tcgen05 instruction paradigm (tcgen05.mma single-thread issue; tcgen05.{cp,ld,st} for TMEM movement); and anchoring artifacts for Part I framing.
+%   anchors: "III-A Blackwell Architecture"; "IV-A1 Tensor Memory (TMEM)"; "V-A Tensor Memory"; "VI-A Fifth-Generation Tensor Cores";
+%            Figure 2 (Tensor Core pipeline); Table IV (tcgen05 PTX-to-SASS mapping); Table V (latency); "VIII Discussion (Software Ecosystem)".
+%
+% OPT_PIPE:
+%   used_for: Blackwell-class scheduling/codegen framing: cooperative warps, variable-latency tile movement (TMA), blocking synchronization, and the narrative that sequential IRs struggle; plus Blackwell-specific sync notes.
+%   anchors: "3.2 Code Generation Challenges"; Figure 2 (blocking sync interrupts concurrent issue); Figure 5 (memory allocation constraints);
+%            "6.1 Methodology / Evaluation Platforms"; "6.2.2 Blackwell"; "6.3.2 Blackwell".
+%
+% NV_BLOG_TILE:
+%   used_for: CUDA Tile / CUDA Tile IR and Triton-to-TileIR positioning (tile semantics preserved vs PTX); CUDA 13.1+ + Blackwell prerequisites;
+%            limitations (unsupported ops; tensor-of-pointer performance) and descriptor/TMA mitigation as practical terminology.
+%   anchors: Post date (Jan 30, 2026); "What are CUDA Tile and CUDA Tile IR?"; "What is Triton-to-TileIR?"; "How to use Triton-to-TileIR";
+%            "Verify Tile IR compilation"; "Limitations" (unsupported ops; tensor-of-pointer; descriptor/TMA guidance).
+%
+% SEED_1:
+%   used_for: Layout terminology and motivation: linear layouts as a generic mechanism for expressing/transforming layouts and enabling layout-conversion codegen.
+%   anchors: Section 4 (Linear Layouts); Definition 4.11 / Proposition 4.12 (mma swizzling as linear layout); Section 5.4 (codegen for layout conversions);
+%            conclusions/limitations discussion.
+%
+% SEED_2:
+%   used_for: Formal layout terminology and correctness motivation: CuTe layout ops and correctness hazard (OOB) motivating predicate synthesis; integer set relations as unifying framework.
+%   anchors: "2.1 CuTe Layout"; "2.1.2 Layout Operations"; hazard discussion (OOB risk from composition without bounds);
+%            implementation/tool mention (isl-layout via ISLpy); expressiveness and complexity discussion.
+%
+% SEED_3:
+%   used_for: Grace-Blackwell system-locality context and scheduling terminology: CTA scheduling styles and traversal-order transformation (wavefront/sawtooth) as motivation that ordering matters.
+%   anchors: "2.1 GPU Memory Hierarchy"; "CTA Scheduling and Work Distribution" (Algorithms 2/3); Algorithm 4 (Sawtooth Wavefront Reordering);
+%            "4.3.2 Limitations" (tile size / compiler splitting).
+% ----------------------------------------------------------------------
+
+% === END PART 1 ===

@@ -1,0 +1,2120 @@
+% ============================================================
+%  BUTA — Blackwell Unified Tile Algebra
+%  Part 3: Solver Encodings, Layout Tooling,
+%          Data-Movement Pipeline, Cache Analysis,
+%          and Calibration Plan
+% ============================================================
+\documentclass[10pt,twocolumn]{article}
+
+% ---- Geometry & Typography ----
+\usepackage[margin=0.85in,columnsep=0.25in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% ---- Mathematics ----
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+
+% ---- Figures & Tables ----
+\usepackage{graphicx,booktabs,array,multirow}
+\usepackage{fancyvrb}
+\usepackage{float}
+
+% ---- Cross-references & Links ----
+\usepackage[colorlinks,citecolor=blue!70!black,
+            linkcolor=blue!60!black,urlcolor=blue!50!black]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+% ---- Misc ----
+\usepackage{xcolor}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+% ---- Theorem-like environments ----
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{invariant}[definition]{Invariant}
+\newtheorem{remark}[definition]{Remark}
+\newtheorem{procedure}[definition]{Procedure}
+\theoremstyle{plain}
+\newtheorem{proposition}[definition]{Proposition}
+\newtheorem{obligation}[definition]{Proof Obligation}
+
+% ---- Convenience macros (matching Parts 1--2) ----
+\newcommand{\BUTA}{\textsc{Buta}}
+\newcommand{\Ftwo}{\mathbb{F}_2}
+\newcommand{\ZZ}{\mathbb{Z}}
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\ISL}{\textsc{ISL}}
+\newcommand{\CuTe}{\textsc{CuTe}}
+\newcommand{\TileIR}{Tile\,IR}
+\newcommand{\TMEM}{\textsc{TMEM}}
+\newcommand{\SMEM}{\textsc{SMEM}}
+\newcommand{\tcgen}{\texttt{tcgen05}}
+\newcommand{\tma}{\textsc{TMA}}
+\newcommand{\II}{\mathit{II}}
+\newcommand{\reuse}{d_{\mathrm{reuse}}}
+\newcommand{\unverified}{\textsc{[unverified]}}
+\newcommand{\inference}{\textsc{[inference]}}
+
+% ---- Continue section numbering from Part 2 ----
+\setcounter{section}{10}
+
+% ---- Title ----
+\title{%
+  \BUTA{}: Blackwell Unified Tile Algebra\\[4pt]
+  \large Part~3 --- Solver Encodings, Layout Tooling,\\
+         Data-Movement Pipeline, Cache Analysis,\\
+         and Calibration Plan}
+
+\author{%
+  \textit{[Authors redacted for review]}\\
+  Target architecture: NVIDIA Blackwell (B200 cc\,10.0;
+  Grace-Blackwell GB10 cc\,12.0)\\
+  Toolchain: CUDA ${>}\,13.0$ (prefer 13.1+),
+  PTX ${>}\,9.0$ (strict)}
+
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+% ====================================================================
+%  OVERVIEW
+% ====================================================================
+\noindent
+Part~2 defined the seven mathematical objects of
+\BUTA{}, their semantic layers, invariants, and proof
+obligations.
+This part develops the \emph{computational methods}
+required to work with \BUTA{}: solver encodings that
+translate the abstract constraint system into
+executable ILP and SMT formulations
+(\cref{sec:solver}); layout tooling that realises the
+three-layer layout hierarchy as verifiable computations
+(\cref{sec:layout-tool}); data-movement and
+token-ordering pipelines that operationalise the
+\TileIR{} memory model (\cref{sec:dm-pipeline});
+cache traffic analysis procedures that compute
+reuse-distance predictions (\cref{sec:cache-pipe});
+calibration microbenchmark protocols that fit the
+hardware parameters (\cref{sec:calibration}); and
+workload characterisation methods that classify
+operators for cost-vector conditioning
+(\cref{sec:workload-char}).
+
+
+% ====================================================================
+%  SECTION 11 — SOLVER ENCODING METHODS
+% ====================================================================
+\section{Solver Encoding Methods}
+\label{sec:solver}
+
+The schedule constraint system $\mathcal{S}$ (Part~2,
+Definition~4.4) is an abstract optimisation problem.
+This section specifies its concrete encoding into ILP
+and SMT solver inputs, parameterised by the Blackwell
+cost vector~\cite{ARCH_BW} and extended with the 2CTA
+constraints~\cite{NV_BLOG_TILE}.
+
+\subsection{ILP Encoding for Initiation Interval
+            Lower Bound}
+\label{sec:solver:ilp}
+
+The ILP formulation determines a lower bound on the
+initiation interval $\II$ by relaxing the boolean
+schedule variables to continuous
+surrogates~\cite{OPT_PIPE}.
+
+\begin{definition}[ILP Variable
+  Set~\cite{OPT_PIPE}]
+\label{def:ilp-vars}
+For dependence graph $G = (V, E)$, define:
+\begin{align}
+  &\II \in \NN^{+}
+    &&\text{(initiation interval)} \notag\\
+  &M(v) \in \{0, \dots, \II{-}1\}
+    &&\forall\, v \in V
+    \text{ (schedule time)} \notag\\
+  &\theta(v) \in \{0, \dots, |V|{-}1\}
+    &&\forall\, v \in V
+    \text{ (stage index)} \notag
+\end{align}
+The stage index satisfies
+$M(v) = M(v) \bmod \II$ with
+$\theta(v) = \lfloor M(v) / \II \rfloor$,
+decomposing the absolute schedule time into within-period
+offset and pipeline
+stage~\cite{OPT_PIPE}.
+\end{definition}
+
+\begin{definition}[ILP Constraint
+  Encoding~\cite{OPT_PIPE, ARCH_BW}]
+\label{def:ilp-constraints}
+The ILP over $G = (V, E)$ with Blackwell cost
+vector $\mathbf{c}(x)$ (Part~2, Definition~7.1) is:
+\begin{equation}
+  \min\; \II
+  \label{eq:ilp-obj}
+\end{equation}
+subject to, for every $(u, v, d, \delta) \in E$:
+\begin{equation}
+  M(v) - M(u) + \II \cdot \delta
+  \;\geq\;
+  d(u,v)
+  \label{eq:ilp-dep}
+\end{equation}
+where $d(u,v) = \mathbf{c}(x)[\mathrm{type}(u)]$ is
+the operation latency drawn from the
+Blackwell-parameterised cost
+vector~\cite{ARCH_BW}.
+Additionally, the \emph{resource lower bound}
+contributes:
+\begin{equation}
+  \II \;\geq\;
+  \left\lceil
+    \frac{\sum_{v \in V_c} d(v)}{R_c}
+  \right\rceil
+  \quad \forall\, c \in
+  \{\text{TC},\, \tma{},\, \text{ALU}\}
+  \label{eq:ilp-resource}
+\end{equation}
+where $V_c \subseteq V$ is the set of operations
+requiring functional unit class~$c$ and
+$R_c$ is the number of such units per
+SM~\cite{OPT_PIPE, ARCH_BW}.
+For Blackwell: $R_{\text{TC}} = 1$
+(one 5th-generation tensor core per
+SM)~\cite{ARCH_BW}.
+\end{definition}
+
+\begin{remark}
+The ILP provides only a \emph{lower bound} on the
+achievable $\II$.
+The true optimum may be higher due to resource
+conflicts not captured by the aggregate bound in
+\cref{eq:ilp-resource}.
+The tight solution is obtained from the full SMT
+encoding below~\cite{OPT_PIPE}.
+\end{remark}
+
+
+\subsection{SMT Encoding for Joint SWP+WS}
+\label{sec:solver:smt}
+
+The SMT formulation encodes the \emph{joint}
+software-pipelining and warp-specialisation problem
+as a satisfiability query~\cite{OPT_PIPE}.
+
+\begin{definition}[SMT Variable
+  Encoding~\cite{OPT_PIPE}]
+\label{def:smt-vars}
+Given ILP lower bound $\II_{\mathrm{lb}}$, the
+SMT solver iterates over candidate values
+$\II = \II_{\mathrm{lb}}, \II_{\mathrm{lb}}{+}1,
+\dots$ until satisfiable.
+For each candidate $\II$, define:
+\begin{align}
+  &\mathrm{op}[v, i, t] \in \{0, 1\}
+    && \forall\, v \in V,\; i \in [I],\; t \in [T]
+    \notag\\
+  &W(v) \in \{0, \dots, N_W{-}1\}
+    && \forall\, v \in V
+    \notag
+\end{align}
+where $I$ is the maximum number of in-flight
+iterations (bounded by pipeline depth),
+$T = I \cdot \II$ is the total schedule horizon,
+and $N_W$ is the warp count~\cite{OPT_PIPE}.
+The boolean $\mathrm{op}[v, i, t] = 1$ encodes that
+operation~$v$ from iteration~$i$ executes at absolute
+time~$t$~\cite{OPT_PIPE}.
+\end{definition}
+
+\begin{definition}[SMT Clause
+  Set~\cite{OPT_PIPE}]
+\label{def:smt-clauses}
+The constraint set
+$\Phi = \Phi_{\mathrm{uniq}} \wedge
+\Phi_{\mathrm{dep}} \wedge
+\Phi_{\mathrm{fu}} \wedge
+\Phi_{\mathrm{res}}$ consists of:
+
+\smallskip\noindent
+\textbf{Uniqueness} $\Phi_{\mathrm{uniq}}$:
+each operation executes \emph{exactly once} per
+iteration:
+\begin{equation}
+  \forall\, v, i:\quad
+  \sum_{t=0}^{T-1} \mathrm{op}[v, i, t] = 1
+  \label{eq:smt-uniq}
+\end{equation}
+
+\smallskip\noindent
+\textbf{Dependency} $\Phi_{\mathrm{dep}}$:
+for every $(u, v, d, \delta) \in E$ and iteration~$i$,
+if $\mathrm{op}[u, i, t_u] = 1$ and
+$\mathrm{op}[v, i{+}\delta, t_v] = 1$ then
+$t_v - t_u \geq d(u,v)$~\cite{OPT_PIPE}.
+
+\smallskip\noindent
+\textbf{Functional unit exclusivity}
+$\Phi_{\mathrm{fu}}$:
+for each unit class $c$ and time~$t$:
+\begin{equation}
+  \sum_{\substack{v \in V_c \\ i \in [I]}}
+  \mathrm{op}[v, i, t] \;\leq\; R_c
+  \label{eq:smt-fu}
+\end{equation}
+
+\smallskip\noindent
+\textbf{Resource capacity} $\Phi_{\mathrm{res}}$:
+active execution contexts $\leq 4$ per SM at every
+time step~\cite{ARCH_BW, OPT_PIPE}, and concurrent
+warps $\leq N_{\mathrm{WS}}(x)$
+($64$ for cc\,10.0, $48$ for
+cc\,12.0)~\cite{ARCH_BW}.
+\end{definition}
+
+
+\subsection{2CTA Extension of the SMT Formulation}
+\label{sec:solver:2cta}
+
+Dense MMA on Blackwell requires
+$\texttt{num\_ctas} = 2$~\cite{NV_BLOG_TILE}.
+The base OPT\_PIPE formulation~\cite{OPT_PIPE}
+models single-CTA scheduling; extending it to CTA
+pairs is a formal contribution of \BUTA{} (gap~G6).
+
+\begin{definition}[2CTA Variable
+  Extension~\cite{NV_BLOG_TILE}]
+\label{def:2cta-vars}
+Augment the SMT variable set with:
+\begin{align}
+  &\mathrm{cta}(v) \in \{0, 1\}
+    && \forall\, v \in V
+    \notag\\
+  &\mathrm{shared}(a) \in \{0, 1\}
+    && \forall\, a \in \mathrm{Allocs}(\SMEM{})
+    \notag
+\end{align}
+where $\mathrm{cta}(v)$ assigns each operation to a
+CTA within the TPC pair and $\mathrm{shared}(a)$
+indicates whether \SMEM{} allocation~$a$ is in the
+shared operand region accessible by both
+CTAs~\cite{NV_BLOG_TILE, ARCH_BW}.
+\end{definition}
+
+\begin{definition}[2CTA Constraint
+  Clauses~\cite{NV_BLOG_TILE, ARCH_BW}]
+\label{def:2cta-clauses}
+The 2CTA constraint set $\Phi_{\mathrm{2cta}}$
+comprises:
+
+\smallskip\noindent
+\textbf{(a) MMA operand spanning.}
+For every MMA operation $v_{\mathrm{mma}} \in V$ with
+operand-$A$ load $v_A$ and operand-$B$ load $v_B$:
+\begin{equation}
+  \mathrm{cta}(v_A) + \mathrm{cta}(v_B) = 1
+  \label{eq:2cta-span}
+\end{equation}
+This ensures the two loads originate from different
+CTAs, leveraging TPC-internal bandwidth for
+operand sharing~\cite{NV_BLOG_TILE, ARCH_BW}.
+
+\smallskip\noindent
+\textbf{(b) \SMEM{} capacity with sharing.}
+Total \SMEM{} consumption per TPC respects the
+aggregate capacity minus the shared region counted
+once:
+\begin{equation}
+  \sum_{\substack{a \in \mathrm{Allocs} \\
+    \mathrm{shared}(a)=0}}
+  \!\!\mathrm{size}(a)
+  \;+\;
+  \sum_{\substack{a \in \mathrm{Allocs} \\
+    \mathrm{shared}(a)=1}}
+  \!\!\mathrm{size}(a)
+  \;\leq\;
+  2\, C_{\SMEM{}}(x)
+  \label{eq:2cta-smem}
+\end{equation}
+where $C_{\SMEM{}}(10.0) = 228$\,KB and
+$C_{\SMEM{}}(12.0) = 128$\,KB per
+SM~\cite{ARCH_BW}.
+Shared operands are loaded once and read by both
+CTAs via the MMA.2SM
+path~\cite{ARCH_BW}.
+
+\smallskip\noindent
+\textbf{(c) Symmetry breaking.}
+Fix $\mathrm{cta}(v_0) = 0$ for one
+distinguished operation $v_0 \in V$, pruning
+redundant symmetric solutions.
+
+\smallskip\noindent
+\textbf{(d) Inter-CTA synchronisation.}
+For operations $(u, v)$ assigned to different CTAs
+that share a data dependency:
+\begin{equation}
+  \mathrm{cta}(u) \neq \mathrm{cta}(v)
+  \;\Rightarrow\;
+  t_v - t_u \;\geq\; d(u,v) + \tau_{\mathrm{sync}}
+  \label{eq:2cta-sync}
+\end{equation}
+where $\tau_{\mathrm{sync}}$ is the TPC-internal
+synchronisation latency \unverified{}.
+\end{definition}
+
+\begin{remark}
+The value of $\tau_{\mathrm{sync}}$ is not
+characterised in the golden sources.
+Microbenchmark calibration (see \cref{sec:calib:tma})
+is required; until measured, solver results using
+$\Phi_{\mathrm{2cta}}$ carry an \unverified{}
+parameter.
+\end{remark}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Solver Pipeline: ILP -> SMT -> Schedule                  |
++===========================================================+
+|                                                           |
+|  INPUT: Dependence graph G = (V, E)                       |
+|         Cost vector c(x) [ARCH_BW]                        |
+|         Precision p in P  [ARCH_BW]                       |
+|         num_ctas in {1, 2} [NV_BLOG_TILE]                 |
+|                                                           |
+|  PHASE 1: ILP Lower Bound                                 |
+|  +--------------------------------------------------+     |
+|  | min II  s.t.  M(v)-M(u)+II*delta >= d(u,v)       |     |
+|  |               II >= ceil(sum d(v)/R_c) per unit   |     |
+|  | Solver: Gurobi / CPLEX / HiGHS                   |     |
+|  | Output: II_lb (lower bound)                       |     |
+|  +----+---------------------------------------------+     |
+|       |                                                   |
+|       v  II = II_lb                                       |
+|                                                           |
+|  PHASE 2: SMT Search                                      |
+|  +--------------------------------------------------+     |
+|  | LOOP: II = II_lb, II_lb+1, ...                    |     |
+|  |   Encode Phi_uniq AND Phi_dep AND Phi_fu          |     |
+|  |          AND Phi_res                              |     |
+|  |   IF num_ctas=2: AND Phi_2cta [gap G6]            |     |
+|  |   IF tokens:     AND Phi_token [gap G7]            |     |
+|  |                                                   |     |
+|  |   Query: Z3 / cvc5                                |     |
+|  |   IF SAT: extract (M, W, II, cta)                 |     |
+|  |   IF UNSAT: II := II + 1; continue                |     |
+|  +----+---------------------------------------------+     |
+|       |                                                   |
+|       v                                                   |
+|                                                           |
+|  PHASE 3: Schedule Extraction                             |
+|  +--------------------------------------------------+     |
+|  | From satisfying assignment:                       |     |
+|  |   M(v)  : time slot per operation                 |     |
+|  |   W(v)  : warp assignment per operation            |     |
+|  |   II    : initiation interval (optimal)            |     |
+|  |   cta(v): CTA assignment (if 2CTA)                |     |
+|  |                                                   |     |
+|  | Validate against INV-S1..S5 [Part 2]               |     |
+|  +--------------------------------------------------+     |
+|                                                           |
+|  OUTPUT: Feasible Blackwell schedule (M, W, II, cta)      |
++===========================================================+
+\end{BVerbatim}
+\caption{Three-phase solver pipeline.
+  Phase~1 (ILP) lower-bounds
+  $\II$~\cite{OPT_PIPE};
+  Phase~2 (SMT) searches for a satisfying joint
+  SWP+WS assignment with optional 2CTA
+  extension~\cite{NV_BLOG_TILE};
+  Phase~3 extracts and validates the schedule against
+  Blackwell resource bounds~\cite{ARCH_BW}.}
+\label{fig:solver-pipeline}
+\end{figure}
+
+
+\subsection{ZLP Normalisation Procedure}
+\label{sec:solver:zlp}
+
+The Blackwell cost vector $\mathbf{c}(x)$ contains
+real-valued latencies (e.g.,
+$c_{\mathrm{MMA}} \approx 11.2$ cycles).
+SMT solvers operate most efficiently on integer
+constraints.
+The Zero-One Linear Program (ZLP) normalisation
+of~\cite{OPT_PIPE} converts cost ratios to minimal
+positive integers.
+
+\begin{definition}[ZLP
+  Normalisation~\cite{OPT_PIPE}]
+\label{def:zlp}
+Given raw cost vector
+$\mathbf{c} = (c_1, \dots, c_k) \in \RR_{>0}^k$:
+\begin{enumerate}[label=(\roman*)]
+  \item Compute ratios:
+    $r_j = c_j / \min_{j'} c_{j'}$
+    for all $j$.
+  \item Find the smallest $N \in \NN^{+}$ such that
+    $|\lfloor N \cdot r_j \rceil - N \cdot r_j|
+    < \varepsilon$
+    for all~$j$, where $\varepsilon$ is a rounding
+    tolerance (default $10^{-3}$).
+  \item Set normalised costs:
+    $\hat{c}_j = \lfloor N \cdot r_j \rceil$ for
+    all~$j$.
+\end{enumerate}
+The normalised cost vector
+$\hat{\mathbf{c}} = (\hat{c}_1, \dots, \hat{c}_k)$
+replaces $\mathbf{c}$ in all SMT constraints.
+\end{definition}
+
+\begin{proposition}[ZLP Optimality
+  Preservation~\cite{OPT_PIPE}]
+\label{prop:zlp}
+If $\varepsilon = 0$ (exact rationalisation), the ZLP
+normalisation preserves optimality: a schedule
+$(\hat{M}, \hat{W}, \hat{\II})$ that minimises $\II$
+under $\hat{\mathbf{c}}$ also minimises $\II$ under
+$\mathbf{c}$.
+For $\varepsilon > 0$, the normalised optimum satisfies
+$|\hat{\II} - \II^{*}| \leq 1$, where $\II^{*}$ is
+the true optimum.
+\end{proposition}
+
+\begin{remark}
+For Blackwell, the cost vector anchor is
+$c_{\mathrm{MMA}} \approx 11.0$--$11.4$ cycles
+(approximately constant across FP16 tile
+sizes)~\cite{ARCH_BW}.
+The constancy of MMA latency across precisions beyond
+FP16 is \unverified{} for FP4, FP6, and
+FP64 (gap~G9).
+\end{remark}
+
+
+\subsection{Joint Layout-Schedule Encoding}
+\label{sec:solver:joint}
+
+Gaps~G4 and~G8 identify the absence of a joint
+layout-schedule constraint encoding in which layout
+selection variables appear as parameters in scheduling
+constraints.
+
+\begin{definition}[Layout Selection
+  Variables \inference{} (Gap~G4)]
+\label{def:layout-select}
+Introduce a layout selection variable
+$\ell \in \{1, \dots, K\}$ indexing a finite candidate
+set
+$\mathcal{L}_{\mathrm{cand}}(p, T) \subseteq
+\mathrm{Mor}_{\mathcal{L}}$
+of valid layouts for precision~$p$ and tile
+shape~$T$~\cite{SEED_1, ARCH_BW}.
+For each candidate $\ell$, the cost vector becomes
+layout-dependent:
+\begin{equation}
+  \mathbf{c}_{\ell}(x) =
+  \bigl(
+    c_{\mathrm{MMA}}(p, T),\;
+    c_{\tma{}}^{\mathrm{ld}}(T, \ell),\;
+    c_{\tma{}}^{\mathrm{st}}(T, \ell),\;
+    \dots
+  \bigr)
+  \label{eq:layout-cost}
+\end{equation}
+where $c_{\tma{}}^{\mathrm{ld}}(T, \ell)$ depends on
+the alignment properties of layout~$\ell$,
+which determine whether the \tma{} descriptor achieves
+coalesced transfer or incurs penalty
+cycles~\cite{NV_BLOG_TILE, SEED_2}.
+\end{definition}
+
+\begin{definition}[Joint Formulation
+  \inference{}]
+\label{def:joint-formulation}
+The joint layout-schedule problem is:
+\begin{equation}
+  \min_{\ell \in [K]}\;
+  \min_{\II}\;
+  \II
+  \quad\text{s.t.}\quad
+  \Phi(\mathbf{c}_\ell)
+  \label{eq:joint-obj}
+\end{equation}
+\end{definition}
+
+\begin{remark}
+Two solution strategies are available.
+\emph{Enumeration}: solve $K$ independent SMT problems
+(one per candidate layout) and select the minimum
+$\II$.
+This is tractable when $K$ is small, as it is for
+$\Ftwo$ linear layouts at fixed bit-width: the
+candidate set is enumerable from the layout library
+of~\cite{SEED_1}.
+\emph{Integrated}: encode $\ell$ as an integer variable
+in the SMT formulation, using conditional cost
+assignments.
+This may increase solve time but finds the joint
+optimum in a single query \inference{}.
+Tractability of the integrated approach is an open
+question (gap~G4).
+\end{remark}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  ZLP Normalisation Procedure                              |
++===========================================================+
+|                                                           |
+|  INPUT:  Raw cost vector c = (c_1, ..., c_k)             |
+|          Tolerance eps (default 1e-3)                     |
+|                                                           |
+|  STEP 1: Compute c_min = min(c_j)                        |
+|  STEP 2: Compute ratios r_j = c_j / c_min for all j      |
+|                                                           |
+|  STEP 3: Search for minimal N in {1, 2, 3, ...}          |
+|          such that for all j:                             |
+|            |round(N * r_j) - N * r_j| < eps               |
+|                                                           |
+|  STEP 4: Set c_hat_j = round(N * r_j) for all j          |
+|                                                           |
+|  OUTPUT: Normalised integer cost vector c_hat             |
+|                                                           |
+|  EXAMPLE (Blackwell FP16):                                |
+|    c = (c_MMA=11.2, c_TMA_ld=~80, c_ALU=4, c_cp=~8)     |
+|    c_min = 4                                              |
+|    r = (2.8, ~20, 1, ~2)                                  |
+|    N = 5: c_hat = (14, ~100, 5, ~10)                      |
+|                                                           |
+|  PROPERTY: If eps=0, ZLP preserves II optimality          |
+|            If eps>0, |II_hat - II*| <= 1                  |
+|                                                           |
+|  NOTE: TMA latencies are UNVERIFIED for specific          |
+|        tile sizes; values above are illustrative          |
++===========================================================+
+\end{BVerbatim}
+\caption{ZLP normalisation procedure
+  (after~\cite{OPT_PIPE}).
+  Raw Blackwell cycle counts from~\cite{ARCH_BW}
+  are converted to minimal positive integers for SMT
+  solver efficiency.
+  TMA load/store latencies for specific tile sizes
+  are not published and require calibration
+  (\cref{sec:calib:tma}).}
+\label{fig:zlp}
+\end{figure}
+
+
+% ====================================================================
+%  SECTION 12 — LAYOUT TOOLING
+% ====================================================================
+\section{Layout Tooling}
+\label{sec:layout-tool}
+
+The layout morphism space $\mathcal{L}$ (Part~2,
+Definition~4.2) has three representation layers.
+This section specifies the concrete computational
+tooling for each layer and the cross-layer
+verification pipeline that connects them.
+
+\subsection{$\Ftwo$ Binary Matrix Library}
+\label{sec:layout-tool:f2}
+
+\begin{definition}[$\Ftwo$ Library
+  Interface~\cite{SEED_1}]
+\label{def:f2-library}
+The $\Ftwo$ library exposes the following operations on
+binary matrices $L \in \Ftwo^{m \times n}$:
+\begin{enumerate}[label=(\alph*)]
+  \item $\textsc{Compose}(L_1, L_2) = L_2 \cdot L_1$:
+    matrix multiplication over $\Ftwo$;
+    cost $O(m \cdot n \cdot p)$ for
+    $L_1 \in \Ftwo^{m \times n}$,
+    $L_2 \in \Ftwo^{n \times p}$~\cite{SEED_1}.
+  \item $\textsc{Convert}(L_1, L_2) = L_2 \cdot
+    L_1^{-1}$:
+    layout-to-layout conversion via pseudoinverse;
+    eliminates quadratic code
+    explosion~\cite{SEED_1}.
+  \item $\textsc{Rank}(L)$:
+    rank over $\Ftwo$ via Gaussian elimination;
+    cost $O(\min(m,n)^2 \cdot \max(m,n))$.
+  \item $\textsc{Enumerate}(m, n, p)$:
+    enumerate all valid $\Ftwo^{m(p) \times n}$ layout
+    matrices for precision~$p \in \mathcal{P}$
+    satisfying alignment constraints
+    $\mathrm{alignment}(p)$~\cite{ARCH_BW, SEED_1}.
+\end{enumerate}
+The dimension $m(p)$ depends on element bit-width:
+$m(\texttt{FP16}) = \lceil\log_2(16)\rceil = 4$
+address bits per element; for \texttt{FP4},
+$m(\texttt{FP4}) = 2$~\cite{SEED_1}.
+\end{definition}
+
+\begin{remark}
+The \textsc{Enumerate} operation is tractable because
+the candidate space grows as
+$O(2^{m(p) \cdot n})$, which for typical tile
+sizes ($n \leq 16$ address bits) and low-precision
+types ($m \leq 4$) yields at most $2^{64}$
+candidates before rank and alignment pruning.
+In practice, the Triton compiler
+of~\cite{SEED_1} uses a curated library rather than
+exhaustive enumeration.
+Layouts for FP4 and FP6 have not been characterised in
+the golden sources \unverified{} (gap~G8).
+\end{remark}
+
+
+\subsection{\ISL{}-Based Relational Layout Analysis}
+\label{sec:layout-tool:isl}
+
+\begin{definition}[\ISL{} Relation Construction
+  from \CuTe{}~\cite{SEED_2}]
+\label{def:isl-construct}
+Given a \CuTe{} layout
+$H = (\mathrm{shape}, \mathrm{stride})$ with
+$\mathrm{shape} = (s_0, \dots, s_{k-1})$ and
+$\mathrm{stride} = (d_0, \dots, d_{k-1})$,
+Algorithm~1 of~\cite{SEED_2} constructs the \ISL{}
+relation:
+\begin{equation}
+  R_H = \bigl\{c \to
+    \textstyle\sum_{i=0}^{k-1}
+    \bigl(\lfloor c / \sigma_i \rfloor \bmod s_i\bigr)
+    \cdot d_i
+  \bigr\}
+  \label{eq:isl-cute}
+\end{equation}
+where $\sigma_i = \prod_{j<i} s_j$ is the cumulative
+stride.
+The \ISL{} library represents this as a quasi-affine
+relation over integer
+sets~\cite{SEED_2}.
+\end{definition}
+
+\begin{definition}[\ISL{} Swizzle
+  Analysis~\cite{SEED_2}]
+\label{def:isl-swizzle}
+Non-linear swizzle patterns (e.g., XOR-based \SMEM{}
+bank-conflict avoidance) are modelled as bit-level
+integer set operations within \ISL{}:
+\begin{equation}
+  S_w(a) = a \oplus (\lfloor a / 2^b \rfloor
+  \bmod 2^w) \cdot 2^s
+  \label{eq:isl-swizzle}
+\end{equation}
+where $b, w, s$ parametrise the swizzle
+pattern~\cite{SEED_2}.
+The \ISL{} representation captures this via
+existentially quantified binary decomposition of the
+address bits.
+Swizzles that are non-linear lie
+\emph{outside} $\mathcal{L}^{\Ftwo}$ and require
+$\mathcal{L}^{\ISL{}}$~\cite{SEED_1, SEED_2}.
+\end{definition}
+
+\begin{definition}[\ISL{} Composition
+  Verification~\cite{SEED_2}]
+\label{def:isl-compose-verify}
+To verify that a chain of layout transformations
+$\ell_1, \ell_2, \dots, \ell_k$ is consistent
+across layers, compute:
+\begin{equation}
+  R_{\mathrm{chain}} =
+  R_{\ell_k} \circ_{\ISL{}} \cdots
+  \circ_{\ISL{}} R_{\ell_1}
+  \label{eq:isl-chain}
+\end{equation}
+using \ISL{} relation composition, and verify that
+$R_{\mathrm{chain}}$ is injective on its domain (per
+INV-L1, Part~2) by checking:
+\[
+  |\operatorname{dom}(R_{\mathrm{chain}})|
+  = |\operatorname{ran}(R_{\mathrm{chain}})|
+\]
+using \ISL{} cardinality counting~\cite{SEED_2}.
+Layout size $|H|$ and co-size $\|H\|$ (Part~1,
+Definition~2.5) provide diagnostic bounds.
+\end{definition}
+
+
+\subsection{Categorical Construction Validation}
+\label{sec:layout-tool:cat}
+
+\begin{definition}[Tractability
+  Check~\cite{SEED_4}]
+\label{def:cat-check}
+Given a layout relation $R$, determine whether it
+arises from the $\mathbf{Tuple}$/$\mathbf{Nest}$
+categorical construction by:
+\begin{enumerate}[label=(\roman*)]
+  \item Decompose $R$ into shape-stride pairs via the
+    inverse of Algorithm~1~\cite{SEED_2}.
+  \item Verify that the shape-stride structure satisfies
+    the tractability criterion
+    of~\cite{SEED_4}: the layout is tractable iff
+    it can be expressed as a composition of categorical
+    morphisms in $\mathbf{Nest}$.
+  \item Cross-validate against the CUTLASS library
+    of known tractable layouts~\cite{SEED_4}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[CUTLASS Alignment
+  Test~\cite{SEED_4}]
+\label{def:cutlass-align}
+For each candidate layout, the validation pipeline
+compares the computed $\mathbf{Nest}$ morphism output
+against CUTLASS ground-truth layout descriptors.
+The Python implementation of~\cite{SEED_4}
+provides automated comparison: for layout~$L$,
+emit the \CuTe{} layout descriptor and verify
+$L_{\mathrm{computed}} = L_{\mathrm{CUTLASS}}$
+element-wise over the tile domain.
+Mismatches indicate either a non-tractable layout or
+an error in the embedding functor
+$F$~\cite{SEED_4}.
+\end{definition}
+
+
+\subsection{Three-Layer Verification Pipeline}
+\label{sec:layout-tool:pipeline}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Layout Verification Pipeline                             |
++===========================================================+
+|                                                           |
+|  INPUT: Candidate layout L for tile T, precision p        |
+|                                                           |
+|  LAYER 1: F_2 Fragment Check                              |
+|  +-----------------------------------------------------+  |
+|  | Is L linear?                                        |  |
+|  |   YES: L_f2 = F2 matrix [SEED_1]                    |  |
+|  |         Check rank(L_f2) = min(m,n) -> injective    |  |
+|  |         Check alignment(p) constraints [ARCH_BW]    |  |
+|  |         => PASS/FAIL for linear fragment             |  |
+|  |   NO:  proceed to ISL layer                          |  |
+|  +--+-----------+--------------------------------------+  |
+|     |           |                                         |
+|     | linear    | non-linear                              |
+|     v           v                                         |
+|  LAYER 2: ISL Analysis                                    |
+|  +-----------------------------------------------------+  |
+|  | Construct R_L via Algorithm 1 [SEED_2]               |  |
+|  | IF linear: verify phi(L_f2) = R_L  [PO-1, gap G1]   |  |
+|  | Compute |dom(R_L)|, |ran(R_L)| for injectivity      |  |
+|  | Model swizzle as ISL bit-ops [SEED_2]                |  |
+|  | Verify composition: R_chain injective                |  |
+|  | => PASS/FAIL for ISL representation                  |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|     v                                                     |
+|  LAYER 3: Categorical Validation                          |
+|  +-----------------------------------------------------+  |
+|  | Decompose R_L into Nest morphism [SEED_4]            |  |
+|  | Check tractability criterion [SEED_4]                |  |
+|  | Verify F(nest_morph) = R_L  [PO-2, gap G2]          |  |
+|  | Cross-validate against CUTLASS [SEED_4]              |  |
+|  | => PASS/FAIL for categorical foundation              |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  OUTPUT: Verified layout with representation at each      |
+|          applicable layer; flagged proof obligation        |
+|          status (PO-1 / PO-2)                             |
++===========================================================+
+\end{BVerbatim}
+\caption{Three-layer layout verification pipeline.
+  Each candidate layout is checked at the
+  $\Ftwo$~\cite{SEED_1}, \ISL{}~\cite{SEED_2},
+  and categorical~\cite{SEED_4} levels.
+  Cross-layer consistency (embedding $\phi$ and
+  functor $F$) is a proof obligation for \BUTA{}
+  (gaps~G1, G2).}
+\label{fig:layout-pipeline}
+\end{figure}
+
+\begin{proposition}[Pipeline
+  Completeness \inference{}]
+\label{prop:pipeline-complete}
+Every layout representable in $\mathcal{L}^{\Ftwo}$ is
+also representable in $\mathcal{L}^{\ISL{}}$ (by
+definition of the embedding $\phi$).
+Every tractable layout (per~\cite{SEED_4}) is
+representable in $\mathcal{L}^{\ISL{}}$ (by definition
+of the functor $F$).
+The pipeline therefore provides layered verification:
+passing at a lower layer implies representability at
+higher layers, subject to PO-1 and PO-2.
+\end{proposition}
+
+\begin{remark}
+Layouts that are representable in
+$\mathcal{L}^{\ISL{}}$ but not in
+$\mathcal{L}^{\Ftwo}$ (i.e., non-linear swizzles)
+must bypass Layer~1 and be verified at Layers~2--3.
+Layouts that are representable in
+$\mathcal{L}^{\ISL{}}$ but not tractable in the
+categorical sense bypass Layer~3.
+The pipeline records which layers each layout passes,
+enabling the solver to prefer layouts with the
+strongest formal guarantees.
+\end{remark}
+
+
+% ====================================================================
+%  SECTION 13 — DATA MOVEMENT AND TOKEN ORDERING
+% ====================================================================
+\section{Data Movement and Token Ordering Pipeline}
+\label{sec:dm-pipeline}
+
+This section operationalises the data movement relation
+$\mathcal{D}$ (Part~2, Definition~4.5) and the token
+ordering framework (Part~2,
+Definition~6.5) into constructive procedures.
+
+\subsection{\tma{} Descriptor Generation from Layout
+            Relations}
+\label{sec:dm-pipeline:tma-gen}
+
+\begin{definition}[Layout-to-Descriptor
+  Mapping~\cite{NV_BLOG_TILE, SEED_2}]
+\label{def:layout-to-desc}
+Given a layout morphism
+$\ell \in \mathrm{Mor}_{\mathcal{L}}$ governing a tile
+transfer between tiers $\mu_s$ and $\mu_d$ in
+$\mathcal{H}$, the \tma{} descriptor generation
+proceeds as:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Contiguity analysis}: extract the
+    \ISL{} relation $R_\ell$~\cite{SEED_2} and compute
+    whether the range is contiguous in the destination
+    tier's address space.
+  \item \emph{Descriptor type selection}: if the
+    transfer is a structured bulk copy
+    (HBM $\to$ \SMEM{}),
+    use $\mathrm{desc} = \texttt{idesc}$
+    (im2col descriptor for multi-dimensional tiles) or
+    $\mathrm{desc} = \texttt{sdesc}$
+    (simple descriptor for contiguous
+    regions)~\cite{NV_BLOG_TILE}.
+  \item \emph{Address computation}: the descriptor's
+    base address and stride parameters are derived
+    from $R_\ell$'s affine coefficients;
+    for $\Ftwo$ linear layouts, these are extracted
+    from the matrix
+    columns~\cite{SEED_1, SEED_2}.
+  \item \emph{Validation}: verify that the generated
+    descriptor targets an edge $({\mu_s}, {\mu_d})
+    \in E(\mathcal{H})$ and that the transfer size
+    respects tier capacity
+    (INV-D3)~\cite{ARCH_BW}.
+\end{enumerate}
+\end{definition}
+
+\begin{remark}
+Tensor-of-pointer access patterns exhibit poor
+performance on Blackwell and are \emph{not}
+generated by the descriptor mapping;
+\tma{} descriptors are strictly
+preferred~\cite{NV_BLOG_TILE}.
+\end{remark}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  TMA Descriptor Generation Flow                           |
++===========================================================+
+|                                                           |
+|  INPUT:  Layout morphism l in Mor(L)                      |
+|          Source tier mu_s, dest tier mu_d                  |
+|          Tile shape T, precision p                         |
+|                                                           |
+|  STEP 1: Contiguity Analysis                              |
+|  +-----------------------------------------------------+  |
+|  | Compute R_l via ISL [SEED_2]                         |  |
+|  | Check: is ran(R_l) a contiguous interval in mu_d?    |  |
+|  |   YES -> simple descriptor (sdesc)                   |  |
+|  |   NO  -> check structured pattern                    |  |
+|  |          YES -> im2col descriptor (idesc)            |  |
+|  |          NO  -> REJECT (use explicit loads)          |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STEP 2: Descriptor Parameter Extraction                  |
+|  +-----------------------------------------------------+  |
+|  | base_addr = min(ran(R_l))                            |  |
+|  | For sdesc:  size = |ran(R_l)| * bits(p) / 8          |  |
+|  | For idesc:  dims, strides from R_l affine coeffs     |  |
+|  |            via ISL coeff extraction [SEED_2]         |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STEP 3: Token Assignment                                 |
+|  +-----------------------------------------------------+  |
+|  | Assign fresh token tau_out to this TMA operation     |  |
+|  | Record (mu_s, mu_d, desc, tau_in, tau_out) in D      |  |
+|  | Verify: sum(live_allocs(mu_d)) <= cap(mu_d,x)       |  |
+|  |         [INV-D3, ARCH_BW]                            |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  OUTPUT: TMA descriptor tuple delta_TMA                   |
+|          Token tau_out for consumer registration          |
++===========================================================+
+\end{BVerbatim}
+\caption{\tma{} descriptor generation from layout
+  relations.
+  Contiguity analysis uses \ISL{}
+  representations~\cite{SEED_2};
+  descriptor types follow the \TileIR{}
+  specification~\cite{NV_BLOG_TILE};
+  capacity validation uses Blackwell
+  parameters~\cite{ARCH_BW}.}
+\label{fig:tma-gen}
+\end{figure}
+
+
+\subsection{Token DAG Construction}
+\label{sec:dm-pipeline:token-dag}
+
+\begin{definition}[Token Insertion
+  Rules~\cite{NV_BLOG_TILE}]
+\label{def:token-rules}
+Given a tile program's operation sequence, the token
+dependency DAG
+$\mathcal{T} = (\mathrm{Ops}, \mathrm{TokenEdges})$
+is constructed by the following rules:
+\begin{enumerate}[label=(\alph*)]
+  \item \emph{Producer-consumer}: for every \tma{}
+    load $u$ producing token $\tau$ and every MMA or
+    ALU operation $v$ consuming the loaded data,
+    insert edge $(u, v)$ with token
+    $\tau$~\cite{NV_BLOG_TILE}.
+  \item \emph{Write-after-read}: for every \tma{}
+    store $u$ to a region and subsequent \tma{} load $v$
+    of the same region, insert edge
+    $(u, v)$~\cite{NV_BLOG_TILE}.
+  \item \emph{\TMEM{} lifecycle}: for every
+    $\tcgen{}\texttt{.mma}$ operation $u$ writing to
+    \TMEM{} and subsequent
+    $\tcgen{}\texttt{.cp}$ operation $v$ reading the
+    same \TMEM{} region, insert edge
+    $(u, v)$~\cite{ARCH_BW, NV_BLOG_TILE}.
+  \item \emph{Deallocation ordering}: for every
+    $\tcgen{}\texttt{.cp}$ operation $u$ consuming
+    data from a \TMEM{} region and subsequent
+    $\texttt{dealloc}$ operation $v$, insert edge
+    $(u, v)$~\cite{ARCH_BW}.
+\end{enumerate}
+Program-ordered operations (non-token-ordered) are
+sequenced by textual position and do not introduce
+token edges~\cite{NV_BLOG_TILE}.
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Token DAG for Flash Attention Inner Loop (one iter)      |
++===========================================================+
+|                                                           |
+|  TMA_load(K_j)                TMA_load(V_j)              |
+|  tau_K ----+                  tau_V ----+                 |
+|            |                            |                 |
+|            v                            |                 |
+|  MMA_S: S_ij = Q_i * K_j^T             |                 |
+|  tau_S ----+                            |                 |
+|            |                            |                 |
+|            v                            |                 |
+|  ALU: P_ij = softmax(S_ij)             |                 |
+|  tau_P ----+                            |                 |
+|            |                            |                 |
+|            +---+     +------------------+                 |
+|                |     |                                    |
+|                v     v                                    |
+|  MMA_O: O_i += P_ij * V_j   (accumulator in TMEM)        |
+|  tau_O ----+                                              |
+|            |                                              |
+|            v                                              |
+|  tcgen05.cp: TMEM -> RF   (when epilogue needed)         |
+|  tau_cp ---+                                              |
+|            |                                              |
+|            v                                              |
+|  TMA_store(O_i): RF -> SMEM -> HBM                       |
+|                                                           |
+|  Token edges: tau_K -> MMA_S, tau_V -> MMA_O,            |
+|               tau_S -> ALU, tau_P -> MMA_O,               |
+|               tau_O -> tcgen05.cp, tau_cp -> TMA_store    |
+|                                                           |
+|  Properties:                                              |
+|    - DAG is acyclic (INV-D2)  [NV_BLOG_TILE]             |
+|    - All conflicting pairs ordered (DRF)                  |
+|    - TMEM lifecycle: alloc -> mma -> cp -> dealloc        |
++===========================================================+
+\end{BVerbatim}
+\caption{Token DAG for one iteration of Flash
+  Attention inner loop on Blackwell.
+  Token edges enforce ordering between \tma{}
+  loads~\cite{NV_BLOG_TILE}, MMA
+  operations~\cite{ARCH_BW}, and \TMEM{}
+  copies~\cite{ARCH_BW}.
+  The DAG is acyclic (INV-D2) and data-race free
+  (Part~2, Definition~6.6).}
+\label{fig:token-dag-fa}
+\end{figure}
+
+
+\subsection{Token DAG Verification}
+\label{sec:dm-pipeline:verify}
+
+\begin{definition}[Acyclicity
+  Check~\cite{NV_BLOG_TILE}]
+\label{def:acyclicity}
+The token DAG $\mathcal{T}$ is verified acyclic
+(INV-D2, Part~2) by topological sort.
+If the sort succeeds (all operations receive a
+topological ordering), the DAG is acyclic.
+Failure indicates a circular token dependency,
+which must be resolved before schedule
+generation.
+Complexity: $O(|V| + |\mathrm{TokenEdges}|)$.
+\end{definition}
+
+\begin{definition}[Data-Race Freedom
+  Verification~\cite{NV_BLOG_TILE}]
+\label{def:drf-verify}
+Given a well-formed token DAG $\mathcal{T}$, verify
+data-race freedom (Part~2, Definition~6.6) by:
+\begin{enumerate}[label=(\roman*)]
+  \item Identify all \emph{conflict pairs}:
+    operation pairs $(a, b)$ accessing the same memory
+    location with at least one write.
+  \item For each conflict pair, verify
+    $a \preceq_{\mathcal{T}} b$ or
+    $b \preceq_{\mathcal{T}} a$
+    using reachability queries on
+    $\mathcal{T}$~\cite{NV_BLOG_TILE}.
+  \item Any unordered conflict pair constitutes a
+    data race; report and require additional token
+    edges.
+\end{enumerate}
+Reachability is preprocessed via transitive closure
+in $O(|V|^2)$ time, after which each pair query is
+$O(1)$.
+\end{definition}
+
+\begin{definition}[Token-to-SMT
+  Integration~\cite{OPT_PIPE, NV_BLOG_TILE}
+  (Gap~G7)]
+\label{def:token-smt}
+Token edges are integrated into the SMT formulation
+by augmenting the dependence graph:
+for each $(u, v) \in \mathrm{TokenEdges}$,
+add dependency:
+\begin{equation}
+  M(v) - M(u) \;\geq\; \mathrm{lat}(u)
+  \label{eq:token-dep}
+\end{equation}
+where $\mathrm{lat}(u)$ is the operation latency of~$u$
+drawn from $\mathbf{c}(x)$~\cite{ARCH_BW}.
+The augmented graph $G' = (V, E \cup
+\mathrm{TokenEdges})$ replaces $G$ in the SMT clause
+set $\Phi_{\mathrm{dep}}$~\cite{OPT_PIPE}.
+\end{definition}
+
+\begin{proposition}[DRF Decidability]
+\label{prop:drf-decide}
+Data-race freedom for a tile block with a finite
+well-formed token DAG $\mathcal{T}$ is decidable in
+$O(|V|^2 + |V| \cdot |\mathrm{TokenEdges}|)$ time.
+The procedure is the composition of transitive-closure
+computation and conflict-pair enumeration
+from~\cref{def:drf-verify}.
+\end{proposition}
+
+\begin{remark}
+Token ordering may be too fine-grained for solver
+scalability on large programs.
+Mitigation: merge non-interfering token groups into
+\emph{coarsened tokens}, reducing
+$|\mathrm{TokenEdges}|$ while preserving DRF
+\inference{} (gap~G7).
+The \TileIR{} memory model may evolve in future CUDA
+releases; the integration should be parameterised by
+CUDA version~\cite{NV_BLOG_TILE}.
+\end{remark}
+
+
+% ====================================================================
+%  SECTION 14 — CACHE TRAFFIC ANALYSIS PIPELINE
+% ====================================================================
+\section{Cache Traffic Analysis Pipeline}
+\label{sec:cache-pipe}
+
+The cache traffic function $\mathcal{C}$ (Part~2,
+Definition~4.6) requires three computational stages:
+reuse-distance computation, parameterised miss
+prediction, and tile-ordering optimisation.
+
+\subsection{Reuse-Distance Computation}
+\label{sec:cache-pipe:reuse}
+
+\begin{definition}[Stack-Based Reuse Distance
+  Algorithm~\cite{SEED_3}]
+\label{def:reuse-algo}
+Given a tile program's memory access trace
+$\alpha = (a_1, a_2, \dots, a_n)$ at sector
+granularity ($s = 32$\,bytes), the reuse distance
+$\reuse(a_i)$ is computed by maintaining an LRU stack
+$\mathcal{S}$:
+\begin{enumerate}[label=(\roman*)]
+  \item For each access $a_i$:
+    if $a_i \in \mathcal{S}$, let
+    $\reuse(a_i)$ equal the depth of $a_i$ in
+    $\mathcal{S}$; move $a_i$ to top.
+  \item If $a_i \notin \mathcal{S}$,
+    $\reuse(a_i) = \infty$ (cold miss); push $a_i$ to
+    top; evict bottom if
+    $|\mathcal{S}| > C_{\mathrm{L2}}/s$.
+\end{enumerate}
+A sector access is an L2 hit iff
+$\reuse(a_i) < C_{\mathrm{L2}}/s$~\cite{SEED_3}.
+The per-sector total miss count sums the cold and
+capacity misses.
+\end{definition}
+
+\begin{remark}
+The na\"ive stack simulation has complexity
+$O(n \cdot C_{\mathrm{L2}}/s)$ per access.
+Tree-based implementations (e.g., balanced BST on
+stack positions) reduce this to
+$O(n \log (C_{\mathrm{L2}}/s))$.
+For Blackwell, $C_{\mathrm{L2}} \approx 65$\,MB,
+giving $C_{\mathrm{L2}}/s \approx 2 \times 10^6$
+sectors~\cite{ARCH_BW}.
+For Flash Attention workloads, the
+trace length scales with sequence length
+$N$~\cite{SEED_3}.
+\end{remark}
+
+
+\subsection{Parameterised Miss Prediction}
+\label{sec:cache-pipe:miss}
+
+\begin{definition}[Model Instantiation for
+  Blackwell~\cite{SEED_3, ARCH_BW}]
+\label{def:miss-model-inst}
+The cache traffic function is instantiated per
+workload by:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Trace generation}: symbolically expand the
+    tile loop nest under ordering $\sigma$, producing a
+    sector-level trace template parameterised by tile
+    shape $T$, tile count, and access
+    pattern~\cite{SEED_3}.
+  \item \emph{Platform parameters}: instantiate
+    $C_{\mathrm{L2}} \approx 65$\,MB,
+    sector size $s = 32$\,B~\cite{ARCH_BW};
+    $N_{\mathrm{SM}} = 148$ for B200 (or runtime SM
+    count for GB10)~\cite{ARCH_BW, SEED_3}.
+  \item \emph{L2 contention scaling}: under streaming
+    access, effective per-SM L2 capacity scales as
+    $C_{\mathrm{eff}} \approx C_{\mathrm{L2}} /
+    N_{\mathrm{SM}}$;
+    L2 hit rate correlates with
+    $N_{\mathrm{SM}}$~\cite{SEED_3}.
+  \item \emph{L1 assessment}: for streaming tile
+    patterns, L1 is negligible and excluded from the
+    model~\cite{SEED_3}.
+    For non-streaming patterns (e.g., tiled GEMM with
+    reuse), L1 contribution requires separate
+    estimation \inference{} (gap~G5).
+\end{enumerate}
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Cache Traffic Analysis Pipeline                          |
++===========================================================+
+|                                                           |
+|  INPUT:  Tile program P                                   |
+|          Tile ordering sigma                              |
+|          Platform params: C_L2, N_SM, s [ARCH_BW]         |
+|          Access pattern type [NV_workloads]                |
+|                                                           |
+|  STAGE 1: Trace Generation                                |
+|  +-----------------------------------------------------+  |
+|  | Symbolically expand tile loop under sigma            |  |
+|  | Produce sector-level access trace alpha              |  |
+|  | Pattern classification:                              |  |
+|  |   streaming (FA K,V) -> L1 negligible [SEED_3]       |  |
+|  |   reuse (GEMM A,B)   -> L1 may matter [INFERENCE]   |  |
+|  |   mixed               -> per-operator [NV_workloads] |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STAGE 2: Reuse Distance Computation                      |
+|  +-----------------------------------------------------+  |
+|  | LRU stack simulation at sector granularity           |  |
+|  | d_reuse(a, sigma) for each sector a                  |  |
+|  | Complexity: O(n * log(C_L2/s))                       |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STAGE 3: Miss Prediction                                 |
+|  +-----------------------------------------------------+  |
+|  | C(sigma, N_SM, C_L2) =                               |  |
+|  |   sum_{a} 1[d_reuse(a,sigma) > C_L2/s]  [SEED_3]    |  |
+|  |                                                     |  |
+|  | Validated baseline: sawtooth on GB10 FA              |  |
+|  |   67% miss reduction [SEED_3]                        |  |
+|  | Generalization: GEMM, conv [INFERENCE, gap G5]       |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STAGE 4: Ordering Optimization (feed to solver)          |
+|  +-----------------------------------------------------+  |
+|  | Encode C(sigma) as OBJ-2 term in solver [Part 2]     |  |
+|  | Sawtooth sigma_saw as known feasible solution        |  |
+|  | Search: permutation space or parameterized family    |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  OUTPUT: Predicted miss count C(sigma, N_SM, C_L2)        |
+|          Optimal or near-optimal ordering sigma*           |
++===========================================================+
+\end{BVerbatim}
+\caption{Cache traffic analysis pipeline.
+  Reuse-distance computation
+  follows~\cite{SEED_3}; platform parameters
+  from~\cite{ARCH_BW}; access pattern
+  classification uses~\cite{NV_workloads}
+  taxonomy.
+  Stages~3--4 operationalise OBJ-2
+  (Part~2).}
+\label{fig:cache-pipeline}
+\end{figure}
+
+
+\subsection{Tile Ordering as Optimisation Variable}
+\label{sec:cache-pipe:ordering}
+
+\begin{definition}[Ordering Constraint
+  Encoding~\cite{SEED_3}]
+\label{def:ordering-constraint}
+The tile iteration ordering $\sigma$ is encoded as an
+optimisation variable by restricting the search to a
+parametric family of orderings.
+Three candidate families are defined:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Raster}: $\sigma_{\mathrm{rast}}$ scans
+    tiles in row-major order (baseline).
+  \item \emph{Sawtooth}: $\sigma_{\mathrm{saw}}$
+    alternates inner-loop direction per outer-loop
+    iteration~\cite{SEED_3}.
+  \item \emph{Space-filling}: $\sigma_{\mathrm{hilb}}$
+    follows a Hilbert or Z-curve over the 2D tile
+    grid \inference{}.
+\end{enumerate}
+For each family member $\sigma_k$, the pipeline
+evaluates
+$\mathcal{C}(\sigma_k, N_{\mathrm{SM}},
+C_{\mathrm{L2}})$ and selects
+$\sigma^{*} = \arg\min_k \mathcal{C}(\sigma_k)$.
+\end{definition}
+
+\begin{proposition}[Sawtooth Optimality
+  Bound~\cite{SEED_3}]
+\label{prop:sawtooth-opt}
+For streaming split-$Q$ attention dataflows with
+persistent CTAs, sawtooth ordering achieves
+$\reuse(a, \sigma_{\mathrm{saw}}) < D_{\mathrm{data}}$
+for fraction $\geq (1 - 1/N_{\mathrm{CTA}})$ of
+sector accesses~\cite{SEED_3}.
+No other ordering in the parametric family
+$\{\sigma_{\mathrm{rast}},
+\sigma_{\mathrm{saw}},
+\sigma_{\mathrm{hilb}}\}$
+achieves a uniformly better reuse-distance bound
+for streaming patterns \inference{}.
+\end{proposition}
+
+\begin{remark}
+The sawtooth bound is validated only for Flash
+Attention on GB10~\cite{SEED_3}; its extension to
+GEMM and convolution is \inference{} (gap~G5).
+For non-streaming patterns where tile reuse is
+significant, space-filling orderings may outperform
+sawtooth \inference{}.
+The relationship between tile ordering and \SMEM{}
+swizzle patterns~\cite{SEED_2} is not yet formalised.
+\end{remark}
+
+
+% ====================================================================
+%  SECTION 15 — CALIBRATION MICROBENCHMARK PLAN
+% ====================================================================
+\section{Calibration Microbenchmark Plan}
+\label{sec:calibration}
+
+The \BUTA{} cost vector $\mathbf{c}(x)$ and tier-graph
+labels $(\mathrm{lat}, \mathrm{bw}, \mathrm{cap})$
+require empirical calibration on Blackwell hardware.
+This section defines the measurement protocols,
+hardware counter methodology, and falsifiable
+predictions that anchor \BUTA{} to physical
+measurements.
+
+\subsection{Experimental Infrastructure}
+\label{sec:calib:infra}
+
+\begin{definition}[Measurement Protocol]
+\label{def:meas-protocol}
+All microbenchmarks execute on:
+\begin{enumerate}[label=(\roman*)]
+  \item NVIDIA B200 (cc\,10.0, 148~SMs, 228\,KB
+    \SMEM{}/SM, \TMEM{} 256\,KB/SM)~\cite{ARCH_BW}.
+  \item NVIDIA Grace-Blackwell GB10 (cc\,12.0,
+    128\,KB \SMEM{}/SM)~\cite{ARCH_BW, SEED_3}.
+  \item Toolchain: CUDA $\geq$\,13.1, PTX $>$\,9.0,
+    Nsight Compute for hardware
+    counters~\cite{NV_BLOG_TILE}.
+\end{enumerate}
+Each measurement is repeated ${\geq}\,100$ times with
+warm-up; results reported as median $\pm$ IQR.
+Clock frequencies are locked to avoid DVFS artefacts.
+\end{definition}
+
+
+\subsection{\tcgen{} Latency Suite}
+\label{sec:calib:mma}
+
+\begin{definition}[\tcgen{}\texttt{.mma} Latency
+  Measurement~\cite{ARCH_BW}]
+\label{def:mma-calib}
+For each precision $p \in \mathcal{P}$ and tile size
+$T \in \{64{\times}64,\; 128{\times}128,\;
+256{\times}128\}$:
+\begin{enumerate}[label=(\roman*)]
+  \item Construct a serialised dependency chain of
+    $N_{\mathrm{ops}}$ consecutive
+    \tcgen{}\texttt{.mma} operations,
+    each consuming the accumulator of the
+    previous~\cite{ARCH_BW}.
+  \item Measure total elapsed cycles via
+    $\texttt{clock64()}$ around the chain.
+  \item Compute per-operation latency:
+    $c_{\mathrm{MMA}}(p, T) =
+    \mathrm{elapsed} / N_{\mathrm{ops}}$.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Falsifiable Predictions for
+  MMA Latency]
+\label{def:fp-mma}
+The following predictions are derived from the golden
+sources and must be confirmed or falsified by
+calibration:
+\begin{enumerate}[label=(FP-\arabic*)]
+  \item $c_{\mathrm{MMA}}(\texttt{FP16}, T) \in
+    [11.0, 11.4]$ cycles for all $T$, matching
+    the approximately constant latency reported
+    in~\cite{ARCH_BW}.
+  \item FP32 accumulation halves throughput relative
+    to FP16 accumulation:
+    $c_{\mathrm{MMA}}(p, T)|_{\mathrm{FP32\,acc}}
+    \approx 2 \cdot
+    c_{\mathrm{MMA}}(p, T)|_{\mathrm{FP16\,acc}}$%
+    ~\cite{ARCH_BW}.
+  \item \tcgen{}\texttt{.mma} latency is constant
+    across precisions
+    $\{\texttt{FP4},\texttt{FP6},\texttt{FP8},
+    \texttt{FP64}\}$ \unverified{} (gap~G9).
+\end{enumerate}
+\end{definition}
+
+
+\subsection{\TMEM{} Bandwidth Characterisation}
+\label{sec:calib:tmem}
+
+\begin{definition}[\TMEM{} Bandwidth
+  Measurement~\cite{ARCH_BW}]
+\label{def:tmem-calib}
+Measure \TMEM{} read and write throughput by:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Read bandwidth}: issue a stream of
+    $\tcgen{}\texttt{.ld}$ operations from \TMEM{}
+    to RF, varying occupancy (1--64 warps);
+    measure bytes transferred per cycle per SM.
+  \item \emph{Write bandwidth}: issue a stream of
+    $\tcgen{}\texttt{.st}$ operations from RF to
+    \TMEM{}, same occupancy sweep.
+  \item \emph{Accumulator pathway}: measure effective
+    $\texttt{mma\_acc}$ write bandwidth by timing
+    \tcgen{}\texttt{.mma} with varying accumulator
+    sizes in \TMEM{}~\cite{ARCH_BW}.
+  \item \emph{Copy bandwidth}: measure
+    $\tcgen{}\texttt{.cp}$ latency and throughput for
+    varying region sizes.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Falsifiable Predictions for
+  TMEM Bandwidth]
+\label{def:fp-tmem}
+\begin{enumerate}[label=(FP-\arabic*),start=4]
+  \item \TMEM{} read bandwidth
+    $\approx 16$\,TB/s per SM at saturation
+    \unverified{}~\cite{ARCH_BW}.
+  \item \TMEM{} write bandwidth
+    $\approx 8$\,TB/s per SM at saturation
+    \unverified{}~\cite{ARCH_BW}.
+  \item \TMEM{} hit rates of 61--82\% in multi-stage
+    tensor pipelines~\cite{ARCH_BW}.
+\end{enumerate}
+These values are from secondary analysis and require
+independent confirmation.
+\end{definition}
+
+
+\subsection{\tma{} Overhead Profiling}
+\label{sec:calib:tma}
+
+\begin{definition}[\tma{} vs.\ Pointer-Based
+  Comparison~\cite{NV_BLOG_TILE, ARCH_BW}]
+\label{def:tma-calib}
+Construct paired microbenchmarks for each tile size
+$T$:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{\tma{} bulk load}: issue a \tma{}
+    descriptor-based load of tile~$T$ from HBM to
+    \SMEM{}; measure latency and throughput via Nsight
+    counters~\cite{NV_BLOG_TILE}.
+  \item \emph{Pointer-based gather}: issue element-wise
+    loads via tensor-of-pointer pattern for the same
+    tile~$T$; measure latency and
+    throughput~\cite{NV_BLOG_TILE}.
+  \item Compute speedup ratio:
+    $\rho(T) = \mathrm{lat}_{\mathrm{ptr}}(T) /
+    \mathrm{lat}_{\tma{}}(T)$.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Falsifiable Predictions for TMA]
+\label{def:fp-tma}
+\begin{enumerate}[label=(FP-\arabic*),start=7]
+  \item \tma{} strictly faster than pointer-based loads
+    for tiles $\geq 128$ elements:
+    $\rho(T) > 1$ for
+    $|T| \geq 128$~\cite{NV_BLOG_TILE}.
+  \item Tensor-of-pointer patterns exhibit
+    ``poor performance''
+    per~\cite{NV_BLOG_TILE}; quantify as
+    $\rho(T) \geq 2$ for typical tile sizes
+    \unverified{}.
+\end{enumerate}
+\end{definition}
+
+
+\subsection{L2 Cache Characterisation}
+\label{sec:calib:l2}
+
+\begin{definition}[L2 Capacity and Associativity
+  Probing~\cite{ARCH_BW, SEED_3}]
+\label{def:l2-calib}
+Determine effective L2 cache parameters by:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Capacity sweep}: allocate working sets of
+    size $W \in \{1, 2, 4, \dots, 128\}$\,MB;
+    stream through with single-SM access; measure miss
+    rate via \texttt{l2\_hit\_rate} Nsight
+    counter~\cite{ARCH_BW}.
+    Identify $C_{\mathrm{L2}}$ as the $W$ at which
+    miss rate transitions from ${\sim}0$ to
+    ${\sim}1$.
+  \item \emph{Multi-SM contention}: repeat with
+    $N_{\mathrm{SM}} \in \{1, 16, 74, 148\}$ active
+    SMs; measure L2 hit rate as a function of
+    $N_{\mathrm{SM}}$~\cite{SEED_3}.
+  \item \emph{Sector-level validation}: compare
+    $\mathcal{C}(\sigma, N_{\mathrm{SM}},
+    C_{\mathrm{L2}})$ predicted by the reuse-distance
+    model (\cref{def:reuse-algo}) against hardware
+    sector miss counters~\cite{SEED_3}.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Falsifiable Predictions for L2]
+\label{def:fp-l2}
+\begin{enumerate}[label=(FP-\arabic*),start=9]
+  \item $C_{\mathrm{L2}} \approx 65$\,MB effective
+    capacity on B200~\cite{ARCH_BW}.
+  \item Miss rate exhibits a step function at the
+    capacity boundary: for $W < C_{\mathrm{L2}}$,
+    miss rate $< 5\%$; for
+    $W > 1.5 \cdot C_{\mathrm{L2}}$,
+    miss rate $> 80\%$~\cite{ARCH_BW}.
+  \item Sawtooth ordering reduces L2 misses by
+    $67\% \pm 5\%$ on GB10 Flash Attention
+    (reproducing~\cite{SEED_3}: 370M $\to$ 120M
+    sectors).
+  \item 58\% cache-miss latency reduction vs.\
+    H200~\cite{ARCH_BW}: measured as
+    $\tau_{\mathrm{miss}}(\text{B200}) \approx
+    420$ cycles vs.\
+    $\tau_{\mathrm{miss}}(\text{H200}) \approx
+    1000$ cycles.
+\end{enumerate}
+\end{definition}
+
+
+\subsection{Cross-Platform Calibration}
+\label{sec:calib:cross}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Calibration Experiment Matrix                            |
++===========================================================+
+|                                                           |
+|  Parameter         | B200 cc10.0  | GB10 cc12.0  | Gap   |
+|  ------------------+--------------+--------------+-------+
+|  tcgen05.mma       |              |              |       |
+|    FP16  latency   | 11.0-11.4 cy | 11.0-11.4 cy | G9   |
+|    FP4   latency   | UNVERIFIED   | UNVERIFIED   | G9   |
+|    FP6   latency   | UNVERIFIED   | UNVERIFIED   | G9   |
+|    FP8   latency   | UNVERIFIED   | UNVERIFIED   | G9   |
+|    FP64  latency   | UNVERIFIED   | UNVERIFIED   | G9   |
+|  ------------------+--------------+--------------+-------+
+|  TMEM bandwidth    |              |              |       |
+|    read  BW        | ~16 TB/s UNV | ~16 TB/s UNV | G3   |
+|    write BW        | ~8 TB/s UNV  | ~8 TB/s UNV  | G3   |
+|    hit rate        | 61-82%       | 61-82%       | G3   |
+|  ------------------+--------------+--------------+-------+
+|  TMA overhead      |              |              |       |
+|    bulk lat.       | measure      | measure      | G9   |
+|    ptr-vs-TMA      | rho > 1      | rho > 1      | ---  |
+|  ------------------+--------------+--------------+-------+
+|  L2 cache          |              |              |       |
+|    capacity        | ~65 MB       | ~65 MB       | G5   |
+|    miss latency    | ~420 cy      | measure      | G5   |
+|    multi-SM rate   | f(N_SM)      | f(N_SM)      | G5   |
+|  ------------------+--------------+--------------+-------+
+|  SMEM capacity     | 228 KB       | 128 KB       | ---  |
+|  Max warps         | 64           | 48           | ---  |
+|  SMs               | 148          | measure      | ---  |
+|  ------------------+--------------+--------------+-------+
+|  2CTA sync latency | UNVERIFIED   | UNVERIFIED   | G6   |
+|  ------------------+--------------+--------------+-------+
+|                                                           |
+|  Sources: ARCH_BW (all hardware params)                   |
+|           SEED_3  (L2 model on GB10)                      |
+|           NV_BLOG_TILE (TMA, Tile IR, CUDA 13.1)          |
+|  UNV = UNVERIFIED (requires measurement)                  |
++===========================================================+
+\end{BVerbatim}
+\caption{Calibration experiment matrix for B200 and
+  GB10.
+  Parameters anchored to~\cite{ARCH_BW} are listed
+  with expected values; \unverified{} entries require
+  independent measurement.
+  Gap references identify which \BUTA{} gaps each
+  measurement addresses.
+  \SMEM{} capacity differs between
+  platforms~\cite{ARCH_BW}.}
+\label{fig:calib-matrix}
+\end{figure}
+
+\begin{definition}[Cross-Platform Parameterisation]
+\label{def:cross-plat}
+The cost vector and tier-graph labels are instantiated
+separately for each platform:
+\begin{align}
+  \mathbf{c}(10.0) &: \text{B200-specific costs}
+    \notag\\
+  \mathbf{c}(12.0) &: \text{GB10-specific costs}
+    \notag
+\end{align}
+Key differences between platforms~\cite{ARCH_BW}:
+\begin{enumerate}[label=(\roman*)]
+  \item $C_{\SMEM{}}(10.0) = 228$\,KB vs.\
+    $C_{\SMEM{}}(12.0) = 128$\,KB.
+  \item $N_{\mathrm{WS}}(10.0) = 64$ warps vs.\
+    $N_{\mathrm{WS}}(12.0) = 48$ warps.
+  \item B200 has 148~SMs (8~GPCs, dual-die
+    NV-HBI)~\cite{ARCH_BW}; GB10 SM count differs.
+\end{enumerate}
+The solver must be run separately for each platform,
+as optimal schedules may differ due to resource
+bound differences~\cite{OPT_PIPE, ARCH_BW}.
+\end{definition}
+
+\begin{remark}
+SEED\_3~\cite{SEED_3} results (67\% L2 miss
+reduction, 60\% throughput increase) are validated on
+GB10 (cc\,12.0, 128\,KB \SMEM{}).
+Reproducing these results on B200 (228\,KB \SMEM{})
+requires adjusting the tile size parameters to respect
+the different \SMEM{} capacity; the larger \SMEM{} may
+permit deeper pipelining and larger tiles, potentially
+improving L2 hit rates \inference{}.
+\end{remark}
+
+
+\subsection{Solver Calibration Validation}
+\label{sec:calib:solver}
+
+\begin{definition}[Solver Output
+  Validation~\cite{OPT_PIPE, ARCH_BW}]
+\label{def:solver-valid}
+The calibrated solver is validated by:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Schedule rediscovery}: run the SMT solver
+    on Flash Attention dependence graphs with
+    calibrated Blackwell cost vector; verify that the
+    solver rediscovers schedules matching or exceeding
+    expert FA3/FA4 implementations~\cite{OPT_PIPE}.
+  \item \emph{Performance parity}: compile
+    solver-generated schedules to PTX ($> 9.0$) and
+    execute on B200/GB10; compare TFLOPS against expert
+    baselines~\cite{OPT_PIPE, ARCH_BW}.
+  \item \emph{Cross-generation distinction}: verify that
+    Blackwell-parameterised optimal schedules differ
+    structurally from Hopper-parameterised
+    schedules~\cite{OPT_PIPE}, confirming that the
+    cost vector captures architectural differences.
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Falsifiable Predictions for Solver]
+\label{def:fp-solver}
+\begin{enumerate}[label=(FP-\arabic*),start=13]
+  \item Solve time $< 60$ seconds for Flash
+    Attention-scale problems, consistent
+    with~\cite{OPT_PIPE} evaluation.
+  \item Calibrated solver rediscovers FA3/FA4-equivalent
+    schedules on Blackwell~\cite{OPT_PIPE}.
+  \item Blackwell cost parameterisation yields distinct
+    optimal schedule structure vs.\
+    Hopper~\cite{OPT_PIPE}.
+  \item With 2CTA extension ($\Phi_{\mathrm{2cta}}$),
+    solver achieves lower $\II$ on dense MMA kernels
+    than single-CTA
+    formulation~\cite{NV_BLOG_TILE} \inference{}.
+\end{enumerate}
+\end{definition}
+
+
+% ====================================================================
+%  SECTION 16 — WORKLOAD CHARACTERISATION
+% ====================================================================
+\section{Workload Characterisation}
+\label{sec:workload-char}
+
+This section specifies the methods for classifying
+workloads within \BUTA{}'s workload descriptor
+$\mathcal{W}$ (Part~2, Definition~4.7) and conditioning
+the solver cost vector accordingly.
+
+\subsection{Per-Operator Arithmetic Intensity Profiling}
+\label{sec:workload-char:ai}
+
+\begin{definition}[Arithmetic Intensity
+  Computation~\cite{ARCH_BW, NV_workloads}]
+\label{def:ai-compute}
+For each tile-level operation $\mathrm{op}_i$ in a
+workload, compute:
+\begin{equation}
+  \mathrm{AI}_i =
+  \frac{\mathrm{FLOP}(\mathrm{op}_i, p_i)}
+       {\mathrm{Bytes}(\mathrm{op}_i, T_i)}
+  \label{eq:ai}
+\end{equation}
+where $\mathrm{FLOP}(\mathrm{op}_i, p_i)$ is the
+floating-point operation count at precision~$p_i$
+(accounting for the $177\times$ throughput scaling
+from FP64 to FP4~\cite{ARCH_BW}),
+and $\mathrm{Bytes}(\mathrm{op}_i, T_i)$ is the
+total data volume for tile shape~$T_i$ (input operands
++ output, counted at the memory tier from which they
+are sourced).
+\end{definition}
+
+\begin{definition}[Reuse Class
+  Assignment~\cite{SEED_3, NV_workloads}]
+\label{def:reuse-class}
+Each operator receives a reuse class
+$r_i \in \{\texttt{streaming},\, \texttt{reuse},\,
+\texttt{mixed}\}$ based on its access pattern:
+\begin{enumerate}[label=(\roman*)]
+  \item \texttt{streaming}: each data element is
+    accessed once per tile invocation
+    (e.g., $K$, $V$ tiles in Flash
+    Attention)~\cite{SEED_3}.
+  \item \texttt{reuse}: data elements are accessed
+    multiple times across tile invocations
+    (e.g., $Q$ tiles resident in
+    \SMEM{})~\cite{SEED_3}.
+  \item \texttt{mixed}: workload contains operators of
+    both types
+    (e.g., Flash Attention as a
+    whole)~\cite{NV_workloads}.
+\end{enumerate}
+The reuse class determines which cache model tier
+is dominant: L2 for streaming, potentially
+L1+\SMEM{} for reuse patterns~\cite{SEED_3}.
+\end{definition}
+
+
+\subsection{HARP Taxonomy Integration}
+\label{sec:workload-char:harp}
+
+\begin{definition}[Workload Classification
+  Procedure~\cite{NV_workloads, ARCH_BW}]
+\label{def:harp-classify}
+Classify each target workload along both HARP
+axes~\cite{NV_workloads}:
+\begin{enumerate}[label=(\roman*)]
+  \item \emph{Depth of compute}: determine whether the
+    computation is leaf-only (all compute at SM level)
+    or hierarchical (compute distributed across
+    hierarchy).
+    For Blackwell, all workloads targeted by \BUTA{}
+    are leaf-only (compute at SM
+    level)~\cite{NV_workloads}.
+  \item \emph{Location of heterogeneity}: classify the
+    SM as intra-node heterogeneous (CUDA cores + tensor
+    cores as distinct
+    sub-accelerators)~\cite{NV_workloads, ARCH_BW}.
+    Operators mapping to different sub-accelerators
+    receive different cost entries in
+    $\mathbf{c}(x)$.
+\end{enumerate}
+\end{definition}
+
+\begin{figure}[t]
+\centering
+\begin{BVerbatim}[fontsize=\scriptsize]
++===========================================================+
+|  Workload Characterisation Flow                           |
++===========================================================+
+|                                                           |
+|  INPUT: Tile program P with operators op_1, ..., op_n     |
+|                                                           |
+|  STEP 1: Per-Operator Profiling                           |
+|  +-----------------------------------------------------+  |
+|  | For each op_i:                                       |  |
+|  |   Compute AI_i = FLOP(op_i, p_i) / Bytes(op_i, T_i) |  |
+|  |   Assign reuse class r_i [SEED_3, NV_workloads]     |  |
+|  |   Record precision p_i in P [ARCH_BW]               |  |
+|  |   Map to sub-accelerator:                            |  |
+|  |     MMA -> TC_5thgen (c_MMA ~ 11.2 cy)              |  |
+|  |     softmax -> CUDA cores (c_ALU)                    |  |
+|  |     TMA -> TMA unit (c_TMA)                          |  |
+|  |     TMEM cp -> tcgen05 (c_cp)                        |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STEP 2: HARP Classification [NV_workloads]               |
+|  +-----------------------------------------------------+  |
+|  | Depth of compute: leaf-only (SM-level)               |  |
+|  | Heterogeneity: intra-node (CUDA + TC) [ARCH_BW]     |  |
+|  | Workload type:                                       |  |
+|  |   all op_i same AI class -> homogeneous              |  |
+|  |   mix of high-AI + low-AI -> mixed-reuse             |  |
+|  | Cross-depth: not applicable for BUTA targets         |  |
+|  +--+--------------------------------------------------+  |
+|     |                                                     |
+|  STEP 3: Cost Vector Conditioning                         |
+|  +-----------------------------------------------------+  |
+|  | Construct W = {(op_i, AI_i, r_i, p_i) : i in [n]}   |  |
+|  | Map W -> c(x) via:                                   |  |
+|  |   c(op_i) = calibrated latency [Sec 15]             |  |
+|  |   Adjust for precision: sigma(p_i) -> SASS class    |  |
+|  |   Weight by AI for OBJ-3 [Part 2]                   |  |
+|  | Feed c(x) to solver [Sec 11]                         |  |
+|  +-----------------------------------------------------+  |
+|                                                           |
+|  OUTPUT: Workload descriptor W                            |
+|          Conditioned cost vector c(x)                     |
++===========================================================+
+\end{BVerbatim}
+\caption{Workload characterisation flow.
+  Each operator is profiled for arithmetic intensity
+  and reuse class~\cite{NV_workloads, SEED_3},
+  mapped to a Blackwell
+  sub-accelerator~\cite{ARCH_BW}, and classified
+  under the HARP
+  taxonomy~\cite{NV_workloads}.
+  The output conditions the solver cost
+  vector~\cite{OPT_PIPE}.}
+\label{fig:workload-flow}
+\end{figure}
+
+
+\subsection{Cost Vector Conditioning from
+            Workload Descriptor}
+\label{sec:workload-char:cost}
+
+\begin{definition}[$\mathcal{W} \to \mathcal{S}$
+  Interface
+  Realisation~\cite{OPT_PIPE, NV_workloads, ARCH_BW}]
+\label{def:w-to-s}
+The interface constraint
+$\Psi_{\mathcal{W} \to \mathcal{S}}$ (Part~2,
+Definition~4.9(iii)) is realised by constructing
+the cost vector $\mathbf{c}(x)$ as follows:
+\begin{enumerate}[label=(\roman*)]
+  \item For each MMA operation: cost
+    $c_{\mathrm{MMA}}(p_i, T_i)$ from calibration
+    (\cref{def:mma-calib}),
+    SASS class $\sigma(p_i)$ from the precision
+    lattice~\cite{ARCH_BW}.
+  \item For each \tma{} operation: cost
+    $c_{\tma{}}(T_i)$ from calibration
+    (\cref{def:tma-calib})~\cite{NV_BLOG_TILE}.
+  \item For each ALU operation: cost
+    $c_{\mathrm{ALU}}$ from standard SM latency;
+    reduced-precision epilogues may use tensor-core
+    reduction paths \unverified{}.
+  \item Apply ZLP normalisation
+    (\cref{def:zlp})~\cite{OPT_PIPE} to obtain
+    integer costs $\hat{\mathbf{c}}(x)$.
+\end{enumerate}
+For mixed-reuse workloads~\cite{NV_workloads}, the
+cost vector contains heterogeneous entries:
+high-$\mathrm{AI}$ MMA operations have cost dominated
+by compute latency, while low-$\mathrm{AI}$ epilogue
+operations have cost dominated by memory access
+latency~\cite{ARCH_BW, NV_workloads}.
+\end{definition}
+
+\begin{remark}
+The precision lattice introduces a multiplicative
+factor: throughput scales up to $177\times$ from FP64
+to FP4~\cite{ARCH_BW}, implying that the
+\emph{effective} cost per FLOP varies by two orders of
+magnitude across precision choices.
+The per-operator cost in $\mathbf{c}(x)$ must
+therefore be normalised to a common unit (e.g.,
+cycles per tile) rather than cycles per
+FLOP~\cite{OPT_PIPE, ARCH_BW}.
+Block scaling formats (MXFP4, MXFP8) add scale-factor
+handling overhead not captured in the base cost model
+\unverified{} (gap~G8).
+\end{remark}
+
+
+% ====================================================================
+%  SUMMARY
+% ====================================================================
+\section*{Part~3 Summary}
+
+This part has developed the computational machinery
+required to operationalise the \BUTA{} model defined in
+Part~2.
+\Cref{sec:solver} specified solver encodings (ILP,
+SMT, 2CTA extension, ZLP normalisation)
+that translate the abstract constraint system
+$\mathcal{S}$ into executable solver
+inputs~\cite{OPT_PIPE, NV_BLOG_TILE, ARCH_BW}.
+\Cref{sec:layout-tool} defined a three-layer layout
+verification pipeline spanning
+$\Ftwo$~\cite{SEED_1},
+\ISL{}~\cite{SEED_2}, and
+categorical~\cite{SEED_4} representations.
+\Cref{sec:dm-pipeline} operationalised \tma{}
+descriptor generation and token DAG construction
+with decidable DRF
+verification~\cite{NV_BLOG_TILE, ARCH_BW}.
+\Cref{sec:cache-pipe} instantiated the reuse-distance
+cache traffic model for
+Blackwell~\cite{SEED_3, ARCH_BW} and formalised
+tile ordering as an optimisation variable.
+\Cref{sec:calibration} defined the full calibration
+microbenchmark plan with 16~falsifiable predictions
+covering \tcgen{} latency, \TMEM{} bandwidth,
+\tma{} overhead, L2 characterisation, and
+solver validation~\cite{ARCH_BW, OPT_PIPE}.
+\Cref{sec:workload-char} specified workload
+classification methods using the HARP
+taxonomy~\cite{NV_workloads} and precision-dependent
+cost conditioning~\cite{ARCH_BW}.
+
+Part~4 will define the evaluation strategy, benchmark
+suite, reproducibility plan, and threat analysis that
+complete the \BUTA{} proposal.
+
+
+% ====================================================================
+%  SOURCE AUDIT
+% ====================================================================
+\section*{Source Audit (Part~3)}
+\label{sec:audit-p3}
+
+\noindent
+All eight golden sources are cited in this part.
+\Cref{tab:audit-p3} records usage.
+
+\begin{table}[H]
+\centering
+\caption{Part~3 source audit: usage and anchors.}
+\label{tab:audit-p3}
+\footnotesize
+\begin{tabular}{@{}p{1.3cm}p{6.0cm}@{}}
+\toprule
+\textbf{ID} & \textbf{Used for (anchor)} \\
+\midrule
+ARCH\_BW &
+  Cost vector parameterisation
+  (\tcgen{}.mma 11.0--11.4\,cy, 4 exec ctx,
+  64/48 warps, 148 SMs);
+  tier-graph labels (\TMEM{} 256\,KB,
+  \SMEM{} 228/128\,KB, L2 ${\sim}$65\,MB);
+  \TMEM{} bandwidth \unverified{} (${\sim}$16/8\,TB/s);
+  calibration: precision lattice, SASS mappings,
+  MMA.2SM TPC bandwidth, 58\% miss-latency reduction;
+  cross-platform differences cc\,10.0 vs.\ 12.0;
+  AI profiling: 177$\times$ throughput scaling. \\
+\addlinespace
+OPT\_PIPE &
+  ILP encoding for modulo scheduling (\cref{def:ilp-constraints});
+  SMT encoding for joint SWP+WS
+  ($\mathrm{op}[v,i,t]$, $W(v)$, clause structure);
+  ZLP normalisation procedure;
+  solver validation: Twill rediscovery of FA schedules;
+  solve-time prediction ($< 60$\,s);
+  cost-vector conditioning via $\mathcal{W}$. \\
+\addlinespace
+NV\_BLOG\_ TILE &
+  2CTA constraint encoding
+  ($\texttt{num\_ctas}{=}2$,
+  $\Phi_{\mathrm{2cta}}$);
+  \tma{} descriptor types (idesc, sdesc);
+  token-ordered memory model (DAG construction rules,
+  DRF definition);
+  \tma{} vs.\ pointer performance;
+  CUDA 13.1 / PTX $>$ 9.0 requirement;
+  occupancy hint limitation. \\
+\addlinespace
+NV\_work\-loads &
+  Workload characterisation:
+  HARP two-axis taxonomy (depth $\times$ heterogeneity);
+  mixed-reuse classification;
+  reuse class assignment;
+  cost-vector conditioning for heterogeneous operators;
+  SM sub-accelerator mapping. \\
+\addlinespace
+SEED\_1 &
+  $\Ftwo$ library interface (compose, convert, rank,
+  enumerate);
+  layout bit-width dependence on precision;
+  linear fragment identification;
+  candidate layout enumeration for joint solver;
+  verification pipeline Layer~1. \\
+\addlinespace
+SEED\_2 &
+  \ISL{} relation construction (Algorithm~1);
+  swizzle as bit-level ISL operation;
+  contiguity analysis for \tma{} descriptor generation;
+  composition verification via cardinality;
+  verification pipeline Layer~2;
+  layout size/co-size diagnostics. \\
+\addlinespace
+SEED\_3 &
+  Reuse-distance computation algorithm;
+  sawtooth ordering bound;
+  67\% L2 miss reduction on GB10 (370M $\to$ 120M
+  sectors, falsifiable prediction);
+  L1 negligible for streaming;
+  L2 hit rate ${\sim} f(N_{\mathrm{SM}})$;
+  cache pipeline Stages~1--4;
+  ordering optimisation. \\
+\addlinespace
+SEED\_4 &
+  Categorical construction validation (tractability
+  check, CUTLASS alignment);
+  $\mathbf{Tuple}$/$\mathbf{Nest}$ morphism
+  decomposition;
+  verification pipeline Layer~3;
+  functor $F$ target validation. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ====================================================================
+%  BIBLIOGRAPHY
+% ====================================================================
+\begin{thebibliography}{8}
+
+\bibitem{ARCH_BW}
+A.~Jarmusch and S.~Chandrasekaran,
+``Microbenchmarking NVIDIA's Blackwell Architecture:
+An In-Depth Architectural Analysis,''
+\emph{arXiv:2512.02189v1}, Dec.~2025.
+\url{https://arxiv.org/html/2512.02189v1}
+
+\bibitem{OPT_PIPE}
+K.~Soi, A.~Venkat, T.~Nowicki, and
+G.~Biros,
+``Optimal Software Pipelining and Warp
+Specialization for Tensor Core GPUs,''
+\emph{arXiv:2512.18134v1}, Dec.~2025.
+\url{https://arxiv.org/html/2512.18134v1}
+
+\bibitem{NV_BLOG_TILE}
+NVIDIA,
+``Advancing GPU Programming with the CUDA Tile IR
+Backend for OpenAI Triton,''
+\emph{NVIDIA Developer Blog}, Jan.~2026.
+\url{https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/}
+
+\bibitem{NV_workloads}
+S.~Garg, M.~Pellauer, and T.~Krishna,
+``HARP: A Taxonomy for Heterogeneous and
+Hierarchical Processors for Mixed-Reuse Workloads,''
+\emph{arXiv:2502.13113}, Feb.~2025.
+\url{https://arxiv.org/html/2502.13113}
+
+\bibitem{SEED_1}
+J.~Zhou, M.~Lezcano, A.~Goucher, et~al.,
+``Linear Layouts: Robust Code Generation of Efficient
+Tensor Computation Using $\mathbb{F}_2$,''
+\emph{arXiv:2505.23819v3}, Oct.~2025.
+\url{https://arxiv.org/html/2505.23819v3}
+
+\bibitem{SEED_2}
+S.~Bhaskaracharya, N.~Acharya, M.~Hagedorn,
+and S.~Grover,
+``Modeling Layout Abstractions Using Integer Set
+Relations,''
+\emph{arXiv:2511.10374v1}, Nov.~2025.
+\url{https://arxiv.org/html/2511.10374v1}
+
+\bibitem{SEED_3}
+Z.~Zhu, J.~Pan, and Y.~Ding,
+``Sawtooth Wavefront Reordering: Enhanced CuTile
+FlashAttention on NVIDIA GB10,''
+\emph{arXiv:2601.16032v2}, Jan.~2026.
+\url{https://arxiv.org/html/2601.16032v2}
+
+\bibitem{SEED_4}
+R.~Carlisle, A.~Shah, H.~Stern, and
+D.~VanKoughnett,
+``Categorical Foundations for CuTe Layouts,''
+\emph{arXiv:2601.05972v1}, Jan.~2026.
+\url{https://arxiv.org/pdf/2601.05972v1}
+
+\end{thebibliography}
+
+\end{document}

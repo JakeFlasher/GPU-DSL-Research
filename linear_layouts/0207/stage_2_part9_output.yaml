@@ -1,0 +1,860 @@
+context_pack_version: "S2.v2"
+generated_at_utc: "2026-02-06T04:33:38Z"
+project_profile:
+  objective: "Develop a theory-first formal model to evaluate and solve Blackwell GPU architecture problems under CUDA>13 and PTX>9; output a 9-part academic LaTeX proposal."
+  hard_constraints:
+    architecture: "NVIDIA Blackwell (Grace-Blackwell allowed when relevant)"
+    cuda: "> 13.0 (prefer 13.1+)"
+    ptx: "> 9.0 (strict)"
+    required_sources_each_run: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  writing_constraints:
+    latex_style: "academic, math-first"
+    output_split: ">= 9 LaTeX parts; each LaTeX run emits exactly 1 part"
+    citation_policy: "no uncited non-trivial claims; mark UNVERIFIED if not in sources"
+  scope_boundaries:
+    include:
+      - "formal semantics/models"
+      - "layout algebra"
+      - "integer relations"
+      - "constraint optimization (SMT/ILP)"
+      - "cache/traffic modeling"
+      - "TMEM/TMA/tile IR as modeled objects"
+      - "scheduling (SWP/WS/CTA)"
+    exclude:
+      - "marketing-only claims without evidence"
+      - "non-Blackwell architectures except as explicit comparison or modeling baseline"
+golden_sources:
+  ARCH_BW: {url: "https://arxiv.org/html/2512.02189v1", tier: "tier_1_insight"}
+  OPT_PIPE: {url: "https://arxiv.org/html/2512.18134v1", tier: "tier_1_insight"}
+  NV_BLOG_TILE:
+    url: "https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/"
+    tier: "tier_1_insight"
+  NV_workloads: {url: "https://arxiv.org/html/2502.13113", tier: "tier_2_modeling_context"}
+  SEED_1: {url: "https://arxiv.org/html/2505.23819v3", tier: "tier_4_context"}
+  SEED_2: {url: "https://arxiv.org/html/2511.10374v1", tier: "tier_4_context"}
+  SEED_3: {url: "https://arxiv.org/html/2601.16032v2", tier: "tier_4_context"}
+source_audit:
+  ARCH_BW:
+    used_for: |-
+      Empirical Blackwell (B200) microarchitectural facts and microbenchmark methodology to ground and calibrate model parameters for:
+      - TMEM (size, addressing structure, latency, bandwidth, and the requirement to use tcgen05.* for TMEM data movement),
+      - Decompression Engine (DE) throughput/pipeline depth vs chunk size,
+      - 5th-gen Tensor Core path via tcgen05.mma latency/SASS mapping,
+      - software-ecosystem/toolchain constraints (CUDA 13.0 preliminary TMEM/CTA support; FP6 tooling gap).
+      ([arxiv.org](https://arxiv.org/pdf/2512.02189))
+    anchors:
+      - "III-A Blackwell Architecture: B200 dual-die unified via NV-HBI; unified HBM3e memory space (hardware-instance context). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "IV PTX-microbenchmark methodology: PTX-to-SASS validation; TMEM baseline via pointer-chase; instruction/stride sweeps. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "V-A Tensor Memory (TMEM): 256KB per SM; lane-column addressing; 420-cycle miss latency; 16 TB/s read + 8 TB/s write; tcgen05.ld/st. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "V-B Decompression Engine (DE): seven formats; throughput methodology; pipeline depth at >85% efficiency (Table III). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "VI Tensor Cores: tcgen05.mma PTX + SASS mapping (Table IV) and single-instruction latency vs Hopper wgmma (Table V). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "VIII Discussion: CUDA 13.0 preliminary TMEM/CTA support; FP6 hardware support but missing tooling. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+  OPT_PIPE:
+    used_for: |-
+      Formal, solver-ready constraint system for joint software pipelining (modulo scheduling) and warp specialization:
+      - modulo schedule encoding via boolean schedule tensor and feasibility constraints (Figure 4),
+      - memory-capacity feasibility via SSA liveness constraints (Figure 5),
+      - warp-assignment feasibility incl. variable-latency isolation and concurrency/synchronization constraints (Figure 6),
+      - unsatisfiability handling via monotone search over initiation interval and schedule length (Algorithm 1),
+      - toolchain baseline (all experiments use CUDA 13.0) and Blackwell-specific observations (additional synchronization due to Tensor Memory loads/stores).
+      ([arxiv.org](https://arxiv.org/html/2512.18134v1))
+    anchors:
+      - "4.1 Modulo Scheduling with Constraints: uniqueness/consistency/completion/dependence/capacity constraints (Figure 4). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "4.2 Memory Aware Constraints: SSA liveness + capacity constraints (Figure 5). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "4.3 Warp Assignment Constraints: variable latency, register limits, cross-warp spills, concurrency (Figure 6). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Algorithm 1: monotone (II, schedule-length) search to recover satisfiable optimum. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "SMT theory/solver detail: QFLIA in Yices2 (implementation detail for planned solver embedding). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "6.1 Evaluation Platforms: H100 + B200; all experiments use CUDA 13.0. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "6.2.2 Blackwell: strategy differences attributed to faster TC + more required sync for Tensor Memory loads/stores; claimed rediscovery of FA4 strategy. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+  NV_BLOG_TILE:
+    used_for: |-
+      Toolchain/IR boundary constraints for CUDA Tile IR backend (Triton-to-TileIR):
+      - prerequisites (CUDA 13.1+ and Blackwell GPUs),
+      - compilation selection and verification (.tileIR cache artifacts; ENABLE_TILE=1),
+      - currently known limitations (unsupported ops; tensor-of-pointer degradation on CUDA 13.1),
+      - formalizable descriptorization interface for data movement (tl.make_tensor_descriptor with shape/strides/block_shape; desc.load/store).
+      ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))
+    anchors:
+      - "CUDA Tile introduced in CUDA 13.1; Tile IR described as MLIR-based IR with a spec defining semantics/ops/type system. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "Prerequisites: CUDA 13.1+; GPU architecture: NVIDIA Blackwell GPUs; source-based build only. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "Verify compilation: ENABLE_TILE=1; cache uses .tileIR rather than .cubin. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "Limitation: tensor-of-pointer pattern suboptimal on Tile IR backend with CUDA 13.1; mitigation includes descriptor+TMA rewrite. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "TMA descriptor pattern: descriptor parameters (base, shape, strides, block_shape) and desc.load/store offsets. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+  NV_workloads:
+    used_for: |-
+      Modeling vocabulary and higher-level evaluation scaffold for mixed-reuse workloads:
+      - mapping as loop transformations (permutation/parallelization/tiling),
+      - mixed-reuse workload structure and dependency-limited overlap,
+      - Harp taxonomy to describe hierarchical/heterogeneous processor decompositions,
+      - Timeloop-based evaluation framework (per-op blackbox mapping on sub-accelerators + aggregation + resource partitioning).
+      Used as tier-2 context (not Blackwell-specific microarchitectural facts).
+      ([arxiv.org](https://arxiv.org/html/2502.13113))
+    anchors:
+      - "II-A Mapping definition: mapping is a set of loop transformations (incl. permutation/parallelization/tiling) affecting reuse/utilization. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "II-B Mixed-reuse workload definition and transformer examples. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "IV Harp Taxonomy + note: existing-work table does not cover some plausible combinations (explicit taxonomy gap). ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "VI-A Evaluation Framework: Timeloop-based pipeline, architecture-file generation, mapping constraints, per-op mapping. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+  SEED_1:
+    used_for: |-
+      Primary layout-algebra formalism (linear layouts over F2):
+      - definitions and operators (composition/product/left-division/right-inverse),
+      - completeness results for distributed and memory layouts,
+      - closure/minimality of a layout family under Triton shape ops (layout-propagation semantics),
+      - bank-conflict wavefront model and optimal swizzling as a formal cost/constraint hook.
+      ([arxiv.org](https://arxiv.org/html/2505.23819v3))
+    anchors:
+      - "Definition 4.1–4.5: linear layouts + composition/product/left division/right inverse. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Theorem 4.9 + Definition 4.10: distributed layouts are linear layouts; formal distributed-layout family. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Theorem 4.13 + Definition 4.14: memory layouts as invertible linear layouts (offsets ↔ coordinates). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Theorem 5.1: SIMD primitive applicability via existence of left division. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Lemma 9.4: shared-memory bank-conflict wavefront lower bound/exactness criterion. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Limitations: power-of-two shapes; flipping/slicing need affine extension; call for hardware measurement integration. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+  SEED_2:
+    used_for: |-
+      Alternative/unifying layout formalism via integer set relations (ISL):
+      - representation of CuTe layouts + swizzles and Triton linear layouts as relations,
+      - quasi-affine constructs for tiling/coordinate mappings,
+      - reconstruction algorithms (get_layout_strictly_affine; get_layout_from_strides),
+      - explicit open problem: infer both shape and strides from layout mapping alone.
+      ([arxiv.org](https://arxiv.org/html/2511.10374v1))
+    anchors:
+      - "ISL background: integer set relations and operations; quasi-affine extensions. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "Algorithm get_layout_strictly_affine + correctness argument. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "Algorithm get_layout_from_strides + open problem statement about inferring both shape and strides from mapping alone. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "CuTe operations incl. complement; relation-based constructions (overview). ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+  SEED_3:
+    used_for: |-
+      Analytic cache/traffic component and scheduling-level locality transformation on Grace-Blackwell (GB10):
+      - L2 sector-access model variables/formulas and error analysis,
+      - empirical counter methodology (Nsight Compute) and observation about L1Tex→L2 dominated traffic,
+      - persistent vs non-persistent CTA scheduling comparison under saturation,
+      - sawtooth traversal order (Algorithm 4) and CuTile validation; plus limitations (tile-size fits shared memory; compiler tile splitting).
+      ([arxiv.org](https://arxiv.org/html/2601.16032v2))
+    anchors:
+      - "3.2 Modeling L2 Sector Access: variable list + validated formula + MAPE table. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Persistent vs non-persistent CTA scheduling: nearly identical L1/L2 counters when SM=48 saturated; negligible L1 hits; L1Tex-driven L2 traffic. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Algorithm 4: Sawtooth KV Access Pattern (alternating scan). ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "CUDA + CuTile results summary: miss reductions and throughput increases; limitation about tile size and compiler splitting. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Counter methodology: Nsight Compute CLI. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+formalism_index:
+  ARCH_BW:
+    definitions:
+      - "B200 dual-die Blackwell GPU unified to software via NV-HBI, presented as a single device with unified HBM3e memory space. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "TMEM: dedicated 256KB on-chip memory per SM for Tensor Core operations; lane-column addressing. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "tcgen05.* instruction family: required for TMEM data movement; some prior data movement instructions cannot interface with TMEM (as stated). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "DE: hardware decompression engine with throughput/pipeline-depth characterization across multiple formats. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "PTX microbenchmark methodology includes PTX-to-SASS audit for path validation. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    operators_or_constructions:
+      - "Latency isolation via pointer-chase benchmarks to prevent pipeline overlap. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "Instruction-family comparison via access-pattern sweeps. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "Bandwidth saturation sweeps over operand sizes and strides. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    theorems_or_propositions: []
+    proof_techniques:
+      - "Empirical validation via controlled microbenchmarks plus translation audit. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    algorithmic_artifacts:
+      - "Microbenchmark suite for TMEM, tcgen05 instructions, and DE characterization. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    modeling_assumptions:
+      - "Toolchain sensitivity: measured parameters may change under CUDA>13.0/PTX>9.0 (UNVERIFIED). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+  OPT_PIPE:
+    definitions:
+      - "Loop dependence graph G=(V,E); initiation interval (II); modulo schedule with periodic time slots. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "SMT schedule encoding via constraints enforcing a valid modulo schedule (Figure 4). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "SSA liveness encoding live[val,time] to enforce working-set capacity (Figure 5). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Warp assignment encoding opw[op,warp] with constraints (Figure 6). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    operators_or_constructions:
+      - "Unified constraint conjunction for schedule + memory + warp assignment + concurrency. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Monotone search over (II, schedule length) to resolve unsatisfiability (Algorithm 1). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "LP seeding + SMT refinement; SMT in QFLIA (Yices2). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    theorems_or_propositions:
+      - "Stated optimality guarantee for supported program class, relative to constraints and chosen tile size (conditional). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    proof_techniques:
+      - "LP + SMT (QFLIA) with invariants embodied as constraints. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    algorithmic_artifacts:
+      - "Constraint templates (Figures 4–6) and Algorithm 1. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    modeling_assumptions:
+      - "Program class restriction: singly-nested loops without additional control flow. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Tile size not auto-selected; optimality conditional on tile-size choice. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Empirical results use CUDA 13.0; portability to CUDA 13.1+ and PTX>9.0 is UNVERIFIED. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+  NV_BLOG_TILE:
+    definitions:
+      - "CUDA Tile: tile-based GPU programming model introduced in CUDA 13.1. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "CUDA Tile IR: MLIR-based IR/spec describing semantics, ops, and type system. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "Triton-to-TileIR backend: compilation path from Triton to CUDA Tile IR rather than PTX. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "Tensor descriptor: (base pointer, shape, strides, block_shape) used for TMA-backed tile transfers. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+    operators_or_constructions:
+      - "Backend selection and verification: ENABLE_TILE=1; observe .tileIR cache artifacts. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "Descriptorization rewrite: tensor-of-pointers → tensor descriptor + desc.load/store. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+    theorems_or_propositions: []
+    proof_techniques: ["Engineering blog; relies on stated prerequisites/limitations and demonstrative code. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"]
+    algorithmic_artifacts:
+      - "Source-build procedure; tutorial verification; rewrite pattern example. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+    modeling_assumptions:
+      - "Backend is early stage with incomplete op support; performance issues described as temporary. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+  NV_workloads:
+    definitions:
+      - "Mapping: loop transformations (permutation/parallelization/tiling) determining reuse and utilization. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "Mixed-reuse workloads: include both high- and low-arithmetic-intensity ops with dependency-limited overlap. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "Harp taxonomy: classifies hierarchical/heterogeneous processors along axes including compute placement and heterogeneity location. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "Timeloop-based evaluation framework for Harp (per-op mapping + aggregation + resource partitioning). ([arxiv.org](https://arxiv.org/html/2502.13113))"
+    operators_or_constructions:
+      - "Blackbox mapping decomposition: per-op mapping search run independently on sub-accelerators. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+      - "Resource partitioning sensitivity analysis (e.g., bandwidth). ([arxiv.org](https://arxiv.org/html/2502.13113))"
+    theorems_or_propositions: []
+    proof_techniques: ["Empirical/simulation-based evaluation using Timeloop mappings. ([arxiv.org](https://arxiv.org/html/2502.13113))"]
+    algorithmic_artifacts:
+      - "Framework built on Timeloop v0.4 + wrapper. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+    modeling_assumptions:
+      - "Not Blackwell-specific; direct instantiation to Blackwell requires additional measurement/calibration (UNVERIFIED). ([arxiv.org](https://arxiv.org/html/2502.13113))"
+  SEED_1:
+    definitions:
+      - "Linear layout: linear map between labeled vector spaces over F2 (Definition 4.1). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Layout operators: composition/product/left division/right inverse (Definitions 4.2–4.5). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Distributed layout family (Definition 4.10) and memory layout family (Definition 4.14). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "Shared-memory bank-conflict wavefront criterion (Lemma 9.4). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    operators_or_constructions:
+      - "Layout closure under Triton shape operations (Theorem 9.3 referenced). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "SIMD applicability check via left division (Theorem 5.1). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    theorems_or_propositions:
+      - "Completeness: distributed layouts and memory layouts are linear layouts (Theorems 4.9 and 4.13). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    proof_techniques:
+      - "Linearity/closure arguments + constructive matrix proofs; Gaussian elimination for right inverses (as described). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    algorithmic_artifacts:
+      - "Layout propagation rationale via closure/minimality; bank-conflict optimal swizzle algorithm referenced. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    modeling_assumptions:
+      - "Power-of-two shape restriction; affine extension suggested for flips/slices. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+  SEED_2:
+    definitions:
+      - "Integer set relation (ISL): mapping between integer spaces specified by affine/quasi-affine constraints. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "ISL operations: composition/inverse/domain/range; quasi-affine extensions with floor/ceiling. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "Algorithm get_layout_strictly_affine reconstructs strides from strictly affine index mapping given a shape. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "Algorithm get_layout_from_strides; open problem: infer both shape and strides from layout mapping alone. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    operators_or_constructions:
+      - "Represent CuTe layout mapping as relation compositions; represent swizzles as relations. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "Layout complement construction via gap-filling (overview). ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    theorems_or_propositions:
+      - "Correctness arguments are provided adjacent to algorithms (as prose proofs). ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    proof_techniques:
+      - "Polyhedral/relational reasoning via relation operations; bit-level reasoning for swizzle mapping. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    algorithmic_artifacts:
+      - "isl-layout tool and algorithm suite for layout operations/reconstruction. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    modeling_assumptions:
+      - "Worst-case exponential complexity for relation operations; practicality depends on ISL heuristics and instance structure. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+  SEED_3:
+    definitions:
+      - "L2 sector-access model variables and validated formulas. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "CTA scheduling modes compared (persistent vs non-persistent) with near-identical counters under saturation for studied workload. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Sawtooth wavefront reordering defined by alternating KV traversal direction (Algorithm 4). ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Limitation: sawtooth assumes tile size fits shared memory; compiler tile splitting can alter access patterns. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+    operators_or_constructions:
+      - "Traversal-order transformation: cyclic → sawtooth permutation of KV tile order. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Counter-based validation methodology using Nsight Compute. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+    theorems_or_propositions: []
+    proof_techniques:
+      - "Model validation via comparing predicted sector counts against measured counters (MAPE reported). ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+    algorithmic_artifacts:
+      - "Algorithm 4 (sawtooth) and CuTile validation implementations. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+    modeling_assumptions:
+      - "Model begins with single-batch single-head; scaling assumptions outside tested regimes need confirmation (UNVERIFIED). ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+evidence_index:
+  ARCH_BW:
+    key_claims:
+      - claim: "TMEM is a dedicated 256KB on-chip memory per SM for Tensor Core operations, structured as a 2D array and using a lane-column addressing scheme."
+        support: "Section V-A 'Tensor Memory (TMEM)' (TMEM size/structure/addressing). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "B200-specific characterization target."
+      - claim: "TMEM end-to-end access latency in cache-miss scenarios is reported as 420 cycles; the paper attributes improvement vs Hopper global-memory latency to TMEM’s dedicated arbitration bypassing L2-partition contention."
+        support: "Section V-A TMEM latency discussion. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "Interpret as measured under the paper’s toolchain and benchmark design."
+      - claim: "TMEM per-SM bandwidth is reported as 16 TB/s read and 8 TB/s write, and stated to operate additively with L1/SMEM bandwidth."
+        support: "Section V-A TMEM bandwidth statement. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "Use as parameter prior; re-calibrate per SKU/toolchain."
+      - claim: "Blackwell introduces tcgen05.mma PTX with measured single-instruction latency around 11.0–11.4 cycles for several tile sizes; Table V contrasts with Hopper wgmma latencies."
+        support: "Table V and surrounding discussion. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "All measurements in Table V are FP16; TMEM used only for accumulators (as stated)."
+      - claim: "Microbenchmark methodology includes pointer-chase to isolate memory-tier latency and PTX-to-SASS audit to validate intended execution path."
+        support: "Section IV methodology and TMEM evaluation strategies. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "Directly informs calibration plan design."
+      - claim: "DE characterization measures throughput across seven formats and reports chunk-size-dependent pipeline depth defined at >85% efficiency (Table III)."
+        support: "Section IV DE characterization description and Table III. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "Hook for modeling DE as a throughput-limited transform."
+      - claim: "Software ecosystem note: CUDA 13.0 provides preliminary TMEM/CTA support; FP6 hardware support exists but tooling is lacking."
+        support: "Discussion section (Software Ecosystem). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+        blackwell_relevance: "direct"
+        confidence: "medium"
+        notes: "Project targets CUDA>13.0; must re-validate under CUDA 13.1+."
+    explicit_limitations_or_open_questions:
+      - "PTX version requirements/availability for tcgen05/TMEM instructions are not specified; compliance with PTX>9.0 is UNVERIFIED within this source. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "Numeric performance results are measured on B200; transfer to other Blackwell SKUs (e.g., GB10) requires calibration (UNVERIFIED). ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+  OPT_PIPE:
+    key_claims:
+      - claim: "Twill defines a joint optimization: produce a modulo schedule (min II) together with a warp assignment that realizes it, by solving a unified constraint system."
+        support: "Section 4 'Joint Optimization Problem' framing + constraint sections. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+        notes: "Core scheduling formalism to embed in the model."
+      - claim: "Modulo scheduling is encoded as SMT constraints over a boolean schedule tensor (op, iter, time) enforcing uniqueness/consistency/completion/dependence/capacity (Figure 4)."
+        support: "Figure 4 and surrounding text. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Working-set feasibility is enforced via SSA liveness variables and memory-capacity constraints with backward propagation (Figure 5)."
+        support: "Figure 5 and surrounding text. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Warp specialization is encoded via warp-assignment constraints including variable-latency isolation, per-warp register limits, cross-warp spills, and concurrency constraints (Figure 6)."
+        support: "Figure 6 and surrounding text. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Unsatisfiable instances are handled by a monotone search over initiation interval and schedule length (Algorithm 1)."
+        support: "Algorithm 1 and the corresponding section. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "All experiments use CUDA 13.0 (evaluation platforms include H100 and B200)."
+        support: "Section 6.1 Evaluation Platforms. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "For Blackwell, the paper attributes different SWP/WS strategies vs Hopper to a faster Tensor Core and additional synchronization required for Tensor Memory loads/stores."
+        support: "Section 6.2.2 Blackwell. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+    explicit_limitations_or_open_questions:
+      - "Supports only singly-nested loops without additional control flow. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Tile size not auto-selected; optimality is conditional on tile-size choice. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "Compatibility/performance under CUDA 13.1+ and PTX>9.0 is not established here (UNVERIFIED). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+  NV_BLOG_TILE:
+    key_claims:
+      - claim: "Triton-to-TileIR prerequisites include CUDA 13.1 or higher and NVIDIA Blackwell GPUs."
+        support: "Prerequisites list in 'How to use Triton-to-TileIR'. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Triton-to-TileIR currently supports only source-based compilation; prebuilt binaries are not available."
+        support: "Build-from-source statement. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "When Tile IR backend is active, Triton caches kernels with .tileIR extensions instead of .cubin used by the SIMT backend; ENABLE_TILE=1 is used to enable."
+        support: "Verify Tile IR compilation section. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Tensor-of-pointer pattern is reported to have suboptimal performance on the Tile IR backend with CUDA 13.1; suggested mitigations include rewriting to TMA descriptor load/store."
+        support: "Limitations section (tensor-of-pointer degradation + mitigation bullets + descriptor rewrite). ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Descriptor-based TMA pattern uses tl.make_tensor_descriptor(base, shape, strides, block_shape) followed by desc.load/store with offsets."
+        support: "TMA load/store API example code block. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+    explicit_limitations_or_open_questions:
+      - "Op coverage incomplete: unsupported operations exist; expected to improve with CUDA releases. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "PTX-level behavior/versions are not specified; relation to PTX>9.0 is UNVERIFIED. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+  NV_workloads:
+    key_claims:
+      - claim: "Mapping is defined as loop transformations (permutation, parallelization, tiling) that determine reuse and utilization on a spatial accelerator."
+        support: "Section II-A Mapping. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Mixed-reuse workloads contain both high- and low-arithmetic-intensity operations, with dependencies limiting overlap; transformers are key examples."
+        support: "Section II-B Mixed-reuse workloads. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Harp taxonomy classifies hierarchical/heterogeneous processors along axes including compute placement in memory hierarchy and heterogeneity location; it notes some plausible combinations not covered by existing works."
+        support: "Section IV Harp taxonomy + note about uncovered combinations. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Evaluation framework built on Timeloop: generate sub-accelerator architecture files and run Timeloop mapper per operation, then aggregate; includes mapping constraints and resource partitioning."
+        support: "Section VI-A Evaluation Framework: Timeloop for Harp. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+    explicit_limitations_or_open_questions:
+      - "Not Blackwell-specific; any direct instantiation to Blackwell requires chip/toolchain measurements (UNVERIFIED). ([arxiv.org](https://arxiv.org/html/2502.13113))"
+  SEED_1:
+    key_claims:
+      - claim: "Linear layouts are linear maps between labeled vector spaces over F2, with composition and product corresponding to matrix operations (Definitions 4.1–4.3)."
+        support: "Definitions 4.1–4.3. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Left division is defined and used to test whether a layout can be decomposed into an instruction tile compatible with SIMD primitives; Theorem 5.1 gives the applicability criterion."
+        support: "Definition 4.4 + Theorem 5.1. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Completeness: distributed layouts and memory layouts can be represented as linear layouts (Theorems 4.9 and 4.13)."
+        support: "Theorem 4.9 + Theorem 4.13. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Shared-memory bank conflicts can be modeled to obtain wavefront-count bounds/exactness (Lemma 9.4)."
+        support: "Lemma 9.4. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+        blackwell_relevance: "direct"
+        confidence: "medium"
+      - claim: "Limitations include restriction to power-of-two shapes; flipping/slicing not expressible as linear layouts; affine extension suggested; calls for integration with hardware measurements."
+        support: "Limitations paragraph. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+    explicit_limitations_or_open_questions:
+      - "Power-of-two shape restriction; affine-layout extension suggested for flips/slices. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+  SEED_2:
+    key_claims:
+      - claim: "Integer set relations (ISL) provide a unified mathematical framework to model CuTe layouts (including swizzles) and Triton linear layouts."
+        support: "Contribution statement and ISL background. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "ISL supports quasi-affine constraints (floor/ceiling) enabling representation of tiling and coordinate mappings."
+        support: "ISL quasi-affine extensions section. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Algorithm get_layout_strictly_affine reconstructs a layout from a strictly affine index mapping and a given shape, with a correctness argument."
+        support: "Algorithm and proof paragraph. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+      - claim: "Algorithm get_layout_from_strides reconstructs a layout from a layout mapping and strides; the paper states that inferring both shape and strides from layout mapping alone is still open."
+        support: "Algorithm and open-problem statement. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+        blackwell_relevance: "indirect"
+        confidence: "high"
+    explicit_limitations_or_open_questions:
+      - "Open problem: infer both shape and strides from layout mapping alone. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "Worst-case exponential complexity of relation operations; practical performance depends on ISL heuristics (UNVERIFIED for large layout spaces). ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+  SEED_3:
+    key_claims:
+      - claim: "An L2 sector-access model for Flash Attention is introduced with explicit variables and validated against experimental data with reported MAPE."
+        support: "Section 3.2 Modeling L2 Sector Access + MAPE table. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Under SM=48 saturation for the studied workload, persistent vs non-persistent CTA scheduling yields nearly identical L1/L2 counters; L1 hit count is negligible; L2 traffic largely driven by L1Tex path."
+        support: "Tables 1–2 and interpretation paragraph. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "Sawtooth Wavefront Reordering (Algorithm 4) alternates KV traversal direction per query-tile parity and is reported to reduce L2 non-compulsory misses by ~50% with throughput gains (example numbers given)."
+        support: "Algorithm 4 + CUDA results section. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+      - claim: "CuTile validation reports large reductions in L2 misses and throughput improvements; limitations include tile-size fit and compiler tile splitting altering access pattern."
+        support: "Validation + limitations. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+        blackwell_relevance: "direct"
+        confidence: "high"
+    explicit_limitations_or_open_questions:
+      - "Model starts with single-batch single-head; scaling assumptions need confirmation outside tested regimes (UNVERIFIED). ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "Optimization assumes tile size fits shared memory; compiler splitting can invalidate intended access pattern. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+cross_source_synthesis:
+  agreements:
+    - "Tile-level structure + explicit data movement + careful scheduling are central levers: ARCH_BW highlights TMEM/tcgen05/DE; OPT_PIPE formalizes SWP/WS scheduling; NV_BLOG_TILE centers descriptor-driven TMA transfer in Tile IR; SEED_1/SEED_2 elevate layout as a manipulable math object; SEED_3 links traversal order to L2 traffic. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    - "A solver-ready approach is plausible for key compilation decisions: OPT_PIPE provides a concrete SMT/LP encoding; SEED_1/SEED_2 provide algebraic/relational representations for constraints or post-hoc verification. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    - "Layout parameters (shape/strides/block_shape) are shared vocabulary between Tile IR descriptorization (NV_BLOG_TILE) and layout formalisms (SEED_1/SEED_2), enabling a unification pathway. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+  tensions_or_contradictions:
+    - "CUDA version mismatch: OPT_PIPE (CUDA 13.0) vs NV_BLOG_TILE (CUDA 13.1+ for Tile IR backend); ARCH_BW also notes CUDA 13.0 preliminary TMEM/CTA support. Reconciling behavior under CUDA>13.0 (prefer 13.1+) is required. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    - "Blackwell SKU/platform differences: ARCH_BW characterizes datacenter B200, while SEED_3 reports experiments on Grace-Blackwell GB10; parameters and cache/traffic behavior may not transfer without calibration. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    - "Heuristic vs theory-first contrast: SEED_1 discusses heuristic resolution in layout propagation context, while OPT_PIPE emphasizes a heuristic-free optimal solver for scheduling; integration must separate baseline heuristics from model-derived optimization. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    - "PTX>9.0 constraint gap: none of the golden sources explicitly state PTX version requirements for tcgen05/TMEM or Tile IR generated code; PTX>9.0 compliance remains UNVERIFIED and must be handled as a first-class gap. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+  inferred_implications_marked_as_inference:
+    - "INFERENCE: A unified Blackwell model can factor into (i) layout algebra/verification (SEED_1/SEED_2), (ii) descriptorized data movement (NV_BLOG_TILE), (iii) schedule feasibility/optimality (OPT_PIPE), with hardware parameters calibrated from PTX microbenchmarks (ARCH_BW) and traffic validated via counters (SEED_3). ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+    - "INFERENCE: SEED_3’s sawtooth traversal can be lifted into OPT_PIPE-style optimization as an additional decision variable that changes an analytic traffic objective while preserving program semantics as a permutation of tile visits. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+    - "INFERENCE: NV_workloads’ taxonomy and blackbox mapping pipeline can serve as a higher-level prior over decomposing kernels into subcomponents (e.g., TC compute, DE transform, TMEM movement) while detailed feasibility is enforced by OPT_PIPE constraints. ([arxiv.org](https://arxiv.org/html/2502.13113))"
+    - "INFERENCE: NV_BLOG_TILE’s tensor-of-pointer degradation motivates a formal cost term for pointer-materialization vs descriptorization; SEED_2 relations provide a way to prove equivalence between explicit pointer computation and descriptor-based mapping when (shape,strides,block_shape) fully describe the access pattern. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+model_blueprint:
+  model_name: "BW-ULST (Blackwell Unified Layout–Schedule–Traffic Model)"
+  core_question: |-
+    Given a tile-based kernel K (e.g., Triton/Tile IR-derived) and a Blackwell hardware instance H,
+    synthesize a semantics-preserving implementation choice tuple:
+      Pi = (layouts, descriptors/data-movement, schedule, warp/CTA assignment, traversal order)
+    that is provably feasible under CUDA>13.0 (prefer 13.1+) and minimizes predicted runtime and/or cache-traffic objectives.
+  mathematical_objects:
+    - object: "Hardware instance H_BW with parameter vector theta (TMEM/SMEM/RF/L2/HBM tiers + DE + TC pipeline cost model)."
+      type: "constraint_system"
+      maps_to_gpu_concept: "Blackwell (B200/GB10) execution + memory subsystem; TMEM + DE + tcgen05 path; cache hierarchy parameters."
+      defined_using_sources:
+        - "ARCH_BW: TMEM/DE/tcgen05 empirical parameters + PTX microbenchmark methodology"
+        - "SEED_3: GB10 cache hierarchy behavior + counter-based traffic modeling"
+      notes: "Treat numeric parameters as SKU/toolchain dependent; calibrate per device. PTX>9.0 compliance is UNVERIFIED in sources."
+    - object: "Program dependence graph G=(V,E) with iteration space I⊆Z^d and per-op resource footprints."
+      type: "graph"
+      maps_to_gpu_concept: "Tile-level loop IR dependence graph extracted from tile-based SSA IR; modulo scheduling substrate."
+      defined_using_sources:
+        - "OPT_PIPE: dependence graph + modulo scheduling formalization + constraint encodings"
+        - "NV_workloads: mapping as loop transformations (tiling/permutation/parallelization) affecting reuse/utilization"
+      notes: "Initially restrict to singly-nested loops without additional control flow (per OPT_PIPE)."
+    - object: "Layout as an F2-linear map L_F2: F2^n_in → F2^n_out with labels."
+      type: "relation"
+      maps_to_gpu_concept: "Triton/CuTe-style distributed layouts and memory layouts; swizzles; SIMD tile-compatibility tests."
+      defined_using_sources:
+        - "SEED_1: definitions (linear layouts, left division, memory/distributed layouts) + closure/limitations"
+      notes: "Power-of-two shape restriction applies; non-power-of-two handling uses padding/masking or affine/quasi-affine extension (SEED_1/SEED_2)."
+    - object: "Layout as an integer set relation R_ISL: Z^n → Z (possibly quasi-affine) with ISL operations."
+      type: "relation"
+      maps_to_gpu_concept: "CuTe layouts + swizzles + layout operations (compose/inverse/complement) represented as relations; verification/inference via ISL."
+      defined_using_sources:
+        - "SEED_2: integer set relations framework + reconstruction algorithms + open problems"
+      notes: "INFERENCE: Use relation equivalence as the common semantic notion between layout representations."
+    - object: "Unified layout semantic object U = (L_F2, R_ISL, equiv) where equiv is a checked equivalence witness."
+      type: "constraint_system"
+      maps_to_gpu_concept: "Cross-toolchain layout verification: ensure F2-linear layouts and ISL relations denote the same coordinate↔index mapping."
+      defined_using_sources:
+        - "SEED_1: linear layout semantics + closure"
+        - "SEED_2: ISL relations + relation operations"
+      notes: "INFERENCE: Define equiv by finite-domain equality on the relevant coordinate set; tractability depends on instance size."
+    - object: "Tensor descriptor D=(base, shape, strides, block_shape) and induced tile load/store relation."
+      type: "constraint_system"
+      maps_to_gpu_concept: "TMA descriptorization in Tile IR backend: descriptor-based tile transfers and offsets."
+      defined_using_sources:
+        - "NV_BLOG_TILE: descriptor API surface + motivation (avoid tensor-of-pointer)"
+        - "SEED_2: shapes/strides mapping as relations; reconstruction/verification operators"
+      notes: "Correctness requires that descriptor parameters fully specify the accessed tile mapping; otherwise rewrite is invalid (must prove)."
+    - object: "Schedule variables op[v,i,t], liveness live[x,t], and warp assignment opw[v,w] with machine constraints."
+      type: "constraint_system"
+      maps_to_gpu_concept: "OPT_PIPE-style modulo scheduling + warp specialization feasibility for Tensor Core kernels."
+      defined_using_sources:
+        - "OPT_PIPE: Figures 4–6 + Algorithm 1 search"
+        - "ARCH_BW: additional Blackwell constraints via TMEM/tcgen05 requirements (modeled as resource/latency parameters)"
+      notes: "INFERENCE: Extend OPT_PIPE machine model with TMEM capacity and tcgen05-specific data-movement resource constraints."
+    - object: "Cache/traffic predictor T_L2(·) returning predicted L2 sector accesses (and derived miss proxies)."
+      type: "constraint_system"
+      maps_to_gpu_concept: "SEED_3 L2 sector-access model + traversal-order dependence for Flash-Attention-like streaming workloads."
+      defined_using_sources:
+        - "SEED_3: analytic sector model + sawtooth traversal + counter validation"
+        - "NV_workloads: mapping sensitivity to reuse and bandwidth partitioning (context for objective selection)"
+      notes: "Initially scoped to attention-like streaming; generalization to arbitrary kernels is an explicit gap."
+  semantics_layer:
+    - layer: "layout_semantics"
+      representation: "Two-view semantics: (i) F2-linear maps + left-division tile legality (SEED_1) and (ii) ISL integer-set relations with compose/inverse/complement (SEED_2)."
+      invariants:
+        - "Semantic equivalence invariant: layout transformation must preserve the induced coordinate→index relation on the tensor domain (checked via ISL relation equality / finite-domain equality). (INFERENCE)"
+        - "Closure invariant: allowed shape ops preserve membership in the chosen layout family (when restricted to SEED_1 distributed-layout family)."
+        - "Well-formedness invariant: power-of-two shape requirement for pure linear-layout encoding; otherwise must use padding/masking or quasi-affine relation representation (SEED_1/SEED_2)."
+    - layer: "data_movement_semantics"
+      representation: "Descriptor-induced relations for tile transfers + explicit memory-tier edges (HBM↔L2↔L1Tex/SMEM↔RF, plus TMEM tier) with typed load/store actions."
+      invariants:
+        - "Descriptor correctness: descriptor parameters (shape,strides,block_shape) induce the same access relation as the original program’s indexing (prove or verify)."
+        - "TMEM interface invariant: TMEM data movement must be expressed via tcgen05.* instruction family (ARCH_BW), modeled abstractly as legal actions only."
+        - "No new instruction semantics: treat TMA/tcgen05 as abstract transfer primitives with costs/constraints grounded in sources; otherwise mark UNVERIFIED."
+    - layer: "scheduling_semantics"
+      representation: "SMT/ILP constraint system: modulo schedule feasibility + liveness-based capacity + warp assignment + concurrency/synchronization (OPT_PIPE)."
+      invariants:
+        - "Dependence preservation: scheduled time assignments respect dependence edges."
+        - "Capacity preservation: liveness-based working-set constraints never exceed per-resource capacities (RF/SMEM/TMEM)."
+        - "Warp feasibility: each op assigned to a legal warp group; variable-latency ops isolated as required; cross-warp communication modeled by explicit spill/sync constraints."
+    - layer: "cache_traffic_semantics"
+      representation: "Analytic L2 sector-access model (SEED_3) + traversal-order permutation semantics (sawtooth vs cyclic)."
+      invariants:
+        - "Traffic-model soundness (scoped): predicted sector count is a function of (sequence length, tile size, element size, sector size, head dim) and traversal order; validate against counters within calibrated regime."
+        - "Scheduling-mode invariance under saturation (scoped): persistent vs non-persistent CTA scheduling yields similar L1/L2 counters for the studied streaming workload when fully saturated; treat as hypothesis to re-test per kernel."
+  objective_functions:
+    - "Primary: minimize initiation interval (II) subject to feasibility constraints (OPT_PIPE-style)."
+    - "Secondary (multi-objective or weighted): minimize predicted total time T ≈ f(II, schedule length, latencies, bandwidth constraints) with calibrated theta. (INFERENCE)"
+    - "Traffic-aware: minimize predicted L2 sector accesses T_L2 (SEED_3) subject to semantic preservation and feasibility."
+    - "Descriptorization-aware: minimize pointer-materialization overhead by preferring descriptor-based TMA transfers when equivalence can be proven and backend supports required ops (NV_BLOG_TILE). (INFERENCE)"
+  proof_obligations:
+    - obligation: "Semantic preservation of layout transformations (layout algebra / relation equality)."
+      planned_technique: "Prove equality of induced relations (ISL) or show commutation of composed maps; use SEED_1 operators and SEED_2 relation operations."
+      anchored_sources: ["SEED_1", "SEED_2"]
+    - obligation: "Correctness of descriptorization rewrite (tensor-of-pointer → descriptor+TMA load/store)."
+      planned_technique: "Show descriptor-induced access relation equals original pointer-expression relation; verify by relation extraction/equality checking plus bounded testing on tile domain."
+      anchored_sources: ["NV_BLOG_TILE", "SEED_2"]
+    - obligation: "Soundness of schedule feasibility constraints after extending machine model with TMEM/tcgen05 actions."
+      planned_technique: "Extend OPT_PIPE constraint templates with TMEM capacity and tcgen05-specific resource constraints; prove any satisfying assignment corresponds to a realizable schedule respecting dependences and capacities."
+      anchored_sources: ["OPT_PIPE", "ARCH_BW"]
+    - obligation: "Validity of cache/traffic objective proxy for chosen kernel class."
+      planned_technique: "Fit SEED_3 sector model (when applicable) and validate predicted sector counts vs counters; define explicit domain of validity and falsification tests."
+      anchored_sources: ["SEED_3", "NV_workloads"]
+  calibration_and_validation_plan:
+    - parameter: "TMEM capacity per SM (bytes) and addressing constraints (abstracted)."
+      how_to_measure: "Use ARCH_BW as initial evidence; then validate via targeted PTX microbench that allocates/uses TMEM and observes failure/behavior boundaries (no new semantics; only observed constraints)."
+      anchored_sources: ["ARCH_BW"]
+    - parameter: "TMEM miss-latency and bandwidth priors (e.g., 420 cycles miss latency; 16 TB/s read, 8 TB/s write per SM as reported)."
+      how_to_measure: "Replicate ARCH_BW pointer-chase and bandwidth/stride sweeps under CUDA>13.0; re-fit parameters per device and compiler; compare against reported baselines."
+      anchored_sources: ["ARCH_BW"]
+    - parameter: "tcgen05.mma single-instruction latency (cycles) per tile shape/precision (as available)."
+      how_to_measure: "PTX microbench with dependency chains; validate PTX-to-SASS mapping and measure single-instruction latency analogous to ARCH_BW Table V procedure."
+      anchored_sources: ["ARCH_BW"]
+    - parameter: "DE throughput model: throughput(chunk_size, concurrency) and pipeline depth threshold (>85% efficiency)."
+      how_to_measure: "Run DE microbench suite across chunk sizes; fit throughput curves and saturation points; use Table III as prior and re-measure under CUDA>13.0."
+      anchored_sources: ["ARCH_BW"]
+    - parameter: "Schedule-cost normalization / solver tractability parameters (e.g., cost scaling, variable-latency abstraction settings)."
+      how_to_measure: "Follow OPT_PIPE’s LP+SMT workflow on representative kernels; track solver runtime vs normalization choices; record feasibility boundary cases."
+      anchored_sources: ["OPT_PIPE"]
+    - parameter: "Tile IR backend observables: descriptorization vs tensor-of-pointer overhead (relative), and op-coverage constraint set for a given CUDA release."
+      how_to_measure: "Build Triton-to-TileIR under CUDA 13.1+; compile paired kernels (tensor-of-pointer baseline vs descriptor rewrite) and compare performance/counters; verify .tileIR artifacts and backend selection."
+      anchored_sources: ["NV_BLOG_TILE"]
+    - parameter: "L2 sector-access model parameters and prediction error bounds (MAPE) for attention-like streaming kernels."
+      how_to_measure: "Use Nsight Compute counters and replicate SEED_3 measurement methodology on GB10 or other Blackwell platforms; fit and validate model; record domain-of-validity."
+      anchored_sources: ["SEED_3"]
+    - falsifiable_predictions:
+        - "If a kernel’s KV traversal order is transformed from cyclic to sawtooth while preserving computation, the model predicts a measurable reduction in L2 non-compulsory misses and improved throughput within the SEED_3 regime; failure indicates the traffic model is out-of-domain or the transformation is invalid under compiler/runtime constraints."
+        - "If tensor-of-pointer materialization is replaced by descriptor-based TMA load/store for tiles fully described by (shape,strides,block_shape), Tile IR backend performance should improve relative to the degraded baseline on CUDA 13.1; failure indicates missing equivalence conditions or backend limitations."
+  scope_guardrails:
+    - "Blackwell-only target: no non-Blackwell microarchitectural facts used as constraints except as explicitly labeled baseline/comparison."
+    - "Toolchain target: CUDA > 13.0 (prefer 13.1+); PTX > 9.0 is a hard requirement, but source support is UNVERIFIED—treat as explicit gap until primary docs confirm."
+    - "No new microarchitectural facts or instruction semantics without evidence; otherwise label UNVERIFIED."
+    - "No heuristic-only proposals: any heuristic must be labeled baseline and justified relative to the formal model."
+    - "All non-trivial claims must be anchored to golden sources or primary docs; otherwise label UNVERIFIED."
+gap_map:
+  - gap_id: "G1"
+    gap_statement: "Missing unification proof between F2-linear layouts (SEED_1) and ISL integer-set relations (SEED_2) as a single semantic object usable in solvers."
+    why_it_matters: "Without a proven equivalence bridge, layout decisions made in one representation cannot be reliably verified/optimized in the other, undermining end-to-end semantic guarantees."
+    evidence_links:
+      - "SEED_1: Definition 4.1 (linear layouts) + left division/Theorem 5.1 + power-of-two limitation. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "SEED_2: integer set relations framework + quasi-affine support for tiling/coordinate mappings. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    what_is_missing: "formal translation + equivalence witness + complexity/decidability envelope"
+    candidate_research_questions:
+      - "RQ1: For which layout subfamilies does a polynomial-time equivalence check exist between matrix-over-F2 layouts and ISL relations?"
+      - "RQ2: How should quasi-affine relations (SEED_2) be incorporated when SEED_1 linear layouts cannot represent the shape exactly?"
+    candidate_formalization:
+      - "Define a semantics map ⟦·⟧ from both representations to a finite graph of coordinate→index pairs on the relevant domain; define equivalence as equality of these graphs."
+      - "Use ISL relation normalization/canonicalization for relation equality; for linear layouts, derive an ISL relation and compare."
+    candidate_methodology:
+      - "Implement translation prototypes; benchmark equivalence-check runtime on realistic tile sizes; stress-test with quasi-affine cases."
+    evaluation_metrics:
+      - "Equivalence-check success rate on corpus of layouts"
+      - "Runtime/memory of equivalence checks vs domain size"
+      - "Number of false mismatches (soundness failures) found by differential testing"
+    risks_and_mitigations:
+      - "Risk: relation ops worst-case exponential. Mitigation: restrict to bounded-rank layouts; cache canonical forms; use compositional proofs."
+  - gap_id: "G2"
+    gap_statement: "Missing formalization of Tile IR descriptorization constraints as layout relations, including a proof obligation that descriptor-based TMA transfers are equivalent to tensor-of-pointer addressing."
+    why_it_matters: "NV_BLOG_TILE explicitly warns tensor-of-pointer degradation and recommends descriptorization; without a proof/verification method, rewrites risk semantic bugs."
+    evidence_links:
+      - "NV_BLOG_TILE: tensor-of-pointer degradation + descriptor rewrite example (shape/strides/block_shape). ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+      - "SEED_2: relation-based modeling of shapes/strides and layout reconstruction algorithms. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+    what_is_missing: "formal definition of descriptor-induced access relation + equivalence checker for rewrites"
+    candidate_research_questions:
+      - "RQ1: What are necessary/sufficient conditions on (shape,strides,block_shape) for eliminating tensor-of-pointers without changing accessed addresses?"
+      - "RQ2: How to model descriptor offsets as ISL relations compatible with layout operations (compose/inverse/complement)?"
+    candidate_formalization:
+      - "Define a descriptor relation R_D: (tile_coords, offsets) ↦ address and prove R_D equals the original pointer-expression relation."
+      - "Express both relations in ISL and check equality (or inclusion + same domain) for bounded tiles."
+    candidate_methodology:
+      - "Extract pointer expressions from IR; generate ISL relations; compare against descriptor relation; validate via randomized bounded execution."
+    evaluation_metrics:
+      - "Rewrite validity rate (provable equivalence) on benchmark kernels"
+      - "Performance delta on Tile IR backend vs baseline"
+    risks_and_mitigations:
+      - "Risk: unsupported ops or backend changes break assumptions. Mitigation: treat backend op coverage as an explicit constraint set tied to CUDA version."
+  - gap_id: "G3"
+    gap_statement: "Missing unification of OPT_PIPE scheduling constraints with Blackwell TMEM/tcgen05 resource model (capacity + legal data-movement actions + added synchronization)."
+    why_it_matters: "Blackwell introduces TMEM with new instruction sequences and synchronization implications; scheduling without these constraints can generate infeasible or suboptimal plans."
+    evidence_links:
+      - "OPT_PIPE: schedule/liveness/warp constraints + Blackwell notes on Tensor Memory load/store synchronization. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "ARCH_BW: TMEM capacity/latency/bandwidth + tcgen05.* required for TMEM data movement. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+    what_is_missing: "formal machine model extension + invariants linking schedule feasibility to TMEM constraints"
+    candidate_research_questions:
+      - "RQ1: How should TMEM capacity (256KB/SM) be expressed in liveness constraints alongside RF/SMEM capacity?"
+      - "RQ2: What additional synchronization/concurrency constraints are implied by TMEM loads/stores and tcgen05 instruction usage?"
+    candidate_formalization:
+      - "Extend memory-capacity constraints to include a TMEM resource dimension; annotate ops with TMEM footprint and lifetimes."
+      - "Add constraints enforcing that TMEM-requiring ops use tcgen05 action types and respect any blocking edges (synchronization)."
+    candidate_methodology:
+      - "Implement constraint extensions; test satisfiability and performance on attention kernels; compare against ARCH_BW empirical best practices."
+    evaluation_metrics:
+      - "Feasibility rate of solver outputs under real compilation"
+      - "Achieved II vs baseline schedules"
+      - "Mismatch rate between predicted vs observed bottlenecks"
+    risks_and_mitigations:
+      - "Risk: incomplete semantics for tcgen05/TMEM in sources. Mitigation: abstract actions; calibrate only observable constraints; label UNVERIFIED where needed."
+  - gap_id: "G4"
+    gap_statement: "Missing calibrated model for DE as a traffic-reduction transform integrated into schedule and cache/traffic objectives."
+    why_it_matters: "ARCH_BW reports DE throughput/pipeline depth and sparse-workload speedups, but the unified model lacks a formal way to trade decompression placement/scheduling against bandwidth and cache traffic."
+    evidence_links:
+      - "ARCH_BW: DE characterization + pipeline depth table; sparse operations using hardware decompression. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "OPT_PIPE: variable-latency isolation and machine-model-dependent costs; joint SWP/WS solver hook. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    what_is_missing: "formal DE operator in the program graph + calibrated throughput/latency model + solver encoding"
+    candidate_research_questions:
+      - "RQ1: How to encode DE as a pipeline stage with concurrency and chunk-size-dependent saturation inside modulo scheduling?"
+      - "RQ2: How to connect DE decisions to cache/traffic models (e.g., reduced bytes moved implies reduced sectors) without inventing cache geometry?"
+    candidate_formalization:
+      - "Model DE as a resource-constrained operator transforming a compressed stream into an uncompressed stream with throughput function tau_DE(chunk, concurrency)."
+      - "Introduce constraints linking compressed-byte movement and decompressed-byte movement to downstream memory operations."
+    candidate_methodology:
+      - "Fit tau_DE from DE microbench; integrate into solver; validate against sparse kernels where DE is used."
+    evaluation_metrics:
+      - "Prediction error of throughput model vs measured decompression throughput"
+      - "End-to-end performance improvements attributable to DE modeling"
+    risks_and_mitigations:
+      - "Risk: DE behavior differs across SKUs. Mitigation: per-SKU calibration; treat DE parameters as theta(H)."
+  - gap_id: "G5"
+    gap_statement: "Missing proof-aware integration of SEED_3 traffic model (L2 sector accesses) into scheduling optimization (OPT_PIPE), beyond the specific attention kernel setting."
+    why_it_matters: "SEED_3 provides a validated L2-sector model and traversal optimization (sawtooth), but OPT_PIPE’s solver objective is schedule-centric; without integration, traffic-aware scheduling remains ad hoc."
+    evidence_links:
+      - "SEED_3: L2 sector-access model + sawtooth algorithm + limitations. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "OPT_PIPE: SMT/LP scheduling framework with extensible cost/objective and feasibility constraints. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    what_is_missing: "formal decision variable for traversal order + objective coupling to sector model + domain-of-validity theorem"
+    candidate_research_questions:
+      - "RQ1: How to represent traversal order as a permutation/ordering variable in a constraint system without exploding complexity?"
+      - "RQ2: What is the minimal set of kernel features needed for the SEED_3 model to remain predictive (streaming buffers, texture path dominance, saturation)?"
+    candidate_formalization:
+      - "Introduce a traversal-order variable pi acting on tile-visit indices; define T_L2(pi, params) as cost term."
+      - "State explicit assumptions (e.g., saturation, L1Tex-driven traffic) as predicates required for applying the cost model."
+    candidate_methodology:
+      - "Implement sawtooth as a restricted family of pi; compare predicted vs measured sectors across kernels; expand family if stable."
+    evaluation_metrics:
+      - "MAPE of predicted L2 sectors vs counters across kernels"
+      - "Throughput improvement vs cyclic baseline for valid kernels"
+    risks_and_mitigations:
+      - "Risk: compiler transformations (tile splitting) violate model assumptions. Mitigation: add constraints for tile-size fit; detect transformations via profiling."
+  - gap_id: "G6"
+    gap_statement: "Missing toolchain conformance evidence for the hard constraint PTX>9.0 across tcgen05/TMEM and Tile IR compilation paths."
+    why_it_matters: "The project hard-requires PTX>9.0, but golden sources do not specify PTX version requirements for Blackwell features; without confirmation, the formal model might target an unavailable toolchain."
+    evidence_links:
+      - "ARCH_BW: PTX-based microbenchmarks and tcgen05.* usage described, but PTX version not stated. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "NV_BLOG_TILE: Triton-to-TileIR targets Tile IR (not PTX) but references PTX backend; PTX version not discussed. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+    what_is_missing: "primary-doc verification of PTX version requirements and CUDA toolchain behavior"
+    candidate_research_questions:
+      - "RQ1: Which CUDA versions and PTX ISA versions expose tcgen05/TMEM instructions, and under what compilation modes?"
+      - "RQ2: How does Tile IR lowering interact with PTX versioning constraints (if at all)?"
+    candidate_formalization:
+      - "Define a toolchain-compatibility predicate Compat(CUDA, PTX, GPU) as a precondition for the model’s applicability."
+    candidate_methodology:
+      - "Fetch primary PTX/CUDA docs; compile minimal kernels and inspect artifacts; record version gates."
+    evaluation_metrics:
+      - "Pass/fail matrix over (CUDA version, PTX version, GPU SKU) for required features"
+    risks_and_mitigations:
+      - "Risk: docs are incomplete or unstable. Mitigation: include compiler artifact checks and regression tests in reproducibility plan."
+  - gap_id: "G7"
+    gap_statement: "Missing formal interface between OPT_PIPE constraint-level schedules and what CUDA Tile IR backend can actually lower (unsupported ops / backend evolution)."
+    why_it_matters: "A schedule feasible in the abstract constraint system may be unrealizable if the backend lacks required operations or imposes additional lowering constraints."
+    evidence_links:
+      - "OPT_PIPE: supports restricted program class; tile size not auto-selected; lowering automation is limited. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+      - "NV_BLOG_TILE: Tile IR backend is early stage with unsupported operations and performance pitfalls. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+    what_is_missing: "formal lowering contract capturing backend-supported op set and required invariants"
+    candidate_research_questions:
+      - "RQ1: What is the minimal op subset + layout/descriptor constraints that ensures a schedule can be lowered by Tile IR backend on CUDA 13.1+?"
+      - "RQ2: How should backend evolution (op coverage changes per CUDA release) be represented in the model?"
+    candidate_formalization:
+      - "Define a backend constraint set B_CUDA (op coverage + legality constraints) as additional hard constraints in the solver."
+      - "Prove (or empirically validate) that if B_CUDA holds, then schedule+layout decisions are lowerable."
+    candidate_methodology:
+      - "Empirically extract B_CUDA via compile-test matrix + failure classification; encode as constraints."
+    evaluation_metrics:
+      - "Compilation success rate of solver-produced programs under Tile IR backend"
+      - "Rate of unknown failure modes not predicted by B_CUDA"
+    risks_and_mitigations:
+      - "Risk: backend is unstable. Mitigation: version-pin toolchain in experiments; re-run conformance suite per CUDA update."
+  - gap_id: "G8"
+    gap_statement: "Missing calibrated cost model for layout conversions and bank-conflict penalties that can be embedded into OPT_PIPE objective functions."
+    why_it_matters: "SEED_1 provides formal bank-conflict modeling hooks, but without calibrated costs the scheduler cannot trade conversion vs traffic vs II in a principled way."
+    evidence_links:
+      - "SEED_1: left division and bank-conflict wavefront model (Lemma 9.4) + call for hardware-measurement integration. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "OPT_PIPE: cost normalization and optimization framework. ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    what_is_missing: "measurable cost terms mapping layout decisions to predicted cycles/traffic; parameter fitting procedures"
+    candidate_research_questions:
+      - "RQ1: Which layout features (e.g., swizzle parameters) most strongly correlate with bank-conflict wavefront counts on Blackwell?"
+      - "RQ2: Can conversion costs be approximated as linear costs/constraints compatible with QFLIA/ILP?"
+    candidate_formalization:
+      - "Define a cost functional C_layout(L, H; theta) composed of (conversion bytes moved, predicted wavefronts, predicted instruction legality) with calibrated coefficients."
+    candidate_methodology:
+      - "Microbench bank conflict patterns and conversion kernels; fit theta; integrate into solver objective; validate on end-to-end kernels."
+    evaluation_metrics:
+      - "Prediction error for conversion latency vs measurements"
+      - "End-to-end performance improvement relative to baseline heuristics"
+    risks_and_mitigations:
+      - "Risk: bank parameters undocumented. Mitigation: treat as calibrated constants; report confidence intervals; do not hardcode without evidence."
+  - gap_id: "G9"
+    gap_statement: "Missing formal treatment of non-power-of-two shapes across layout, scheduling, and descriptorization pipelines."
+    why_it_matters: "SEED_1 restricts linear layouts to power-of-two shapes; practical kernels may require non-power-of-two handling, which affects layout algebra, solver domains, and Tile IR descriptorization."
+    evidence_links:
+      - "SEED_1: power-of-two limitation and proposed affine extension. ([arxiv.org](https://arxiv.org/html/2505.23819v3))"
+      - "SEED_2: quasi-affine relations support tiling/coordinate mappings beyond strictly affine cases. ([arxiv.org](https://arxiv.org/html/2511.10374v1))"
+      - "OPT_PIPE: program/tile constraints and practical limitations on tile sizes (context). ([arxiv.org](https://arxiv.org/html/2512.18134v1))"
+    what_is_missing: "formal domain extension (padding/masking vs quasi-affine) + proofs of semantic preservation and feasibility"
+    candidate_research_questions:
+      - "RQ1: When is padding/masking sufficient to remain within linear-layout semantics while preserving performance?"
+      - "RQ2: How to integrate quasi-affine relation layouts into solver constraints without losing tractability?"
+    candidate_formalization:
+      - "Define a shape-normalization operator N (pad/mask) with proof of semantic preservation; alternatively represent the layout as quasi-affine ISL relation with explicit legality constraints."
+    candidate_methodology:
+      - "Construct benchmark suite with non-power-of-two shapes; compare correctness/performance of padding vs quasi-affine relation approach."
+    evaluation_metrics:
+      - "Correctness across shapes"
+      - "Solver runtime and schedule quality"
+      - "Performance sensitivity to padding overhead"
+    risks_and_mitigations:
+      - "Risk: solver complexity increases. Mitigation: restrict quasi-affine use to boundary cases; keep most layouts in linear subfamily."
+  - gap_id: "G10"
+    gap_statement: "Missing calibrated cross-SKU parameterization for 'Blackwell' (B200 vs GB10 vs other Blackwell GPUs) so the model remains architecture-level rather than SKU-specific."
+    why_it_matters: "ARCH_BW and SEED_3 use different Blackwell platforms; without explicit parameterization, conclusions may not generalize."
+    evidence_links:
+      - "ARCH_BW: B200 platform context and measured TMEM/tcgen05/DE parameters. ([arxiv.org](https://arxiv.org/pdf/2512.02189))"
+      - "SEED_3: GB10 platform + cache/traffic model and counters. ([arxiv.org](https://arxiv.org/html/2601.16032v2))"
+      - "NV_BLOG_TILE: mentions Blackwell GPUs as compatible with Tile IR backend on CUDA 13.1+. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))"
+    what_is_missing: "explicit parameter vector theta(H) per SKU and a transfer-learning/calibration protocol"
+    candidate_research_questions:
+      - "RQ1: Which parameters are stable across Blackwell SKUs (invariants) vs which must be re-fit?"
+      - "RQ2: Can a small set of microbenchmarks identify the required theta for a new SKU?"
+    candidate_formalization:
+      - "Define theta partition: theta = (theta_arch, theta_sku) with theta_arch constrained by evidence and theta_sku calibrated."
+    candidate_methodology:
+      - "Run minimal calibration suite on each SKU; fit theta_sku; validate model predictions on shared kernels."
+    evaluation_metrics:
+      - "Cross-SKU prediction error for runtime/traffic"
+      - "Calibration cost (#benchmarks, time) per SKU"
+    risks_and_mitigations:
+      - "Risk: insufficient access to multiple SKUs. Mitigation: design calibration to work with whichever Blackwell device is available; explicitly label untested SKUs."
+latex_plan:
+  part_1:
+    sections:
+      - "Problem framing: why Blackwell-specific formal modeling is needed (TMEM/DE/tcgen05, Tile IR, solver-based scheduling, cache-locality)."
+      - "Scope + hard constraints: Blackwell-only; CUDA>13.0 (prefer 13.1+); PTX>9.0; evidence discipline and UNVERIFIED policy."
+      - "Mathematical preliminaries: F2 linear layouts, integer-set relations (ISL), and constraint solving (SMT/ILP) notation."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_2:
+    sections:
+      - "Source-grounded Blackwell model components: TMEM definition/constraints; DE characterization hooks; tcgen05 instruction-family role; toolchain notes (CUDA 13.0 vs 13.1+)."
+      - "IR/toolchain boundary: CUDA Tile IR backend overview, prerequisites, limitations, and observable compilation artifacts."
+      - "Evidence ledger: separate facts from UNVERIFIED items (esp. PTX>9.0 conformance)."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_3:
+    sections:
+      - "Layout semantics I: SEED_1 linear layouts over F2, operators (composition/product/left division/right inverse), and completeness results."
+      - "Layout semantics II: SEED_2 integer-set relations, quasi-affine constructs, and layout operations (compose/inverse/complement/swizzle)."
+      - "Bridge plan (unification): define a shared semantic notion (relation equality on bounded domains) and state proof obligations."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_4:
+    sections:
+      - "Data-movement semantics: descriptorization as relation; formalizing make_tensor_descriptor and descriptor load/store; preconditions for equivalence to tensor-of-pointer addressing."
+      - "Memory-tier semantics: RF/SMEM/TMEM/L2/HBM as typed spaces with abstract transfer actions; incorporate DE as a transform stage."
+      - "Legality constraints: tcgen05 action requirements; backend op-coverage constraints as a versioned predicate."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_5:
+    sections:
+      - "Scheduling semantics (OPT_PIPE): dependence graph, modulo schedule variables, liveness/capacity constraints, warp assignment constraints, and unsat handling."
+      - "Blackwell-specific schedule extensions: incorporate TMEM capacity and tcgen05-required data movement as machine-model parameters/constraints; connect to descriptorized data movement."
+      - "Objective function design: II minimization plus secondary objectives for traffic and conversion costs."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_6:
+    sections:
+      - "Cache/traffic formalism: SEED_3 L2 sector-access model variables and formulas; validation methodology and domain-of-validity."
+      - "Traversal-order transformations: sawtooth as a permutation decision variable; proof sketch of semantic preservation for attention-like kernels."
+      - "Integration into solver: add analytic traffic objective/constraints; discuss limitations (tile splitting, shared memory fit)."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_7:
+    sections:
+      - "Unified model blueprint: formal definitions of objects (layouts, descriptors, schedules, traffic predictor, hardware parameter vector)."
+      - "Commutative diagrams/tables linking representations (F2 layouts ↔ ISL relations ↔ descriptors) and schedule layers (ops ↔ memory tiers ↔ traffic)."
+      - "Proof obligations catalog: semantic preservation, rewrite correctness, schedule soundness, and traffic-model validation."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_8:
+    sections:
+      - "Calibration plan: PTX microbench design (TMEM latency/bandwidth, tcgen05.mma latency, DE throughput/pipeline depth) and counter-based traffic validation."
+      - "Reproducibility plan: toolchain pinning (CUDA 13.1+ for Tile IR), artifact checks (.tileIR), PTX-to-SASS audit practices, and benchmark harness design."
+      - "Model falsification: define concrete acceptance criteria and failure modes; plan ablations (cyclic vs sawtooth, tensor-of-pointer vs descriptor)."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+  part_9:
+    sections:
+      - "Evaluation: benchmark suite selection (attention kernels + mixed-reuse cascades), solver performance, and end-to-end kernel performance/traffic metrics."
+      - "Gap map and risk management: prioritize G1–G10; toolchain/PTX conformance plan; backend instability; cross-SKU generalization."
+      - "Threats to validity + timeline + deliverables for subsequent stages (LaTeX part-by-part execution plan)."
+    must_cite: [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, NV_workloads, SEED_1, SEED_2, SEED_3]
+
+---
+Learn more:
+1. [https://arxiv.org/pdf/2512.02189](https://arxiv.org/pdf/2512.02189)
+2. [https://arxiv.org/html/2512.18134v1](https://arxiv.org/html/2512.18134v1)
+3. [https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/)
+4. [https://arxiv.org/html/2502.13113](https://arxiv.org/html/2502.13113)
+5. [https://arxiv.org/html/2505.23819v3](https://arxiv.org/html/2505.23819v3)
+6. [https://arxiv.org/html/2511.10374v1](https://arxiv.org/html/2511.10374v1)
+7. [https://arxiv.org/html/2601.16032v2](https://arxiv.org/html/2601.16032v2)

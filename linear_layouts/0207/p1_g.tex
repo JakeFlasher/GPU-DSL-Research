@@ -1,0 +1,438 @@
+% =========================
+% PART 1 / 9  (L1_LATEX_PART_1)
+% =========================
+
+\section{Problem framing: why Blackwell forces a theory-first model}
+
+NVIDIA Blackwell introduces (and in some cases exposes at the PTX and toolchain boundary) new architectural and compilation degrees of freedom that are difficult to reason about using purely empirical or heuristic compiler engineering.
+This proposal targets \emph{Blackwell-only} kernels, including Grace--Blackwell as an allowed platform instance, and insists on a formal, solver-backed semantics with explicit calibration and falsification.
+
+\paragraph{Blackwell-specific memory and compute features re-open ``known'' compilation problems.}
+Microarchitectural characterization work on Blackwell B200 reports a distinct on-chip \emph{Tensor Memory (TMEM)} tier with explicit structure and measured latency/bandwidth properties, alongside a fifth-generation Tensor Core instruction family (\texttt{tcgen05.*}) and a characterized decompression engine (DE) whose throughput depends on chunk size and concurrency.%
+~\cite{ARCH_BW}
+These features are not merely ``more of the same'': they add new tiers, new synchronization requirements, and new instruction families that must be \emph{modeled objects} in any correctness- and performance-reasoning framework.
+
+\paragraph{The toolchain is evolving toward tile-semantics IR boundaries that demand formal semantics.}
+CUDA Tile and CUDA Tile IR (a specification-driven, MLIR-based IR for tile computation) are described as a CUDA~13.1-era programming/compilation interface, with a Triton backend that targets Tile IR and requires Blackwell GPUs.%
+~\cite{NV_BLOG_TILE}
+This introduces a new semantic contract boundary: legality and performance are increasingly determined by \emph{tile-level semantics}, descriptorized data movement (e.g., tensor descriptors for TMA-style tile transfers), and backend-specific op coverage constraints.%
+~\cite{NV_BLOG_TILE}
+Consequently, a proposal that aims to be predictive and falsifiable must treat (i) layout, (ii) data movement, and (iii) scheduling as \emph{first-class formal objects}, rather than as post-hoc codegen artifacts.
+
+\paragraph{Scheduling is already solver-addressable, but must be re-grounded for Blackwell tiers and toolchains.}
+Recent solver-first work encodes modulo scheduling and warp specialization as a unified constraint system over boolean schedule/assignment tensors, together with a monotone unsatisfiability-driven search over initiation interval and schedule length.%
+~\cite{OPT_PIPE}
+However, the reported evaluation baseline uses CUDA~13.0 (and includes B200 among platforms),%
+~\cite{OPT_PIPE}
+while this project targets CUDA \(>\) 13.0 (preferably CUDA~13.1+) and PTX \(>\) 9.0 \emph{strictly}. Therefore, the methodology must be lifted into a toolchain-validated, Blackwell-tier-aware machine model calibrated under the target compilation path.%
+~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}
+
+\paragraph{Cache/traffic effects are tile- and order-sensitive and must be represented semantically, not as folklore.}
+Grace--Blackwell traffic modeling for streaming-attention-like kernels emphasizes L2 sector-access behavior under saturation and introduces a traversal-order transformation (``sawtooth'') with empirically validated miss/throughput effects, together with explicit applicability limitations (e.g., tile-size fit and compiler tile-splitting behaviors).%
+~\cite{SEED_3}
+This motivates a semantics layer in which traversal order is an explicit, checkable program transformation and L2 traffic is an explicit modeled quantity (with assumptions stated and falsified).
+
+\paragraph{Workload ``mapping'' context clarifies which decisions belong in the formal optimization problem.}
+A complementary modeling literature defines mapping as loop transformations (permutation/parallelization/tiling) and emphasizes mixed-reuse workloads where no single resource partitioning dominates across regimes.%
+~\cite{NV_workloads}
+While not Blackwell-specific, this vocabulary is useful for explicitly separating (a) kernel-internal schedule/layout/data-movement decisions from (b) higher-level mapping/partitioning decisions in mixed-reuse pipelines.
+
+\paragraph{Objective of the proposal (preview).}
+We will develop \emph{BW-TiLSS} (Blackwell Tile/Layout/Schedule Semantics): a theory-first formal model that (i) represents layouts, (ii) represents descriptorized data movement across memory tiers including TMEM where available, (iii) synthesizes feasible and throughput-optimal software-pipelined + warp-specialized schedules via SMT/ILP constraints, and (iv) incorporates a falsifiable cache/traffic semantics for attention-like tile traversals.
+The proposal is explicitly anchored in formal layout algebras (linear layouts, integer relations, and categorical semantics),%
+~\cite{SEED_1,SEED_2,SEED_4}
+solver-based scheduling semantics,%
+~\cite{OPT_PIPE}
+and Blackwell/Grace--Blackwell empirical calibration targets.%
+~\cite{ARCH_BW,SEED_3}
+
+\begin{verbatim}
+High-level pipeline (conceptual; Part 2 will formalize denotations and proof obligations)
+
+   Tile kernel IR (TTGIR / Tile IR) + explicit movement      Hardware instance (B200 or GB10)
+   ---------------------------------------------------      -------------------------------
+          |                                                               |
+          v                                                               v
+   +----------------------+     +----------------------+     +----------------------+
+   |  Layout semantics    |     | Data-movement sem.   |     |  Schedule semantics  |
+   |  (F2 / ISL / Nest)   |     | (descriptors, tiers) |     | (SWP + WS constraints)|
+   +----------+-----------+     +----------+-----------+     +----------+-----------+
+              \                      |                               /
+               \                     |                              /
+                v                    v                             v
+                   +------------------------------------------------+
+                   |      Joint solver-backed model (BW-TiLSS)      |
+                   |  constraints + objectives + calibrated params  |
+                   +------------------------+-----------------------+
+                                            |
+                                            v
+                              Falsifiable predictions (II, traffic, etc.)
+                              + calibration/validation protocols
+\end{verbatim}
+
+
+\section{Formal preliminaries}
+
+This section fixes notation and introduces the mathematical objects that will be used throughout.
+All preliminaries are chosen to support \emph{proof obligations} (semantic preservation / legality) and \emph{solver encodings} (search over discrete and numeric decisions).
+
+\subsection{Notation and scope}
+
+\paragraph{Architecture instances.}
+Let \(\mathsf{BW}\) denote the Blackwell family.
+We will refer to (at least) two platform instances that appear in the golden sources:
+B200 (datacenter Blackwell)%
+~\cite{ARCH_BW,OPT_PIPE}
+and GB10 (Grace--Blackwell).%
+~\cite{SEED_3}
+Any transfer of numeric parameters or qualitative behaviors between these instances is treated as \textbf{INFERENCE} and must be empirically validated (see Part~3--4 plan; previewed here by explicit \textbf{UNVERIFIED} flags).
+
+\paragraph{Programs of interest (tile kernels).}
+We consider kernels whose essential structure is tile-based: explicit tiling, explicit data movement, and explicit tensor operations (e.g., tiled MMA).
+This aligns with tile-based SSA IRs with explicit movement used for dependence extraction in solver scheduling,%
+~\cite{OPT_PIPE}
+and with CUDA Tile IR as a tile-semantics compilation boundary.%
+~\cite{NV_BLOG_TILE}
+
+\paragraph{Memory tiers as a typed set.}
+We will treat memory and movement targets as a finite set of tiers
+\[
+\mathcal{M} \triangleq \{\mathsf{HBM}, \mathsf{L2}, \mathsf{L1Tex/SMEM}, \mathsf{TMEM}, \mathsf{DE}\},
+\]
+where \(\mathsf{TMEM}\) and \(\mathsf{DE}\) are Blackwell-relevant modeled tiers/units reported in microarchitectural characterization.%
+~\cite{ARCH_BW}
+This ``tier typing'' is a semantic device: it forces each data-movement operation to specify a source and destination tier and enables proof obligations about movement legality and synchronization.
+
+
+\subsection{Linear layouts over \(\mathbb{F}_2\) (bit-level layout algebra)}
+
+We adopt the linear-layout formalism in which layouts are linear maps between labeled vector spaces over \(\mathbb{F}_2\).%
+~\cite{SEED_1}
+This formalism is attractive because it admits constructive operators (composition, product, division, inverses) and yields closure results under common tensor shape operations.%
+~\cite{SEED_1}
+
+\paragraph{Labeled \(\mathbb{F}_2\) vector spaces.}
+Let \(\mathcal{L}\) be a finite label set.
+A labeled bitvector space is a vector space \(V_{\mathcal{L}}\) over \(\mathbb{F}_2\) with coordinates indexed by \(\mathcal{L}\).%
+~\cite{SEED_1}
+Intuitively, \(\mathcal{L}\) names hardware-coordinate bits (e.g., lane/thread/warp bits) or tensor-coordinate bits.
+
+\paragraph{Linear layouts.}
+A (linear) layout is a linear map \(L : V_{\mathcal{L}_{\mathrm{src}}} \rightarrow V_{\mathcal{L}_{\mathrm{dst}}}\) over \(\mathbb{F}_2\), satisfying
+\[
+L(x \oplus y) = L(x) \oplus L(y)
+\quad \text{and} \quad
+L(0) = 0.
+\]
+The formalism provides algebraic constructors: composition, products, (left) division, and right inverses.%
+~\cite{SEED_1}
+
+\paragraph{Distributed layouts and memory layouts.}
+The same representation class is used to model:
+(i) \emph{distributed} layouts mapping hardware resources to logical tensor coordinates, and
+(ii) \emph{memory} layouts mapping (restricted) offsets to coordinates.%
+~\cite{SEED_1}
+Completeness results justify using linear layouts as a uniform representation for these classes under representability conditions.%
+~\cite{SEED_1}
+
+\paragraph{Closure under shape operations and bank-conflict modeling (qualitative use).}
+The distributed-layout family is shown to be closed under common tensor shape operations (transpose/reshape/split/join/broadcast-style transforms),%
+~\cite{SEED_1}
+supporting semantics for layout propagation at the IR level.
+A separate algebraic bank-conflict model and swizzling constructions are provided,%
+~\cite{SEED_1}
+but any quantitative instantiation on Blackwell requires chip-specific calibration parameters that are not provided in the golden set; thus any numeric bank-cost use is \textbf{UNVERIFIED} at this stage.
+
+\paragraph{Representability restriction.}
+The linear-layout formalism carries a power-of-two shape restriction (bitvector spaces), and non-power-of-two cases require padding/masking or an alternative representation.%
+~\cite{SEED_1}
+This motivates an explicit fallback representation (next subsection) rather than implicit heuristics.
+
+
+\subsection{Integer set relations (ISL) as a unifying representation of layouts}
+
+We introduce integer set relations as a solver- and verification-friendly semantics for layout mappings, following the proposal to represent both CuTe layouts/swizzles and Triton-style linear layouts as relations in an ISL-like algebra.%
+~\cite{SEED_2}
+
+\paragraph{Integer relations and operations.}
+An integer relation is a subset \(R \subseteq \mathbb{Z}^n \times \mathbb{Z}^m\).
+Standard operations include relational composition, inverse, and domain/range restriction, which support encoding of layout composition and inversion as relation algebra.%
+~\cite{SEED_2}
+When necessary, quasi-affine constraints may be used to express mappings that are not strictly affine under certain shape choices.%
+~\cite{SEED_2}
+
+\paragraph{CuTe layout decomposition.}
+A CuTe layout is described via shape and strides, and its semantics can be decomposed into coordinate and index mappings whose composition yields the overall layout mapping.%
+~\cite{SEED_2}
+This decomposition aligns with descriptor-style programming interfaces that carry \((\text{shape}, \text{strides})\) explicitly as parameters.%
+~\cite{SEED_2,NV_BLOG_TILE}
+
+\paragraph{Reconstruction and inference limits.}
+Algorithms exist to reconstruct layouts from strictly affine relations (given shape) and to reconstruct layouts given strides, with correctness arguments;%
+~\cite{SEED_2}
+however, inferring both shape and strides from layout mapping alone is stated as an open problem.%
+~\cite{SEED_2}
+This is important for our proposal because it delineates what can and cannot be inferred from observing only compiled address behavior.
+
+\paragraph{Role in the proposal.}
+ISL relations will serve as the ``total'' semantics layer used when \(\mathbb{F}_2\)-linearity representability fails or when we require a relation-level proof of address-set equivalence for descriptorization transforms (Part~2--3).%
+~\cite{SEED_2,NV_BLOG_TILE}
+
+
+\subsection{Categorical semantics for tractable CuTe layout algebra}
+
+To support proof-carrying transformations and to exploit a tractable algebra of layout operations, we use categorical semantics that encode a class of tractable layouts as morphisms in categories \texttt{Tuple} and \texttt{Nest}.%
+~\cite{SEED_4}
+
+\paragraph{Categories \texttt{Tuple} and \texttt{Nest}.}
+The framework defines categories whose morphisms correspond (for a non-degenerate tractable subclass) to layouts, with an explicit correspondence theorem between tractable layouts and standard-form \texttt{Nest}-morphisms.%
+~\cite{SEED_4}
+
+\paragraph{Compatibility of operations.}
+Key layout operations (composition, coalesce, complement, logical division, logical product) are shown compatible with corresponding categorical operations, enabling a proof scaffold for semantic preservation when these operations are applied within their admissibility/tractability conditions.%
+~\cite{SEED_4}
+
+\paragraph{Algorithmic relevance.}
+The framework provides algorithms for computing compositions of tractable layouts, aligning with the need for compiler-time layout algebra that is both computable and checkable.%
+~\cite{SEED_4}
+Any use outside the tractable subclass is treated as out-of-scope or \textbf{UNVERIFIED} until representability/tractability checks are defined (Parts~2--3).
+
+\begin{verbatim}
+Representation landscape (relationships are NOT assumed equivalent a priori)
+
+   (A) F2-linear layouts (power-of-two; SEED_1)
+           |
+           | representable subset; algebraic operators
+           v
+   (B) Integer relations (general; quasi-affine; SEED_2)
+           ^
+           |
+           | tractable / admissible subclass with categorical proofs
+           |
+   (C) Nest-morphism encodings (tractable CuTe layouts; SEED_4)
+
+Part 2 will state explicit denotations and proof obligations for when these
+representations must agree (and what to do when they cannot).
+\end{verbatim}
+
+
+\subsection{SMT/ILP foundations: modulo scheduling and warp specialization}
+
+We adopt a solver-first scheduling semantics in which legality and feasibility are encoded as constraints and throughput is optimized by minimizing initiation interval (II), following a modulo-scheduling + warp-specialization formulation.%
+~\cite{OPT_PIPE}
+
+\paragraph{Dependence graph.}
+Let \(G=(V,E)\) be a dependence graph of operations \(V\), where each edge \(e=(u \rightarrow v)\in E\) carries a \emph{cycle delay} \(d_e \in \mathbb{N}\) and an \emph{iteration delay} \(\delta_e \in \mathbb{N}\).%
+~\cite{OPT_PIPE}
+Intuitively, \(\delta_e\) indicates cross-iteration dependences in a loop body.
+
+\paragraph{Modulo schedule and initiation interval.}
+A modulo schedule assigns each operation \(v\in V\) a time slot \(\sigma(v)\) modulo an initiation interval \(\mathrm{II}\in\mathbb{N}\).%
+~\cite{OPT_PIPE}
+For an unrolled representation over a finite horizon (prologue/steady-state/epilogue), the schedule is encoded by boolean decision variables of the form
+\[
+\mathsf{op}[v,i,t] \in \{0,1\},
+\]
+indicating whether operation \(v\) in logical iteration \(i\) issues at time \(t\) in the unrolled schedule.%
+~\cite{OPT_PIPE}
+
+\paragraph{Feasibility constraints (sketch).}
+Constraints enforce uniqueness and completion (each op instance issues exactly once), dependence satisfaction, and resource capacity per time step.%
+~\cite{OPT_PIPE}
+A canonical dependence constraint schema is:
+if \(u\) precedes \(v\) with delays \((d_e,\delta_e)\), then the scheduled time of \(v\) in iteration \(i+\delta_e\) is at least the scheduled time of \(u\) in iteration \(i\) plus \(d_e\).%
+~\cite{OPT_PIPE}
+(The precise encoding uses the schedule tensor and time variables as in the source formulation.)
+
+\paragraph{Working-set feasibility via SSA liveness.}
+Working-set constraints are expressed by liveness booleans
+\[
+\mathsf{live}[x,t] \in \{0,1\},
+\]
+tracking whether an SSA value instance \(x\) is live at time \(t\), with capacity constraints over register/shared-memory-like resources.%
+~\cite{OPT_PIPE}
+This provides a bridge from scheduling decisions to memory feasibility.
+
+\paragraph{Warp specialization (WS).}
+Warp assignment uses decision variables such as
+\[
+\mathsf{opw}[v,w] \in \{0,1\},
+\]
+assigning operations to warps subject to per-warp resource limits and synchronization/communication constraints, including handling of variable-latency effects.%
+~\cite{OPT_PIPE}
+This matters for Blackwell because synchronization associated with tensor-memory data movement is reported to influence WS/SWP strategies on B200.%
+~\cite{OPT_PIPE,ARCH_BW}
+
+\paragraph{Unsatisfiability-aware search.}
+If constraints are unsatisfiable for a candidate \(\mathrm{II}\), a monotone search over \(\mathrm{II}\) (and schedule horizon length) yields the smallest satisfiable \(\mathrm{II}\), which is throughput-optimal relative to the encoded constraints.%
+~\cite{OPT_PIPE}
+This will be the backbone of our optimization layer once Blackwell-tiered costs/capacities are calibrated (Parts~3--4).
+
+
+\subsection{Analytic cache/traffic modeling at tile granularity}
+
+We introduce an explicit cache/traffic semantics layer motivated by analytic modeling and validation on Grace--Blackwell for streaming attention.%
+~\cite{SEED_3}
+This layer is necessary because minimizing \(\mathrm{II}\) alone can select schedules that are feasible yet traffic-suboptimal when reuse distance and traversal order dominate observed performance.
+
+\paragraph{Sector-access model as a semantic observable.}
+Let \(S_{\mathsf{L2}}(\cdot)\) denote a function that predicts L2 sector accesses (or a related sector-count observable) as a function of parameters such as sequence length, tile size, element size, and head dimension, with approximations and assumptions explicitly stated.%
+~\cite{SEED_3}
+The cited model is validated against hardware counters and reports explicit approximation caveats (e.g., trailing effects).%
+~\cite{SEED_3}
+In our proposal, \(S_{\mathsf{L2}}\) will be treated as a hypothesis to be calibrated/falsified, not as an axiom.
+
+\paragraph{Traversal-order transforms.}
+Let \(\tau\) be a traversal permutation over tiles (e.g., cyclic versus sawtooth).
+A sawtooth traversal is defined algorithmically and is shown to impact L2 non-compulsory misses and throughput on GB10, with stated applicability constraints (e.g., tile splitting by the compiler at certain tile sizes).%
+~\cite{SEED_3}
+In BW-TiLSS, \(\tau\) will be modeled as an explicit program transform whose legality must be checked against dependence constraints and whose profitability must be evaluated via \(S_{\mathsf{L2}}\) and empirical validation.%
+~\cite{SEED_3,OPT_PIPE}
+
+\paragraph{Mapping context for mixed-reuse workloads.}
+We adopt the notion of mapping as a set of loop transformations (including tiling) that determine resource use and reuse.%
+~\cite{NV_workloads}
+This framing supports a clean separation between (i) intra-kernel solver decisions (layout/movement/schedule) and (ii) higher-level mapping/partitioning decisions in mixed-reuse pipelines, which will be addressed later as an extension rather than as an implicit heuristic.%
+~\cite{NV_workloads}
+
+
+\section{Toolchain constraints: CUDA \(>\) 13.0, PTX \(>\) 9.0 (strict), and what is \textbf{UNVERIFIED}}
+
+This project adopts non-negotiable constraints and explicitly enumerates what the golden sources do \emph{not} establish about the required toolchain behavior.
+The guiding principle is: if a claim is not supported by a golden source (or later by explicitly fetched primary docs), it is treated as \textbf{UNVERIFIED} and becomes a verification/calibration task.
+
+\subsection{Hard constraints (binding)}
+
+\begin{itemize}
+  \item \textbf{Architecture scope:} NVIDIA Blackwell only; Grace--Blackwell is allowed when relevant.%
+  ~\cite{ARCH_BW,SEED_3}
+  \item \textbf{CUDA toolchain:} CUDA \(>\) 13.0, preferably CUDA~13.1+.%
+  ~\cite{NV_BLOG_TILE}
+  \item \textbf{PTX toolchain:} PTX \(>\) 9.0, strictly (no exceptions).
+  \item \textbf{Source discipline:} no non-trivial claims without citations; any missing evidence is marked \textbf{UNVERIFIED}.%
+  ~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE,SEED_1,SEED_2,SEED_3,SEED_4,NV_workloads}
+\end{itemize}
+
+\subsection{Compilation backends and observable artifacts}
+
+\paragraph{Tile-IR backend gating and limitations.}
+CUDA Tile is described as introduced in CUDA~13.1, and Triton-to-TileIR requires CUDA~13.1+ and Blackwell GPUs, with a source-build workflow and an environment-variable switch (e.g., \texttt{ENABLE\_TILE=1}) that selects the backend; the compilation cache uses a \texttt{.tileIR} artifact when active.%
+~\cite{NV_BLOG_TILE}
+The backend has incomplete operation coverage and warns of performance pitfalls for tensor-of-pointer patterns, with a suggested mitigation via descriptorized loads/stores using a tensor descriptor API.%
+~\cite{NV_BLOG_TILE}
+
+\paragraph{Solver scheduling baselines and CUDA version mismatch.}
+The solver-first modulo scheduling + warp specialization evaluation baseline explicitly uses CUDA~13.0.%
+~\cite{OPT_PIPE}
+Our toolchain target is CUDA \(>\) 13.0; therefore, any machine parameters, instruction availability, or lowering behaviors assumed in the baseline must be re-validated under CUDA~13.1+ (and the chosen driver/toolchain), and cannot be treated as stable by default.%
+~\cite{OPT_PIPE,NV_BLOG_TILE}
+
+\paragraph{Microbenchmark methodology as a validity constraint.}
+Blackwell microarchitectural measurements emphasize PTX microbench design that isolates latency (e.g., dependency chains) and audits PTX-to-SASS translation to ensure the intended hardware path is exercised.%
+~\cite{ARCH_BW}
+This methodology will be adopted as a \emph{toolchain validity check} rather than only as a measurement technique.
+
+\begin{verbatim}
+Toolchain surface (conceptual; verification targets marked UNVERIFIED)
+
+   Source kernel (tile-based Triton / TTGIR)
+                    |
+                    +-------------------------------+
+                    |                               |
+                    v                               v
+        Tile IR backend (CUDA 13.1+)      PTX backend (PTX > 9.0 strict)
+        - ENABLE_TILE=1                   - PTX emitted / assembled
+        - caches .tileIR                  - SASS lowering audited
+        - op coverage incomplete          - instruction availability ?
+        - pointer-tensor pitfalls         - tcgen05/TMEM semantics ?
+                    |                               |
+                    +---------------+---------------+
+                                    v
+                        Blackwell execution (B200 / GB10)
+                        - TMEM, DE, tcgen05.*  (ARCH_BW)
+                        - L2 sector behavior   (SEED_3)
+\end{verbatim}
+
+\subsection{Explicit \textbf{UNVERIFIED} items in the golden sources (must be verified)}
+
+\begin{itemize}
+  \item \textbf{UNVERIFIED (PTX version compatibility):}
+  None of the golden sources, as summarized here, explicitly states the PTX version requirements or guarantees for \texttt{tcgen05.*} and TMEM-relevant operations, nor do they establish that the required behaviors are stable under PTX \(>\) 9.0.%
+  ~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}
+
+  \item \textbf{UNVERIFIED (CUDA \(>\) 13.0 behavior for measured parameters):}
+  Blackwell microarchitectural parameters (e.g., TMEM characteristics, DE pipeline behavior, \texttt{tcgen05.mma} latency) are reported under a specific toolchain regime and include software-ecosystem notes around CUDA~13.0-era support.%
+  ~\cite{ARCH_BW}
+  The solver scheduling work also uses CUDA~13.0.%
+  ~\cite{OPT_PIPE}
+  Therefore, parameter reuse under CUDA~13.1+ is \textbf{UNVERIFIED} and will be re-measured.
+
+  \item \textbf{UNVERIFIED (cross-SKU parameter transfer within Blackwell):}
+  B200-focused microarchitectural measurements and GB10-focused cache/traffic behavior are on different Blackwell-family instances; transferring parameters or assumptions between them is \textbf{UNVERIFIED} without matched calibration.%
+  ~\cite{ARCH_BW,SEED_3}
+
+  \item \textbf{UNVERIFIED (Tile IR backend stability across CUDA 13.x):}
+  The Tile IR backend is described as evolving, with explicit limitations and performance caveats (e.g., unsupported ops, tensor-of-pointer degradation) that are likely CUDA-version dependent; thus any constraint set derived from it is version-parameterized and must be revalidated.%
+  ~\cite{NV_BLOG_TILE}
+
+  \item \textbf{UNVERIFIED (quantitative bank-conflict costs on Blackwell):}
+  While bank-conflict modeling and swizzling are formalized algebraically, quantitative instantiation requires Blackwell-specific bank parameters not provided in the golden set.%
+  ~\cite{SEED_1}
+
+  \item \textbf{UNVERIFIED (traffic-model validity region):}
+  The analytic L2 sector-access model and traversal-order transformation are validated for a specific streaming attention regime on GB10 and carry explicit assumptions/limitations; generalization to other kernels, tile sizes, or compilation behaviors is \textbf{UNVERIFIED}.%
+  ~\cite{SEED_3}
+
+  \item \textbf{UNVERIFIED (end-to-end equivalence across layout representations):}
+  The three layout reasoning substrates (linear \(\mathbb{F}_2\) layouts, integer relations, categorical Nest-morphisms) are individually well-defined,%
+  ~\cite{SEED_1,SEED_2,SEED_4}
+  but a single unified equivalence theorem (with representability/tractability conditions) is not provided as a packaged result; establishing this equivalence (or defining verified fallbacks) is a core proof obligation in this proposal.
+\end{itemize}
+
+% -------------------------------------------------------------------------
+% source_audit (PART 1; comments only to avoid non-LaTeX/YAML side channels)
+%
+% ARCH_BW:
+%   Used for: Blackwell B200 architectural motivation (TMEM, DE, tcgen05.*);
+%             measurement methodology constraints (latency isolation; PTX->SASS audit);
+%             software-ecosystem notes around CUDA 13.0-era support.
+%   Anchors: III-A (Blackwell arch); IV-A (PTX microbench + translation audit);
+%            V-A (TMEM); V-B (DE); VI-A (tcgen05.mma); VIII (discussion/toolchain notes).
+%
+% OPT_PIPE:
+%   Used for: formal scheduling preliminaries (dependence graphs; modulo scheduling; II);
+%             constraint tensors (op/live/opw); WS+SWP unified constraints; UNSAT search.
+%   Anchors: 3.1; 4.1--4.3 + Figures 4--6; Algorithm 1; 6.1 (CUDA 13.0 baseline).
+%
+% NV_BLOG_TILE:
+%   Used for: toolchain boundary conditions (CUDA 13.1+; Blackwell prerequisite);
+%             Tile IR semantics boundary; backend selection via ENABLE_TILE; .tileIR artifact;
+%             limitations and tensor-of-pointer degradation; descriptor rewrite API surface.
+%   Anchors: What is CUDA Tile/Tile IR?; prerequisites; verify compilation; limitations;
+%            tensor descriptor example (tl.make_tensor_descriptor; desc.load/store).
+%
+% NV_workloads:
+%   Used for: mapping vocabulary (loop transformations) and mixed-reuse motivation
+%             to separate kernel-level solver decisions from higher-level mapping/partitioning.
+%   Anchors: II-A (Mapping); II-B (Mixed-reuse); IV (Harp taxonomy); VI-A (evaluation framing).
+%
+% SEED_1:
+%   Used for: F2 linear-layout preliminaries (definitions; operations; closure under shape ops);
+%             qualitative bank-conflict/swizzle mention with explicit UNVERIFIED quantitative instantiation.
+%   Anchors: Def 4.1--4.5; Def 4.10/4.14; Thm 4.9/4.13/9.3; Lemma 9.4; limitations (power-of-two).
+%
+% SEED_2:
+%   Used for: ISL integer relation preliminaries; CuTe layout decomposition; quasi-affine note;
+%             reconstruction algorithms and open problem statement.
+%   Anchors: 2.1--2.4; layout ops; get_layout_* algorithms; open problem on shape+strides inference.
+%
+% SEED_3:
+%   Used for: cache/traffic preliminaries (L2 sector-access modeling; validation; sawtooth transform);
+%             applicability limitations; GB10 as Grace--Blackwell instance.
+%   Anchors: 2.1 (GB10 platform); 3.2 (sector model); Algorithm 4 (sawtooth); limitations section.
+%
+% SEED_4:
+%   Used for: categorical preliminaries (Tuple/Nest categories; tractable layouts);
+%             compatibility theorems for layout operations; algorithmic relevance.
+%   Anchors: Abstract; Theorems A--F; Algorithm 4.1.3 (composition); tractable-subclass scope.
+% -------------------------------------------------------------------------

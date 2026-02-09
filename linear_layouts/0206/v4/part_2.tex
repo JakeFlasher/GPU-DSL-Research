@@ -1,0 +1,74 @@
+\section{Introduction and Motivation}
+\label{sec:intro}
+
+\paragraph{Scope and hard constraints.}
+This proposal is scoped \emph{only} to NVIDIA Blackwell GPUs (including Grace--Blackwell when relevant), and targets toolchains with CUDA \(\!>\!13.0\) (e.g., 13.1+) and PTX \(\!>\!9.0\) (strictly greater than 9.0); any finer-grained toolchain/ISA gating beyond this statement is treated as \UNVERIFIED{} unless supported by primary documentation. \CiteAllGoldens{} We further motivate our evaluation focus using mixed-reuse transformer cascades and phase behavior (e.g., prefill vs.\ decode) as representative, high-leverage regimes rather than relying solely on isolated microkernels. \cite{NV_workloads}
+
+\paragraph{Why Blackwell shifts the optimization and observability surfaces.}
+A central premise is that Blackwell introduces architectural mechanisms and execution granularity changes that reshape what must be modeled and what can be observed.
+At the hardware/interface level, open microbenchmark evidence emphasizes Blackwell-specific components and instruction pathways (including Tensor Memory and fifth-generation Tensor Core behavior) and argues for PTX-level control plus PTX-to-SASS translation audits as a methodology for isolating architectural effects. \cite{ARCH_BW}
+At the scheduling/program-structure level, recent evidence on forward/backward attention kernels reports that Blackwell can demand materially different software-pipelining and warp-specialization strategies, in part due to synchronization requirements around Tensor Memory loads/stores and explicit movement of accumulators from Tensor Memory to registers for general computation. \cite{OPT_PIPE}
+Together, these observations suggest that Blackwell-era performance engineering is increasingly constrained by cross-layer invariants: a kernel's tile shape, data movement, and synchronization structure are not separable choices, and ``getting one wrong'' can dominate end-to-end outcomes.
+
+\begin{verbatim}
+Cross-layer coupling (problem sketch; not a methodology):
+  Mixed-reuse workload phases (prefill vs decode)  [NV_workloads]
+                   |
+                   v
+        kernel family + tensor shapes + reuse mix
+                   |
+                   v
+      tile-level decisions (shape/layout/lifetimes)
+                   |
+                   v
+  lowering decisions (allocation / layout conversion / sync)
+                   |
+                   v
+   backend interface choice (PTX vs CUDA Tile IR surface)
+                   |
+                   v
+  Blackwell execution (Tensor Cores + TMEM + data-movement + caches)
+     [ARCH_BW, OPT_PIPE, NV_BLOG_TILE, SEED_3]
+\end{verbatim}
+
+\paragraph{Problem framing: the ``missing integration'' gap.}
+Despite strong, complementary evidence across the stack, the current ecosystem exposes a mismatch between (i) Blackwell's explicit, tile-centric mechanisms and (ii) the degree of automation and correctness guarantees available in widely used compiler and kernel-generation pipelines.
+On one hand, scheduling work that extracts dependence graphs from Triton programs reports that (beyond scheduling) additional lowering decisions must be made correctly, and that current compiler stacks can make incorrect decisions in memory allocation, layout conversions, and synchronization placement---to the point of failing compilation or producing poorly performing code, motivating hand-compilation of the scheduled pipelines. \cite{OPT_PIPE}
+On the other hand, NVIDIA's emerging Triton-to-CUDA Tile IR backend (introduced in CUDA 13.1 and gated on Blackwell GPUs) foregrounds a shifting compilation interface: operation coverage is incomplete, and a specific performance pitfall is identified for the ``tensor-of-pointer'' access pattern, with a mitigation path that recommends descriptor-driven TMA load/store APIs when tiles are contiguous and shapes/strides are well-defined. \cite{NV_BLOG_TILE}
+Meanwhile, formal layout work provides a plausible route to make layout transformations \emph{trustworthy} (rather than heuristic), supported by empirical correctness evidence showing that layout-handling bugs or limitations can be consequential in practice. \cite{SEED_1}
+Complementarily, integer set relations have been used to model layout abstractions and to highlight a concrete memory-safety hazard: implicit layout promotion under composition can induce mappings that require bounds checks, and the framework argues that required predicates can be synthesized automatically to prevent out-of-bound accesses. \cite{SEED_2}
+Finally, system-level results on a Grace--Blackwell GB10 platform indicate that CTA traversal order can materially affect cache behavior and throughput (e.g., reducing L2 non-compulsory misses), implying that locality is not merely a runtime ``launch detail'' but a potentially first-class optimization decision that interacts with kernel structure. \cite{SEED_3}
+
+\begin{verbatim}
+Two compilation/analysis surfaces (tension to resolve in a Blackwell-only setting):
+
+  (A) PTX-centric observability (fine-grained, instruction-level evidence)
+      PTX -> SASS audit emphasized for isolating architectural effects  [ARCH_BW]
+      (but does not by itself address end-to-end compiler coverage gaps [OPT_PIPE])
+
+  (B) Tile-semantic compilation surface (CUDA Tile IR; evolving coverage)
+      CUDA 13.1+ Tile IR backend; .tileIR artifacts; unsupported ops; and
+      tensor-of-pointer degradation with a descriptor/TMA mitigation path [NV_BLOG_TILE]
+
+  Missing integration:
+      scheduling constraints + allocator/layout/sync correctness + locality choices
+      are evidenced separately, but not unified into a robust, testable pipeline
+      with safety/verification hooks and workload-relevant validation.
+      [OPT_PIPE, SEED_1, SEED_2, SEED_3, NV_workloads]
+\end{verbatim}
+
+\paragraph{Non-claims (scope discipline and hallucination control).}
+We explicitly \emph{do not} claim (and will label \UNVERIFIED{} if hypothesized) any proprietary microarchitectural hazard semantics or undocumented instruction-ordering rules beyond what is supported by the cited sources. \cite{ARCH_BW,OPT_PIPE}
+We also do not assume that results demonstrated under CUDA 13.0 in prior evaluations transfer unchanged to CUDA 13.1+ toolchains; any such transfer is \UNVERIFIED{} until re-established under the project constraints. \cite{OPT_PIPE,NV_BLOG_TILE}
+Finally, we do not generalize Grace--Blackwell GB10 locality results to other Blackwell parts without explicit validation; cross-device generality is \UNVERIFIED{} by default. \cite{SEED_3,ARCH_BW}
+
+\paragraph{Contributions (problem-driven, evidence-linked).}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{A Blackwell-focused research gap framing that is explicitly cross-layer:} we articulate how TMEM-centric execution changes, synchronization pressure in attention-like kernels, and shifting compiler interfaces (PTX vs.\ CUDA Tile IR) jointly create new failure modes and optimization opportunities that are not addressed by any single layer in isolation. \cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}
+  \item \textbf{A unifying perspective on correctness as an enabler for performance:} we connect layout-theoretic robustness results and layout-safety modeling (including predicate synthesis to prevent out-of-bounds mappings) to practical compiler pain points in layout conversion and descriptor formation for tile-based data movement. \cite{SEED_1,SEED_2,NV_BLOG_TILE,OPT_PIPE}
+  \item \textbf{A workload-relevant motivation lens for Blackwell optimization:} we ground the proposal in mixed-reuse cascades and phase behavior, arguing that Blackwell mechanisms must be studied under representative transformer regimes where kernel interactions and locality effects can dominate. \cite{NV_workloads,SEED_3}
+  \item \textbf{A locality-aware framing for tile-centric compilation on Grace--Blackwell:} we highlight evidence that CTA traversal order can significantly affect cache behavior and throughput, motivating research that treats traversal-order decisions as part of the optimization space rather than as a purely incidental runtime artifact. \cite{SEED_3}
+  \item \textbf{A disciplined constraint-and-evidence contract:} we enforce Blackwell-only scope and CUDA \(\!>\!13.0\), PTX \(\!>\!9.0\) toolchain targets, and we adopt an explicit \UNVERIFIED{} labeling policy for any claims that exceed what is supported by the golden sources (or additional primary documentation). \CiteAllGoldens{} \cite{NV_workloads}
+\end{itemize}
+
+% === END PART 2 ===

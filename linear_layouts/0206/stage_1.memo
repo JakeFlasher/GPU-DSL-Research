@@ -1,0 +1,177 @@
+```json
+{
+  "Current_Thesis": "On NVIDIA Blackwell, CUDA Tile IR (CUDA 13.1+) shifts the register-spill/occupancy tradeoff from a mostly-backend (ptxas) artifact into a first-class design variable, because tile-level codegen (tileiras) must jointly map tiles onto new hardware pathways (TMEM/TMA) while respecting explicit token ordering and user hints like `occupancy`.",
+  "Key_Insights": [
+    "CUDA 13.1 introduces CUDA Tile / Tile IR and the `tileiras` compiler that translates Tile IR bytecode into Blackwell SASS; the initial CUDA Tile release targets Blackwell GPUs and PTX advances to ISA 9.1 in the same release line.",
+    "The Triton-to-TileIR backend is enabled via `ENABLE_TILE=1`, targets CUDA 13.1 features, supports Blackwell only in 13.1, and may fall back to the PTX backend on compilation bugs—so provenance checks are mandatory for any measurement campaign.",
+    "Tile IR’s memory model makes ordering explicit via tokens: program/data/control dependencies do not order memory operations; token-ordered ops produce/consume abstract tokens whose dependencies the toolchain preserves.",
+    "Blackwell introduces TMEM (256KB per SM) and `tcgen05.mma` (single-thread issue) with explicit software-managed allocation/data-movement via `tcgen` PTX instructions, making “where do intermediates live?” (RF vs SMEM vs TMEM) a compiler-exposed performance axis.",
+    "NVIDIA explicitly calls out Triton’s tensor-of-pointers loads/stores as suboptimal on the Tile IR backend (CUDA 13.1), and recommends switching to TMA load/store via tensor descriptors to avoid materializing per-element pointers inside the kernel."
+  ],
+  "Evidence_Bank": {
+    "CUDA 13.1 introduces CUDA Tile / Tile IR, targets Blackwell, and adds tileiras (Tile IR bytecode -> SASS)": [
+      "CUDA_RN"
+    ],
+    "CUDA Tile is introduced in CUDA 13.1; tile programming model + Tile IR is MLIR-based and spec-driven": [
+      "NV_BLOG_TILE"
+    ],
+    "Triton-to-TileIR enablement (`ENABLE_TILE=1`), fallback-to-PTX behavior, new `occupancy` hint, missing `num_warps`, and spilling risk in some reductions": [
+      "TRITON_TILE_REPO"
+    ],
+    "Tile IR tokens/token-order are required for memory ordering; program dependencies do not order memory ops": [
+      "TILE_SPEC"
+    ],
+    "Blackwell TMEM + tcgen05 single-thread tensor ops + explicit software management": [
+      "ARCH_BW"
+    ],
+    "Tensor-of-pointers is a known Tile IR perf issue; TMA descriptors recommended": [
+      "NV_BLOG_TILE"
+    ]
+  },
+  "Open_Questions": [
+    "What *observable* compiler decisions does the Tile IR backend make in response to the `occupancy` hint (e.g., unrolling, software-pipelining depth, live-range shaping), and how do those decisions manifest as spill onset on Blackwell?",
+    "How often does token ordering (Tile IR memory model) materially extend live ranges / constrain scheduling enough to trigger spills in real Triton kernels, versus spills being dominated by classic causes (large reductions, pointer arithmetic, unrolling)?",
+    "How do TMA tensor descriptors change register pressure relative to tensor-of-pointers across common kernels (GEMM mainloop, layernorm/reductions, attention epilogues), and does the improvement translate primarily into higher occupancy or fewer local-memory transactions?",
+    "Given that the Triton-to-TileIR backend may fall back to PTX, what is the most robust fail-closed provenance check per-kernel (beyond cache file extensions) that survives autotuning and multi-process runs?",
+    "What is the right ‘spill metric’ set on Nsight Compute 2025.4+ that correlates with *occupancy loss* vs *extra local memory traffic*, specifically for Tile IR-generated SASS on Blackwell?"
+  ],
+  "Execution_Plan": {
+    "Stage": "1/3 Insight_Discovery (complete)",
+    "Next_Steps": [
+      "Stage 2: Design an A/B microbenchmark plan (PTX backend vs Tile IR backend) with strict provenance checks (detect fallback).",
+      "Define a minimal parameter space that can generate spill-onset phase diagrams: tile shapes, reduction sizes, `num_ctas`, and Tile IR `occupancy` hint.",
+      "Select Nsight Compute 2025.4+ metrics for (a) spill instructions/traffic and (b) achieved occupancy / warp stalls attributable to spills."
+    ]
+  }
+}
+```
+
+## Research Memo (Stage 1): Why *spill onset* becomes the organizing principle for Tile IR on Blackwell
+
+### 1) The architectural problem: Blackwell raises the payoff of “getting occupancy vs latency” exactly right
+
+Blackwell’s tensor pipeline is not just “more Tensor Core FLOPS”; it changes the *storage and issue model* for tensor work. The microbenchmark study highlights two shifts that matter directly for register pressure:
+
+- **TMEM becomes a first-class on-chip tensor storage tier (256KB per SM)** and tensor ops can source operands from SMEM/TMEM while writing accumulators back to TMEM. ([arxiv.org](https://arxiv.org/html/2512.02189v1))  
+- **`tcgen05.mma` is a single-thread PTX instruction** (vs warp/warp-group synchronous issuance in prior designs), and **allocation/data movement/deallocation are explicitly managed in software via `tcgen` PTX instructions**, giving the toolchain “precise control” over tile locality/traffic. ([arxiv.org](https://arxiv.org/html/2512.02189v1))  
+
+Mechanism-first implication for spilling/occupancy:
+- Blackwell opens a bigger design space where intermediates can plausibly live in **RF vs SMEM vs TMEM**, and where “software-managed overlap” (prefetch/copy engines + compute) is the path to throughput. The *cost* is that these schedules tend to increase the number of in-flight values (tiles, descriptors, pipeline state), which is exactly what pushes kernels over the spill cliff.
+
+So the core hardware tension is:  
+**Latency hiding wants more in-flight work; occupancy wants fewer registers per thread; software pipelining wants more registers.** Blackwell makes this tension sharper because the new tensor pipeline rewards deep overlap and on-chip residency. ([arxiv.org](https://arxiv.org/html/2512.02189v1))  
+
+### 2) The toolchain shift: Tile IR changes *where* register allocation decisions live (and thus how spills arise)
+
+CUDA 13.1 formally introduces CUDA Tile / Tile IR and—critically—introduces **`tileiras`, which translates Tile IR bytecode into GPU machine instructions (SASS)**. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html))  
+In the PTX path, PTX is an assembly-like language and **`ptxas` is the optimizing backend compiler that optimizes and assembles PTX source modules into binary objects**. ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html))  
+
+The novelty delta is not “new IR exists”; it’s that the *allocation frontier moves*:
+
+- **PTX backend:** TTIR/LLVM-ish lowering → PTX → **ptxas** decides final scheduling + register allocation + spills.  
+- **Tile IR backend:** TTIR → Tile IR → **tileiras** (bytecode → SASS) is now on the critical path. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html))  
+
+Inference (explicitly labeled): generating SASS necessarily entails mapping temporaries onto physical registers, so **tileiras (or its downstream components) becomes the locus where spill decisions are made for Tile IR kernels**, rather than ptxas being the sole “final arbiter.” The practical consequence is that PTX-era heuristics (“ptxas will clean it up if I’m close”) stop being reliable.
+
+### 3) Tile IR’s semantics inject a new spill mechanism: explicit token ordering can reshape live ranges
+
+Tile IR’s memory model makes a very non-CUDA-like promise: **program dependencies do not provide ordering between two memory operations; tokens must be used to enforce order**, and token dependencies are preserved even if “program dependencies may be optimized away.” ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html))  
+
+Why this matters for register spills (mechanism-level):
+- Tokens are **SSA values** in the IR (even if they have “no concrete runtime representation”) that encode dependence edges the compiler must respect. ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html))  
+- Dependence edges restrict reordering; restricted reordering increases the probability of overlapping live ranges; overlapping live ranges is what inflates register pressure and triggers spills.
+
+This yields a Tile IR–specific hypothesis:  
+> **Correctness-mandated token ordering can create “semantic register pressure”: spills that arise not from arithmetic intensity or tile size alone, but from enforced ordering constraints that prevent otherwise-valid re-scheduling.**  
+Undocumented in public specs: the exact magnitude of this effect in tileiras’ allocator is not specified; it must be measured.
+
+### 4) The Triton ↔ Tile IR tension: Triton’s expressive memory patterns fight the Tile IR backend’s preferred hardware mapping
+
+NVIDIA’s Tile IR + Triton integration pitch is: Triton is already tile-oriented, so Tile IR can “preserve tile semantics” and map directly to hardware without rewrites. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+But the blog names a concrete fracture line that hits register pressure directly:
+
+- Triton’s **tensor-of-pointers** (materializing a tensor where *each element is a pointer*) is called out as **suboptimal on the Tile IR backend with CUDA 13.1**, with a recommended mitigation: **use TMA load/store via tensor descriptors** so the kernel passes shape/stride/block metadata instead of computing per-element pointers. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+
+Mechanism-first implication:
+- Tensor-of-pointers turns address generation into a vectorized arithmetic workload; that burns registers and ALU slots and creates long live ranges (pointers must stay live until the load/store).  
+- TMA descriptors shift work from “N pointers in registers” to “one descriptor + offsets,” plausibly collapsing register pressure and changing spill onset.
+
+So Tile IR doesn’t just change “how you compile”; it changes which *coding idioms* are structurally compatible with low register pressure.
+
+### 5) Occupancy becomes explicit—and that is the paper-shaped hook
+
+The Triton-to-TileIR repo makes two statements that essentially define the research opportunity:
+
+1. **A new backend hint `occupancy` (1–32 active thread blocks per SM) is “critical” and defaults to 1.** ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+2. **`num_warps` is not exposed yet**, and for certain norm/reduction kernels “performance may degrade due to register spilling.” ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+This is a uniquely “Tile IR on Blackwell” situation:
+- In classic Triton tuning, `num_warps` is a primary knob for balancing per-thread work, instruction-level parallelism, and register footprint. If it’s absent, the backend has fewer degrees of freedom to avoid spills, making spills more likely to show up as *hard cliffs* when problem shapes cross a threshold. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+- The presence of an `occupancy` hint strongly suggests the compiler is willing to trade registers for latency hiding under an *assumed* concurrency target, rather than leaving occupancy purely as an emergent property.
+
+This makes spill onset the right organizing metric because it is the point where:
+- occupancy stops increasing (or collapses) due to RF limits, and  
+- additional local memory traffic appears, creating stalls.
+
+Nsight Compute’s guide explicitly links stalls on local/global memory pipelines to both **thread-local memory** usage and **excessive register pressure causing spills**, grounding the performance impact mechanism. ([docs.nvidia.com](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html))  
+
+### 6) Why “spill onset” is harder to reason about than before (and why Tile IR makes it more important)
+
+[Legacy toolchain context; CUDA 13.0 in the cited study]  
+The optimal pipelining/warp specialization paper provides a clean cautionary tale: on Blackwell backward FMHA, the authors report that even though a derived schedule “should fit within the register-per-thread budget,” **ptxas was unable to allocate without significant register spilling**, degrading performance; constraining the register budget changed the strategy and allowed ptxas to succeed. ([arxiv.org](https://arxiv.org/html/2512.18134v1))  
+
+The takeaway that transfers to Tile IR (without assuming identical behavior):
+- Spill onset is not a simple function of “static register count” from a high-level IR; it’s a *global interaction* among scheduling, resource modeling, and backend allocator behavior.
+- Tile IR adds new semantic constraints (tokens) and new mapping knobs (`occupancy`, `num_ctas`/2CTA mode) that make this interaction even richer—and less predictable without measurement.
+
+### 7) The core paper opportunity (Stage 1 framing): make the spill/occupancy frontier *legible* for Tile IR on Blackwell
+
+What the field lacks (and what Tile IR’s emergence makes newly valuable) is a principled answer to:
+
+> **When does Tile IR move you to a better spill/occupancy point than PTX, and when does it push you over the spill cliff earlier?**
+
+A tight, insight-driven contribution would be:
+- **A spill-onset “phase diagram”** for Blackwell kernels compiled via Tile IR vs PTX, parameterized by tile sizes / reduction dims / `num_ctas` / `occupancy`. (Method comes in Stage 2.)  
+- **Mechanistic attribution:** separate spill pressure caused by (a) address-generation idioms (tensor-of-pointers vs descriptors), (b) pipeline depth (more in-flight tiles), and (c) ordering constraints (tokens). The Tile IR spec + repo + blog together justify that each of these is plausibly first-order. ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html))  
+- **Actionable tuning story:** since the backend exposes `occupancy` but not `num_warps`, the paper can propose a “contract”: choose `occupancy` to stay just below spill onset for a kernel family, instead of blindly maximizing concurrency. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+### PTX vs Tile IR (only the spill/occupancy-relevant differences)
+
+| Dimension | Triton → PTX → ptxas | Triton → Tile IR → tileiras | Why it matters for spills/occupancy |
+|---|---|---|---|
+| Final compiler to SASS | `ptxas` optimizes/assembles PTX modules into binary objects ([docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)) | CUDA 13.1 introduces `tileiras` to translate Tile IR bytecode into SASS ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html)) | Spill decisions likely move to a different allocator + different IR semantics (tiles/tokens). |
+| Memory ordering semantics in IR | PTX memory model; ordering typically reasoned about via fences/atomics | Token-ordered operations: program dependencies do **not** order memory ops; tokens must be used ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html)) | Token dependencies can constrain scheduling and extend live ranges → new spill triggers. |
+| Canonical “bad for regs” idiom | Pointer arithmetic + per-element addressing is common | Tensor-of-pointers explicitly called out as suboptimal; TMA descriptors recommended ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/)) | Address-generation register pressure can dominate; Tile IR prefers lifting layout into descriptors. |
+| Primary concurrency knob exposure (current backend state) | `num_warps` widely used in Triton tuning | `num_warps` not exposed yet; new `occupancy` hint is critical; spilling noted in some reductions ([github.com](https://github.com/triton-lang/Triton-to-tile-IR)) | Missing `num_warps` means fewer ways to avoid spills; `occupancy` becomes the main dial. |
+| Provenance risk | Single backend path | Tile backend can **fall back to PTX** on compilation bugs ([github.com](https://github.com/triton-lang/Triton-to-tile-IR)) | Any spill study must be fail-closed or it will silently mix backends. |
+
+---
+
+### Working hypotheses (explicitly marked)
+
+1. **(H1) Descriptorization shifts spill onset right:** rewriting tensor-of-pointers loads/stores into TMA tensor descriptors reduces live pointer tensors, decreasing register pressure and enabling higher achieved occupancy before spill. Grounding: NVIDIA’s explicit perf warning + TMA recommendation. ([developer.nvidia.com](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/))  
+
+2. **(H2) Token discipline can shift spill onset left for synchronization-heavy kernels:** kernels that require token ordering across many memory ops will show earlier spill onset (for equal tile sizes) than structurally similar PTX kernels, because preserved dependence edges limit scheduler freedom and increase overlapping live ranges. Grounding: Tile IR token-order semantics. ([docs.nvidia.com](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html))  
+
+3. **(H3) The `occupancy` hint creates a new “occupancy-pressure contract”:** the Tile IR backend will generate different schedules/register footprints depending on the expected active CTAs per SM, making spill onset a function of the hint value—not just the source kernel. Grounding: existence/criticality of `occupancy` hint and missing `num_warps`. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))  
+
+These are the core “story” claims to validate in Stage 2 with microbenchmarks.
+
+---
+
+### Guardrails (scope discipline for the eventual paper)
+
+- Blackwell only; CUDA **13.1+**; PTX ISA **9.1+**; Nsight Compute **2025.4+**. ([docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html))  
+- Pre-13.1 toolchain results (e.g., CUDA 13.0) are [Legacy] motivation, not evidence for Tile IR behavior. ([arxiv.org](https://arxiv.org/html/2512.18134v1))  
+- No invented flags/knobs: only use documented `ENABLE_TILE=1`, `occupancy`, `num_ctas`, and any explicitly documented Tile IR env vars when needed. ([github.com](https://github.com/triton-lang/Triton-to-tile-IR))
+
+---
+Learn more:
+1. [Microbenchmarking NVIDIA’s Blackwell Architecture: An in-depth Architectural Analysis](https://arxiv.org/html/2512.02189v1)
+2. [CUDA Toolkit 13.1 - Release Notes — Release Notes 13.1 documentation](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html)
+3. [1. Introduction — PTX ISA 9.1 documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
+4. [7. Memory Model — Tile IR](https://docs.nvidia.com/cuda/tile-ir/latest/sections/memory_model.html)
+5. [Advancing GPU Programming with the CUDA Tile IR Backend for OpenAI Triton | NVIDIA Technical Blog](https://developer.nvidia.com/blog/advancing-gpu-programming-with-the-cuda-tile-ir-backend-for-openai-triton/)
+6. [GitHub - triton-lang/Triton-to-tile-IR: incubator repo for CUDA-TileIR backend](https://github.com/triton-lang/Triton-to-tile-IR)
+7. [2. Profiling Guide — NsightCompute 13.1 documentation](https://docs.nvidia.com/nsight-compute/2025.4/ProfilingGuide/index.html)
+8. [Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs](https://arxiv.org/html/2512.18134v1)

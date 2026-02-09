@@ -1,0 +1,318 @@
+% =========================
+% PART 4 / 9  (L1_LATEX_PART_4)
+% =========================
+\section{Evaluation plan: benchmarks, reproducibility, and validity threats}
+
+This part specifies how BW-TiLSS will be evaluated as a \emph{proof-carrying, solver-backed} model for Blackwell-family tile kernels, under the hard toolchain targets CUDA $>13.0$ (preferably $13.1+$) and PTX $>9.0$ (strict). The evaluation is designed to (i) measure performance and predictive adequacy, (ii) validate or falsify calibrated parameters and traffic hypotheses, and (iii) make correctness obligations observable via certificates and artifact discipline rather than informal ``best effort'' compiler behavior.%
+~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE,NV_workloads,SEED_1,SEED_2,SEED_3,SEED_4}
+
+\subsection{Evaluation plan: benchmarks, metrics, and comparison baselines}
+
+\subsubsection{Benchmark families (what we run, and what each family tests)}
+
+BW-TiLSS claims are modular (layout semantics, descriptorized movement semantics, schedule feasibility/optimality, and cache/traffic hypotheses). Accordingly, the benchmark suite is organized by \emph{which proof obligations and calibrated terms are exercised}.
+
+\paragraph{(B1) Blackwell action microbenches (calibration targets).}
+We use PTX-level microbenchmarks to fit and cross-check the Blackwell action-cost record $\Theta_{\mathsf{BW}}$ for the modeled tiers/units (TMEM, DE, and \texttt{tcgen05.*}), under the isolation and translation-audit discipline (dependency chains, sweep construction, PTX$\rightarrow$SASS audit).%
+~\cite{ARCH_BW}
+The evaluation criterion is not merely ``numbers match prior work'', but: the fitted parameters are \emph{stable within recorded toolchain provenance}, or else the instability is detected and carried forward as uncertainty (and any reuse across toolchains/SKUs is marked \textbf{UNVERIFIED}).%
+~\cite{ARCH_BW,OPT_PIPE}
+
+\paragraph{(B2) Layout algebra and equivalence tests (symbolic certificates).}
+We evaluate the layout-semantics triangle obligations (Part~2--3) by constructing representative layout transformations (composition/product/division/complement/coalesce and shape operations) and requiring relation-level equivalence certificates (bounded-domain equality in the ISL semantic target).%
+~\cite{SEED_1,SEED_2,SEED_4}
+The benchmark set includes:
+(i) \emph{power-of-two representable} layouts (eligible for $\mathbb{F}_2$-linear encodings and bit-blast denotations),%
+~\cite{SEED_1,SEED_2}
+(ii) \emph{non-power-of-two / quasi-affine} layouts requiring ISL-only semantics (explicitly testing fallback soundness),%
+~\cite{SEED_2,SEED_1}
+and (iii) \emph{tractable-subclass} layouts where categorical proofs are invoked as templates and must be backed by tractability certificates, else fall back to ISL-only equality checks.%
+~\cite{SEED_4,SEED_2}
+
+\paragraph{(B3) Descriptorization (tensor-of-pointers $\rightarrow$ descriptor/TMA) correctness and profitability.}
+For movement ops eligible for both pointer-materialization and descriptorized forms, we run paired kernels differing \emph{only} in movement form and enforce the correctness precondition $R_{\mathrm{ptr}}=R_{\mathrm{desc}}$ (bounded relation equality).%
+~\cite{NV_BLOG_TILE,SEED_2}
+This benchmark family is evaluated under:
+(i) the Tile IR backend (where tensor-of-pointer patterns are reported as suboptimal in a CUDA~13.1 context, motivating descriptorization),%
+~\cite{NV_BLOG_TILE}
+and (ii) the PTX/SIMT backend as a baseline and as a control for backend-specific behavior.%
+~\cite{NV_BLOG_TILE}
+Any additional TMA feasibility constraints beyond address-set equality (e.g., hardware alignment constraints) are treated as \textbf{UNVERIFIED} unless backed by primary documentation imported explicitly; they are \emph{not} silently assumed.%
+~\cite{NV_BLOG_TILE}
+
+\paragraph{(B4) Joint scheduling + warp specialization + tiered movement (solver end-to-end).}
+We evaluate kernels in the program class compatible with the solver-first schedule encoding (dependence graphs extracted from tile-based SSA IRs with explicit movement; modulo scheduling + warp specialization).%
+~\cite{OPT_PIPE}
+We then test three nested optimization configurations:
+\begin{enumerate}
+\item schedule-only solver: fixed layouts and fixed movement forms (baseline closest to the solver-first schedule scaffold),%
+~\cite{OPT_PIPE}
+\item schedule + tier-typing extension: incorporate TMEM/DE/\texttt{tcgen05.*} actions as tier-typed scheduled operations parameterized by calibrated $\Theta_{\mathsf{BW}}$ (BW-TiLSS extension; falsifiable by mismatch),%
+~\cite{ARCH_BW,OPT_PIPE}
+\item full joint model: add layout/movement/traversal decision variables with certificates and backend feasibility predicates as in Part~3.%
+~\cite{SEED_1,SEED_2,SEED_3,NV_BLOG_TILE,SEED_4}
+\end{enumerate}
+
+\paragraph{(B5) Cache/traffic: traversal transforms and sector-model validation (hypothesis testing).}
+For streaming-attention-like kernels where the SEED\_3 regime assumptions are intended to hold, we evaluate:
+(i) legality of traversal transforms $\tau$ (dependence preservation), and
+(ii) the predictive accuracy of the analytic sector-access hypothesis $S_{\mathsf{L2}}(\cdot)$ against hardware counters within the claimed validity region.%
+~\cite{SEED_3,OPT_PIPE}
+We include cyclic (identity) and sawtooth-style transforms as candidate $\tau$ values, with explicit applicability checks (e.g., tile-splitting interference).%
+~\cite{SEED_3}
+
+\subsubsection{Primary metrics (correctness, feasibility, performance, prediction)}
+
+\paragraph{Correctness and certificate metrics (must pass, or fail loudly).}
+\begin{itemize}
+\item \textbf{Certificate completeness:} fraction of produced configurations $c$ that ship with the required certificate bundle $\mathcal{C}$ (layout equivalence, descriptor equality when used, schedule feasibility witness).%
+~\cite{SEED_2,OPT_PIPE,NV_BLOG_TILE}
+\item \textbf{Equality-check robustness:} success/failure rate of bounded relation equality checks for layout transforms and descriptorization.%
+~\cite{SEED_2,SEED_1}
+\item \textbf{Fallback frequency:} fraction of cases requiring ISL-only semantics because $\mathsf{Rep}_{\mathbb{F}_2}$ or $\mathsf{Tractable}_{\mathsf{Nest}}$ fails (coverage metric for the proof scaffolds).%
+~\cite{SEED_1,SEED_4,SEED_2}
+\end{itemize}
+
+\paragraph{Schedule feasibility and solver metrics.}
+\begin{itemize}
+\item \textbf{Feasibility rate:} SAT/UNSAT outcomes as a function of $\mathrm{II}$ and horizon $L$ under monotone UNSAT-driven search; report minimal satisfiable $\mathrm{II}$ per kernel instance.%
+~\cite{OPT_PIPE}
+\item \textbf{Solver time profile:} wall-clock time split by (i) symbolic/certificate construction, (ii) feasibility solving, (iii) secondary optimization (when enabled), and (iv) certificate checking.%
+~\cite{OPT_PIPE,SEED_2}
+\item \textbf{Unsat explanation artifact:} record UNSAT certificates/cores (if available) to support principled constraint refinement rather than ad-hoc patching.%
+~\cite{OPT_PIPE}
+\end{itemize}
+
+\paragraph{Performance and prediction metrics (falsifiable).}
+\begin{itemize}
+\item \textbf{Throughput and latency:} achieved kernel throughput and end-to-end time under fixed correctness conditions; compare against predicted throughput proxies (e.g., improvements in minimal $\mathrm{II}$).%
+~\cite{OPT_PIPE}
+\item \textbf{Traffic observables:} measured L2 sector-access metrics for traffic-model experiments; compare predicted sector counts (when $S_{\mathsf{L2}}$ is declared valid) to counters using an explicit error statistic (e.g., MAPE as used in SEED\_3-style validation).%
+~\cite{SEED_3}
+\item \textbf{Calibration stability:} variance of fitted $\Theta_{\mathsf{BW}}$ components under minor toolchain changes; any instability triggers \textbf{UNVERIFIED} scoping rather than silent reuse.%
+~\cite{ARCH_BW}
+\end{itemize}
+
+\subsubsection{Comparison baselines (explicit, non-theory claims labeled as baselines)}
+
+BW-TiLSS is evaluated against baselines that isolate the incremental contribution of each semantics layer and solver coupling.
+
+\paragraph{Backend baselines (TileIR vs PTX/SIMT).}
+\begin{itemize}
+\item \textbf{SIMT/PTX backend baseline:} compile and run via the classic backend path (control for Tile IR-specific behavior).%
+~\cite{NV_BLOG_TILE}
+\item \textbf{Tile IR backend baseline:} compile and run with Tile IR backend selected; treat unsupported operations as explicit infeasibility (not silent fallback).%
+~\cite{NV_BLOG_TILE}
+\end{itemize}
+
+\paragraph{Layout and movement baselines.}
+\begin{itemize}
+\item \textbf{Heuristic layout engine baseline (baseline):} use the existing compiler/kernel author choices for layouts without attempting proof-guided synthesis; BW-TiLSS is evaluated by \emph{certificate coverage} and by performance relative to this baseline.%
+~\cite{SEED_1,SEED_2,SEED_4}
+\item \textbf{Movement-form baseline:} pointer-materialization form versus descriptorized form (A/B) on Tile IR backend (profitability is version-dependent and treated empirically).%
+~\cite{NV_BLOG_TILE}
+\end{itemize}
+
+\paragraph{Scheduling baselines.}
+\begin{itemize}
+\item \textbf{Schedule-only solver baseline:} modulo scheduling + warp specialization constraints with fixed layout/movement/traversal (closest to the solver-first scaffold).%
+~\cite{OPT_PIPE}
+\item \textbf{Joint BW-TiLSS solver:} schedule + layout + movement + traversal choices with certificates and backend feasibility predicates (proposed unification).%
+~\cite{OPT_PIPE,SEED_1,SEED_2,NV_BLOG_TILE,SEED_3,ARCH_BW,SEED_4}
+\end{itemize}
+
+\begin{verbatim}
+Evaluation decomposition (what each experiment isolates)
+
+   Layout semantics  ---->  Descriptor semantics  ---->  Schedule semantics  ---->  Traffic hypothesis
+   (SEED_1/2/4)             (NV_BLOG_TILE + SEED_2)     (OPT_PIPE + ARCH_BW)       (SEED_3 + OPT_PIPE)
+         |                         |                           |                          |
+         | (certificates)          | (addr equality)           | (II + SAT/UNSAT)         | (counters)
+         v                         v                           v                          v
+   Symbolic pass/fail        Symbolic pass/fail        Throughput proxy + runtime   Prediction error + runtime
+\end{verbatim}
+
+\subsection{Reproducibility: toolchain matrix, artifact checks, and parameter provenance}
+
+Reproducibility is treated as a first-class evaluation outcome: results are meaningful only when the backend path, artifacts, and calibration provenance are explicit, because both the Tile IR backend and Blackwell-specific PTX lowering are toolchain-sensitive.%
+~\cite{NV_BLOG_TILE,ARCH_BW}
+
+\subsubsection{Toolchain matrix (record what matters; do not assume stability)}
+
+BW-TiLSS experiments are indexed by the toolchain record $\mathcal{T}=(\mathsf{cuda\_ver},\mathsf{ptx\_ver},\mathsf{backend},\mathsf{driver},\mathsf{flags},\mathsf{artifacts})$ (Part~2).%
+~\cite{NV_BLOG_TILE,ARCH_BW}
+We report a \emph{toolchain matrix} per benchmark with at least:
+\begin{itemize}
+\item CUDA version (must satisfy CUDA $>13.0$; Tile IR path requires CUDA $13.1+$ per prerequisites),%
+~\cite{NV_BLOG_TILE}
+\item PTX version (must satisfy PTX $>9.0$ for PTX-path claims; \textbf{UNVERIFIED} interactions for Blackwell-specific PTX features are explicitly tested rather than assumed),%
+~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}
+\item backend selection (TileIR vs PTX/SIMT), with explicit evidence,%
+~\cite{NV_BLOG_TILE}
+\item driver/runtime versions and compilation flags (recorded, not assumed irrelevant).
+\end{itemize}
+
+\subsubsection{Artifact checklist (backend evidence + lowering audit)}
+
+\paragraph{Tile IR backend evidence.}
+For Tile IR runs, we require observable evidence of backend selection and compilation products (e.g., cached \texttt{.tileIR} artifacts and runtime selection mechanisms) as part of the reproducibility contract.%
+~\cite{NV_BLOG_TILE}
+
+\paragraph{PTX$\rightarrow$SASS audit evidence.}
+For PTX-path calibration and any PTX-level claims, we require the translation audit discipline (record PTX, record the corresponding lowered instruction path, and ensure the intended instruction family is exercised) to prevent spurious parameter fitting.%
+~\cite{ARCH_BW}
+
+\begin{verbatim}
+Artifact pipeline (what is stored per experiment)
+
+  Kernel source/IR  -->  Compiler invocation  -->  Backend artifact(s)  -->  Run logs + counters
+       |                     |                        |                         |
+       |                     |                        +-- TileIR: .tileIR cache |
+       |                     |                        +-- PTX path: PTX + SASS  |
+       |                     |                        (lowering audited)        |
+       v                     v                        v                         v
+  Git hash + inputs   Toolchain record T       Artifact hashes          Measurements + certificates
+\end{verbatim}
+
+\subsubsection{Parameter provenance for $\Theta_{\mathsf{BW}}$ (calibration reproducibility)}
+
+All calibrated parameters are reported with:
+(i) device instance identifier (B200 vs GB10 when applicable),%
+~\cite{ARCH_BW,SEED_3}
+(ii) toolchain record $\mathcal{T}$, and
+(iii) the microbenchmark methodology version (dependency structure, sweep ranges, audit procedure).%
+~\cite{ARCH_BW}
+Any cross-SKU transfer (e.g., from B200-derived $\Theta_{\mathsf{BW}}$ components to GB10 traffic experiments) is treated as \textbf{INFERENCE} and must be validated by matched measurements.%
+~\cite{ARCH_BW,SEED_3}
+
+\subsection{Threats to validity (and how the evaluation detects them)}
+
+BW-TiLSS threats to validity are framed as \emph{explicit failure modes} that the evaluation is designed to reveal (via UNSAT, missing certificates, or prediction mismatch), rather than to conceal via tuning.
+
+\paragraph{T1: Cross-SKU transfer within ``Blackwell'' (B200 vs GB10).}
+ARCH\_BW calibration targets are B200-centric while SEED\_3 traffic validation is GB10-centric; transferring numeric parameters or qualitative assumptions is not justified without matched calibration and is treated as \textbf{UNVERIFIED}.%
+~\cite{ARCH_BW,SEED_3}
+\emph{Detection:} run matched microbenches/counter studies on each available instance; report per-instance $\Theta$ and validity regions.
+
+\paragraph{T2: Compiler evolution under CUDA 13.x and evolving Tile IR backend coverage.}
+The Tile IR backend is explicitly described as evolving, with incomplete op coverage and version-specific performance caveats (e.g., tensor-of-pointer degradation in a CUDA~13.1 context).%
+~\cite{NV_BLOG_TILE}
+OPT\_PIPE scheduling results are reported under a CUDA~13.0 baseline, which does not match the project toolchain target.%
+~\cite{OPT_PIPE}
+\emph{Detection:} treat op coverage as a measured/documented predicate $\mathsf{Supports}_{\mathcal{T}}(\cdot)$; re-run key experiments across a small set of CUDA $>13.0$ toolchains and report stability/instability explicitly.%
+~\cite{NV_BLOG_TILE}
+
+\paragraph{T3: PTX $>9.0$ uncertainty for Blackwell-relevant instruction families.}
+Golden sources motivate Blackwell-specific PTX-level instruction families and calibration methodology but do not establish PTX-version requirements for all required ops under PTX $>9.0$; thus PTX-version feasibility is a mandatory verification task and a major validity threat if mishandled.%
+~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE}
+\emph{Detection:} include an explicit ``availability and stability'' gate before any PTX-path calibration claim (assemble under PTX $>9.0$, audit lowering, otherwise mark \textbf{UNVERIFIED} and restrict scope).%
+~\cite{ARCH_BW}
+
+\paragraph{T4: Representability/coverage limits of layout formalisms.}
+The $\mathbb{F}_2$ linear-layout formalism has a power-of-two representability restriction and cannot express certain operations without extensions; ISL relations can represent more general (including quasi-affine) cases but may face complexity issues.%
+~\cite{SEED_1,SEED_2}
+The categorical proof scaffold applies only to a tractable subclass and does not claim coverage of all layouts.%
+~\cite{SEED_4}
+\emph{Detection:} report coverage metrics (fraction of layouts representable in each substrate; fallback frequency), and ensure correctness is preserved via ISL-only equality certificates when other predicates fail.%
+~\cite{SEED_2,SEED_4}
+
+\paragraph{T5: Conflation of kernel-internal optimization with workload-level mapping/partitioning.}
+Mapping as loop transformations and resource partitioning are known to be workload- and regime-sensitive; conflating these with kernel-internal solver decisions risks invalid conclusions.%
+~\cite{NV_workloads}
+\emph{Detection:} keep kernel-level evaluation (BW-TiLSS) separate from any workload-level extensions; treat workload-level claims as future work unless explicitly instantiated and validated.%
+~\cite{NV_workloads}
+
+\subsection{Risk register and mitigations aligned to gap map (G1--G11)}
+
+Table~\ref{tab:risk_register} enumerates the primary project risks corresponding to gaps G1--G11 (Stage~S2 gap map), with mitigation strategies that preserve the theory-first contract (proofs where possible, falsifiable calibration otherwise).%
+~\cite{ARCH_BW,OPT_PIPE,NV_BLOG_TILE,NV_workloads,SEED_1,SEED_2,SEED_3,SEED_4}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{|l|p{0.22\linewidth}|p{0.34\linewidth}|p{0.30\linewidth}|}
+\hline
+\textbf{Gap} & \textbf{Risk statement} & \textbf{Impact} & \textbf{Mitigation (evaluation-visible)} \\
+\hline
+G1 & No unified equivalence theorem (F2/ISL/Nest) & Unsound layout transforms if ``equivalence'' is assumed & Require relation-equality certificates for each transform; use F2/Nest only as optional proof templates and fall back to ISL-only when predicates fail. \\
+\hline
+G2 & Descriptorization correctness/profitability not formalized & Incorrect rewrites or version-dependent regressions & Enforce $R_{\mathrm{ptr}}=R_{\mathrm{desc}}$ as a hard constraint; treat profitability as calibrated, toolchain-versioned cost; rerun A/B under CUDA $>13.0$. \\
+\hline
+G3 & Joint solver encoding may be intractable & Solver fails to scale; incomplete search harms optimality claims & Use explicit candidate-set bounding (not correctness-critical); track omissions as optimality threats; leverage UNSAT cores for pruning; report solver-time/coverage. \\
+\hline
+G4 & $\Theta_{\mathsf{BW}}$ not calibrated under target toolchain & Wrong costs $\Rightarrow$ wrong schedules/claims & Refit using isolation + translation audit; attach provenance + confidence; treat instability as \textbf{UNVERIFIED} scope restriction rather than silent reuse. \\
+\hline
+G5 & PTX $>9.0$ availability/stability unknown & Toolchain infeasibility blocks PTX-path model components & Add explicit availability gate (assemble + audit lowering) before using any PTX-path action; otherwise restrict to TileIR path and mark missing ops \textbf{UNVERIFIED}. \\
+\hline
+G6 & Traffic model not integrated with scheduling objective & Throughput-optimal $\mathrm{II}$ may be traffic-suboptimal & Add traffic term only in validated regimes; validate predicted sectors vs counters; disable term when assumptions fail; compare ``with/without traffic'' solutions. \\
+\hline
+G7 & Cross-SKU transfer (B200 $\leftrightarrow$ GB10) invalid & Misapplied parameters invalidate conclusions & Separate $(\Theta_{\mathrm{arch}},\Theta_{\mathrm{sku}},\Theta_{\mathrm{toolchain}})$ in reporting; require matched measurements for transfers; report per-SKU validity regions. \\
+\hline
+G8 & Bank-conflict model not Blackwell-calibrated & Solver may pick legal but pathological layouts & Treat quantitative bank costs as \textbf{UNVERIFIED} until calibrated; evaluate correlation between predicted conflict metrics and measured stalls before enabling as objective term. \\
+\hline
+G9 & Non-power-of-two shapes/quasi-affinity not unified & Practical descriptor shapes excluded or proofs fail & Use ISL-only semantics for general shapes; if padding/masking used, represent as explicit transforms with relation-equality checks; report overhead as measured cost. \\
+\hline
+G10 & Categorical operations lack solver-ready encoding & Cannot exploit Nest proofs algorithmically at scale & Implement categorical ops as candidate generators with proof templates \emph{only when} tractability certificates exist; otherwise perform ISL relation ops + equality checks. \\
+\hline
+G11 & Workload-level mixed-reuse mapping not linked to kernel solver & Kernel-optimal $\neq$ workload-optimal; scope creep & Keep workload-level mapping separate (NV\_workloads vocabulary); if instantiated later, treat as explicit extension with separate validation and sensitivity analysis. \\
+\hline
+\end{tabular}
+\caption{Risk register aligned to gaps G1--G11: mitigations are structured to preserve correctness (hard constraints + certificates) and to make empirical claims falsifiable via calibration/validation.}
+\label{tab:risk_register}
+\end{table}
+
+% -------------------------------------------------------------------------
+% source_audit (PART 4; comments only to avoid non-LaTeX/YAML side channels)
+%
+% ARCH_BW:
+%   Used for: evaluation/certification discipline around PTX microbench calibration (dependency chains,
+%             sweeps, PTX->SASS audit) and for motivating toolchain/SKU sensitivity and provenance
+%             reporting of Θ_BW; validity threat T1/T3 and risks G4/G5/G7.
+%   Anchors: IV-A (PTX microbench design + translation audit); V-A (TMEM); V-B (DE); VI-A (tcgen05.*);
+%            VIII (software/toolchain sensitivity motivating re-fit under CUDA>13.0).
+%
+% OPT_PIPE:
+%   Used for: schedule evaluation metrics (II, SAT/UNSAT, monotone search), solver runtime profiling,
+%             schedule-only baseline definition, UNSAT-core-driven refinement as mitigation, and
+%             dependence legality checks for traversal transforms; validity threat T2/T3 and risks G3/G6.
+%   Anchors: 4.1--4.3 (constraint templates); Algorithm 1 (UNSAT-driven II search); 5.2 (cost normalization);
+%            6.1 (CUDA 13.0 baseline motivating revalidation under CUDA>13.0).
+%
+% NV_BLOG_TILE:
+%   Used for: evaluation baselines contrasting TileIR vs PTX/SIMT backend; reproducibility artifact checks
+%             (ENABLE_TILE / .tileIR cache evidence); explicit treatment of unsupported ops; descriptorization
+%             A/B benchmarking motivation; validity threat T2 and risks G2/G5.
+%   Anchors: prerequisites (CUDA 13.1+; Blackwell); verify compilation (.tileIR artifacts); limitations
+%            (unsupported ops; tensor-of-pointer degradation); descriptor/TMA API example.
+%
+% NV_workloads:
+%   Used for: threat-to-validity framing T5 and risk G11 (do not conflate kernel-internal solver decisions
+%             with workload-level mapping/partitioning); evaluation boundary discipline.
+%   Anchors: II-A (mapping as loop transformations); mixed-reuse framing and sensitivity to partitioning.
+%
+% SEED_1:
+%   Used for: representability/coverage evaluation (power-of-two restriction), fallback-frequency metrics,
+%             and for flagging bank-conflict quantitative costs as UNVERIFIED until Blackwell calibration (risk G8).
+%   Anchors: Definition 4.1--4.5 (linear layouts/operators); limitations paragraph (power-of-two restriction);
+%            bank-conflict modeling section referenced as requiring calibration.
+%
+% SEED_2:
+%   Used for: certificate metrics based on ISL relation equality, bounded-domain equality checks for
+%             layout transforms and descriptorization, reconstruction boundary reporting, and fallback
+%             correctness (ISL-only semantics for general/quasi-affine cases); risks G1/G2/G9/G10.
+%   Anchors: 2.4 (ISL relations/operations); reconstruction algorithms; open inference limit statement.
+%
+% SEED_3:
+%   Used for: traffic-model evaluation (sector-model prediction vs counters within validity region),
+%             traversal transform experiments (cyclic vs sawtooth) and applicability limitations,
+%             and cross-SKU validity threat T1; risks G6/G7.
+%   Anchors: 3.2 (sector model + validation methodology + approximation caveats); Algorithm 4 (sawtooth);
+%            limitations discussion (compiler/tile-size interference).
+%
+% SEED_4:
+%   Used for: evaluation of categorical scaffold coverage (tractable-subclass applicability), fallback
+%             policy to ISL-only when tractability fails, and risk framing for missing solver-ready
+%             tractability/admissibility decision procedures (risk G10).
+%   Anchors: Theorem A (tractable layouts ↔ Nest-morphisms); Theorems B--F (compatibility templates);
+%            Algorithm 4.1.3 (composition computation); tractable-subclass scope.
+% -------------------------------------------------------------------------
