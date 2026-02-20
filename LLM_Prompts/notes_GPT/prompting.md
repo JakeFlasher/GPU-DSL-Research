@@ -5,3 +5,8 @@
 1. Use Linus's code style
 2. Xml format, json banned
 3. Directly embed the source code implementation when debugging
+## be as specific as possible
+1. revision, divide each review, each section
+2. tailor the prompt to each individual review
+3. always use multi-stage, refer to OpenAI/Anthropic official guide
+4. always provide the exactly needed source files (work on structure first, use large context window models to detect the needed files, then use intelligent like GPT 5.2 pro to tailor and modify the details)
